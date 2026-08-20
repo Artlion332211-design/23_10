@@ -1,0 +1,20 @@
+{
+  "group_name": "Пілоти БПЛА",
+  "admin_chat_name": "Особисті нотатки",
+  "positions": [
+    { "name": "Шмель",    "aliases": ["шмель", "shmel"] },
+    { "name": "Кобра",    "aliases": ["кобра", "kobra"] },
+    { "name": "Кажан",    "aliases": ["кажан", "kazhan"] },
+    { "name": "Сімсон",   "aliases": ["сімсон", "simson"] },
+    { "name": "Кузьміч",  "aliases": ["кузьміч", "kuzmich"] },
+    { "name": "Нон Стоп", "aliases": ["нон стоп", "нонстоп", "non stop"] },
+    { "name": "Вій",      "aliases": ["вій", "viy"] }
+  ],
+  "report_timeout_hours": 24,
+  "scan_interval_seconds": 60,
+  "alert_check_interval_seconds": 300,
+  "alert_repeat_hours": 6,
+  "chrome_profile_dir": "wa_profile",
+  "state_file": "state/state.json",
+  "headless": false
+}

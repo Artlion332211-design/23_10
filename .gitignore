@@ -183,3 +183,7 @@ fabric.properties
 
 # idea folder, uncomment if you don't need it
  .idea
+# pilot_reports_monitor: локальна сесія WhatsApp Web та стан звітів
+pilot_reports_monitor/wa_profile/
+pilot_reports_monitor/state/*.json
+pilot_reports_monitor/venv/
