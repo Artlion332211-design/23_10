@@ -1,0 +1,20 @@
+# Скопіюй цей файл у config.yaml і підстав реальні назви чатів WhatsApp.
+# config.yaml НЕ комітиться в git (див. .gitignore) — там будуть реальні
+# назви груп/чатів вашого підрозділу.
+
+chats:
+  # "точна назва чату у WhatsApp": "позначення групи у звітах"
+  "ШМЕЛЬ": "ШМЕЛЬ"
+  "КОБРА": "КОБРА"
+  "ЖАБА": "ЖАБА"
+
+# Чат, куди бот шле алерти й звіти. Найпростіший варіант — чат "Ви"
+# (Message yourself) у власному WhatsApp адміністратора.
+admin_chat: "Ви"
+
+poll_interval_seconds: 20
+report_interval_hours: 6
+
+chrome_profile_dir: "./chrome_profile"
+state_file: "./state.json"
+log_file: "./monitor.log"
