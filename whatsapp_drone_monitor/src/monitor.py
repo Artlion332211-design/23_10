@@ -8,7 +8,7 @@ from typing import Optional
 
 from .config import Config
 from .parser import EventType, parse_message
-from .reporter import format_daily_report, format_event_alert, format_position_stats
+from .reporter import format_daily_report, format_event_alert, format_not_in_service_list, format_position_stats
 from .sheets_client import AmbiguousSerialError, DroneRegistry, PositionStat, open_registry
 from .state import BotState, load_state, save_state
 from .whatsapp_client import WhatsAppClient
@@ -16,7 +16,13 @@ from .whatsapp_client import WhatsAppClient
 logger = logging.getLogger(__name__)
 
 POSITION_COMMANDS = {"на позиції", "/на_позиції", "позиції"}
-DAILY_REPORT_COMMANDS = {"звіт", "/звіт", "статус", "/статус"}
+DAILY_REPORT_COMMANDS = {"звіт", "/звіт", "статус", "/статус", "/status"}
+LIST_COMMANDS = {"/list", "список", "не в роботі"}
+
+# Скільки циклів опитування поспіль мають повністю провалитись (жодного
+# успішного читання чату чи команд адміна), перш ніж бот сам перезапустить
+# Chrome/Selenium — щоб зависла сесія не лишала моніторинг мертвим назавжди.
+RECONNECT_AFTER_FAILURES = 3
 
 
 class Monitor:
@@ -28,6 +34,7 @@ class Monitor:
         )
         self.state: BotState = load_state(config.state_file)
         self._last_daily_report_date: Optional[date] = None
+        self._consecutive_failures = 0
 
     def run(self) -> None:
         self.client.start()
@@ -44,11 +51,15 @@ class Monitor:
             self.client.stop()
 
     def _poll_once(self) -> None:
+        self.registry.clear_cache()  # свіжі дані на кожен цикл, не на кожну подію
+        any_ok = False
+
         for chat_name in self.config.chats:
             try:
                 new_messages, last_text = self.client.fetch_new_messages(
                     chat_name, self.state.last_seen.get(chat_name)
                 )
+                any_ok = True
             except Exception:
                 logger.exception("Не вдалося прочитати чат %s", chat_name)
                 continue
@@ -60,7 +71,29 @@ class Monitor:
             if new_messages:
                 save_state(self.state, self.config.state_file)
 
-        self._poll_admin_commands()
+        if self._poll_admin_commands():
+            any_ok = True
+
+        if any_ok:
+            self._consecutive_failures = 0
+        else:
+            self._consecutive_failures += 1
+            logger.warning("Цикл опитування повністю провалився (%d поспіль)", self._consecutive_failures)
+            if self._consecutive_failures >= RECONNECT_AFTER_FAILURES:
+                self._reconnect_client()
+
+    def _reconnect_client(self) -> None:
+        logger.warning("Перезапускаю WhatsApp-клієнт після повторних збоїв Chrome/Selenium...")
+        try:
+            self.client.stop()
+        except Exception:
+            logger.exception("Помилка під час зупинки клієнта (ігнорую, пробую запустити знову)")
+        try:
+            self.client.start()
+            self._consecutive_failures = 0
+            logger.info("WhatsApp-клієнт перезапущено успішно")
+        except Exception:
+            logger.exception("Не вдалося перезапустити WhatsApp-клієнт — спробую ще раз наступного циклу")
 
     def _handle_message(self, text: str) -> None:
         for drone_event in parse_message(text):
@@ -77,9 +110,13 @@ class Monitor:
 
         if drone_event.event_type is EventType.LOSS:
             event = self._process_loss(drone_event, note)
-        else:
+        elif drone_event.event_type is EventType.REPAIR:
             event = self._process_repair(drone_event, note)
+        else:
+            event = self._process_active(drone_event, note)
 
+        if event is None:
+            return  # статус фактично не змінився — нема чим спамити адміна
         save_state(self.state, self.config.state_file)
         self._send(format_event_alert(event))
 
@@ -92,9 +129,9 @@ class Monitor:
         try:
             matches = self.registry.set_status(drone_event.serial, self.config.status_lost, note=note)
         except AmbiguousSerialError:
-            # Неоднозначність у листах моделей не має блокувати головне —
-            # запис про втрату в журнал все одно додається нижче.
-            logger.warning("Неоднозначний серійник %s при втраті — статус у листах моделей не чіпаємо", drone_event.serial)
+            logger.warning(
+                "Неоднозначний серійник %s при втраті — статус у листах моделей не чіпаємо", drone_event.serial
+            )
             matches = []
         self.registry.append_loss_record(
             self.config.loss_log_sheet,
@@ -124,11 +161,23 @@ class Monitor:
                 group=drone_event.group,
                 note=f"Можливі борти: {', '.join(exc.candidates)}" + (f" | {note}" if note else ""),
             )
+
         if not matches:
+            sheet = self.registry.add_new_row(
+                drone_event.model, drone_event.serial, drone_event.group, self.config.status_repair, note,
+            )
+            if sheet:
+                return self.state.record_event(
+                    event_type="created", serial=drone_event.serial, group=drone_event.group,
+                    sheet=sheet, new_status=self.config.status_repair, note=note,
+                )
             return self.state.record_event(
                 event_type="not_found", serial=drone_event.serial, group=drone_event.group, note=note,
             )
+
         match = matches[0]
+        if match.old_status == self.config.status_repair:
+            return None  # уже позначений на ремонт — не дублюємо алерт
         return self.state.record_event(
             event_type="repair",
             serial=drone_event.serial,
@@ -139,14 +188,51 @@ class Monitor:
             note=note,
         )
 
-    def _poll_admin_commands(self) -> None:
+    def _process_active(self, drone_event, note: str):
+        try:
+            matches = self.registry.set_status(drone_event.serial, self.config.status_active, note=note)
+        except AmbiguousSerialError as exc:
+            return self.state.record_event(
+                event_type="ambiguous", serial=drone_event.serial, group=drone_event.group,
+                note=f"Можливі борти: {', '.join(exc.candidates)}",
+            )
+
+        if not matches:
+            sheet = self.registry.add_new_row(
+                drone_event.model, drone_event.serial, drone_event.group, self.config.status_active, note,
+            )
+            if sheet:
+                return self.state.record_event(
+                    event_type="created", serial=drone_event.serial, group=drone_event.group,
+                    sheet=sheet, new_status=self.config.status_active, note=note,
+                )
+            # Звичайний перелік наявності з нерозпізнаною моделлю чи борт,
+            # якого взагалі нема в реєстрі — на щодень такого забагато, щоб
+            # алертити адміна на кожен; це не про репутаційно важливу подію,
+            # як ремонт чи втрата.
+            return None
+
+        match = matches[0]
+        if match.old_status == self.config.status_active:
+            return None
+        return self.state.record_event(
+            event_type="active",
+            serial=drone_event.serial,
+            group=drone_event.group,
+            sheet=match.worksheet.title,
+            old_status=match.old_status,
+            new_status=self.config.status_active,
+            note=note,
+        )
+
+    def _poll_admin_commands(self) -> bool:
         try:
             new_messages, last_text = self.client.fetch_new_messages(
                 self.config.admin_chat, self.state.last_seen.get(self.config.admin_chat)
             )
         except Exception:
             logger.exception("Не вдалося прочитати команди адміна")
-            return
+            return False
 
         if last_text is not None:
             self.state.last_seen[self.config.admin_chat] = last_text
@@ -156,6 +242,9 @@ class Monitor:
                 self._send_position_snapshot()
             elif command in DAILY_REPORT_COMMANDS:
                 self._send_daily_report()
+            elif command in LIST_COMMANDS:
+                self._send_not_in_service_list()
+        return True
 
     def _send_position_snapshot(self) -> None:
         stats = self._read_position_stats()
@@ -164,6 +253,14 @@ class Monitor:
     def _send_daily_report(self) -> None:
         stats = self._read_position_stats()
         self._send(format_daily_report(stats, self.state.events))
+
+    def _send_not_in_service_list(self) -> None:
+        try:
+            rows = self.registry.list_not_in_service(self.config.status_active)
+            self._send(format_not_in_service_list(rows))
+        except Exception:
+            logger.exception("Не вдалося скласти перелік «не в роботі»")
+            self._send("Не вдалося прочитати таблицю — спробуй ще раз пізніше.")
 
     def _read_position_stats(self):
         try:

@@ -65,6 +65,23 @@ class DroneRegistry:
         self._spreadsheet = spreadsheet
         self._model_sheets = model_sheets
         self._suffix_length = serial_suffix_length
+        # Один інвентарний список у чаті може містити 15-20 серійників, і
+        # кожен тепер породжує подію (навіть просте "в роботі") — без
+        # кешу це означало б до 20х повне сканування всіх листів книги на
+        # одне повідомлення. Викликач очищає кеш між циклами опитування
+        # через clear_cache(), щоб не працювати зі застарілими даними.
+        self._values_cache: Dict[str, List[List[str]]] = {}
+
+    def clear_cache(self) -> None:
+        self._values_cache.clear()
+
+    def _get_values(self, ws) -> List[List[str]]:
+        if ws.title not in self._values_cache:
+            self._values_cache[ws.title] = ws.get_all_values()
+        return self._values_cache[ws.title]
+
+    def _invalidate(self, ws) -> None:
+        self._values_cache.pop(ws.title, None)
 
     def _candidate_worksheets(self):
         if self._model_sheets:
@@ -88,7 +105,7 @@ class DroneRegistry:
         query_suffix = _serial_suffix(serial, self._suffix_length)
         matches: List[SheetMatch] = []
         for ws in self._candidate_worksheets():
-            values = ws.get_all_values()
+            values = self._get_values(ws)
             if not values:
                 continue
             header = values[0]
@@ -118,16 +135,25 @@ class DroneRegistry:
             raise AmbiguousSerialError(serial, sorted(distinct_serials))
 
         for match in matches:
+            if match.old_status == new_status:
+                # Статус фактично не змінився (напр. борт і так значився "в
+                # роботі", і черговий інвентарний перелік це підтверджує) —
+                # не пишемо в таблицю й не засмічуємо примітку тим самим
+                # датованим записом щоразу.
+                continue
+
             header = match.worksheet.row_values(1)
             status_idx = header.index(STATUS_COLUMN) + 1  # gspread рахує колонки з 1
             match.worksheet.update_cell(match.row, status_idx, new_status)
 
-            if note and NOTE_COLUMN in header:
+            if NOTE_COLUMN in header:
                 note_idx = header.index(NOTE_COLUMN) + 1
+                stamped = _stamp_note(note)
                 existing = (match.worksheet.cell(match.row, note_idx).value or "").strip()
-                combined = f"{existing}; {note}" if existing else note
+                combined = f"{existing}; {stamped}" if existing else stamped
                 match.worksheet.update_cell(match.row, note_idx, combined)
 
+            self._invalidate(match.worksheet)
             logger.info(
                 "Статус %s: %s -> %s (лист '%s', рядок %s)",
                 match.full_serial, match.old_status, new_status, match.worksheet.title, match.row,
@@ -197,24 +223,68 @@ class DroneRegistry:
         """
         ws = self._spreadsheet.worksheet(sheet_name)
         header = [h.strip() for h in ws.row_values(1)]
-        values = {
-            "Марка дрону": model or "",
-            "Серійний номер": serial,
-            "Розташування": group or "",
-            "СТАТУС": status,
-            "Дата отримання": datetime.now().strftime("%d.%m.%Y"),
-            "Додаткова примітка": note or "",
-        }
-        if SERIAL_COLUMN in header:
-            row = [""] * len(header)
-            for key, value in values.items():
-                if key in header:
-                    row[header.index(key)] = value
-        else:
-            row = [values.get(col, "") for col in FALLBACK_LOSS_COLUMNS]
-
+        row = _build_row(header, model=model, serial=serial, group=group, status=status, note=note)
         ws.append_row(row, value_input_option="USER_ENTERED")
+        self._invalidate(ws)
         logger.info("Додано запис про втрату %s у лист '%s'", serial, sheet_name)
+
+    def add_new_row(
+        self, model: Optional[str], serial: str, group: Optional[str], status: str, note: Optional[str]
+    ) -> Optional[str]:
+        """Додає новий рядок у лист відповідної моделі, якщо серійника ще
+        нема в реєстрі. Потребує розпізнану модель з тексту повідомлення —
+        без неї не можемо знати, у який саме лист писати, а вгадувати
+        ризиковано (зіпсує підрахунки моделей на листі "На позиції").
+
+        Повертає назву листа, куди дописано рядок, або None, якщо не
+        вдалося (модель не розпізнана чи немає відповідного листа).
+        """
+        if not model:
+            return None
+        target = self._find_model_worksheet(model)
+        if target is None:
+            return None
+
+        header = [h.strip() for h in target.row_values(1)]
+        row = _build_row(header, model=model, serial=serial, group=group, status=status, note=note)
+        target.append_row(row, value_input_option="USER_ENTERED")
+        self._invalidate(target)
+        logger.info("Додано новий рядок %s (%s) у лист '%s'", serial, model, target.title)
+        return target.title
+
+    def list_not_in_service(self, active_status: str) -> List[Dict[str, str]]:
+        """Всі борти зі статусом, відмінним від активного — для команди "/list"."""
+        result: List[Dict[str, str]] = []
+        for ws in self._candidate_worksheets():
+            values = self._get_values(ws)
+            if not values:
+                continue
+            header = values[0]
+            if SERIAL_COLUMN not in header or STATUS_COLUMN not in header:
+                continue
+            serial_idx = header.index(SERIAL_COLUMN)
+            status_idx = header.index(STATUS_COLUMN)
+            group_idx = _find_column(header, ["розташування", "груп"])
+            for row in values[1:]:
+                if serial_idx >= len(row) or not row[serial_idx].strip():
+                    continue
+                status = row[status_idx].strip() if status_idx < len(row) else ""
+                if not status or status == active_status:
+                    continue
+                result.append({
+                    "model": row[0].strip() if row else "",
+                    "serial": row[serial_idx].strip(),
+                    "group": row[group_idx].strip() if group_idx is not None and group_idx < len(row) else "",
+                    "status": status,
+                })
+        return result
+
+    def _find_model_worksheet(self, model: str):
+        wanted = _normalize_model_name(model)
+        for ws in self._candidate_worksheets():
+            if _normalize_model_name(ws.title) == wanted:
+                return ws
+        return None
 
 
 def _find_column(header: List[str], name_variants: List[str]) -> Optional[int]:
@@ -240,6 +310,47 @@ def _normalize_group_name(name: str) -> str:
 
 def _serial_suffix(serial: str, length: int) -> str:
     return serial.strip().upper()[-length:]
+
+
+def _stamp_note(note: Optional[str]) -> str:
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    return f"[{date_str}] {note}" if note else f"[{date_str}]"
+
+
+def _build_row(
+    header: List[str], *, model: Optional[str], serial: str, group: Optional[str],
+    status: str, note: Optional[str],
+) -> List[str]:
+    values = {
+        "Марка дрону": model or "",
+        "Серійний номер": serial,
+        "Розташування": group or "",
+        "СТАТУС": status,
+        "Дата отримання": datetime.now().strftime("%d.%m.%Y"),
+        "Додаткова примітка": note or "",
+    }
+    if SERIAL_COLUMN in header:
+        row = [""] * len(header)
+        for key, value in values.items():
+            if key in header:
+                row[header.index(key)] = value
+        return row
+    return [values.get(col, "") for col in FALLBACK_LOSS_COLUMNS]
+
+
+# "М4Т"/"М4Е" в чаті пишуть кириличними літерами, які лише виглядають як
+# латинські M/T/E — без цього явного словника їх ніяким lower()/strip() не
+# звести докупи з назвою листа "DJI Matrice 4T".
+MODEL_ALIASES = {
+    "м4т": "matrice 4t", "m4t": "matrice 4t",
+    "м4е": "matrice 4e", "m4e": "matrice 4e",
+}
+
+
+def _normalize_model_name(name: str) -> str:
+    key = re.sub(r"\bdji\b", "", name.lower()).strip()
+    key = re.sub(r"\s+", " ", key)
+    return MODEL_ALIASES.get(key, key)
 
 
 def open_registry(

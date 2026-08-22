@@ -128,7 +128,16 @@ class SetStatusTests(unittest.TestCase):
         reg = _registry()
         reg.set_status("1581F7FVC25AC00DTHLW", "потрібен ремонт", note="Знімаємо на ремонт")
         row = reg.find_by_serial("1581F7FVC25AC00DTHLW")[0].worksheet.get_all_values()[1]
-        self.assertEqual(row[6], "Знімаємо на ремонт")
+        self.assertIn("Знімаємо на ремонт", row[6])
+        self.assertTrue(row[6].startswith("["))  # датовий штамп зміни статусу
+
+    def test_skips_write_when_status_unchanged(self):
+        reg = _registry()
+        matches = reg.set_status("1581F7K3C264200DAFYJ", "В роботі")  # вже "В роботі"
+        self.assertEqual(len(matches), 1)
+        row = matches[0].worksheet.get_all_values()[1]
+        self.assertEqual(row[4], "В роботі")
+        self.assertEqual(row[6], "")  # примітку теж не чіпали
 
     def test_unknown_serial_returns_empty_and_does_not_raise(self):
         self.assertEqual(_registry().set_status("0000000000000000XXXX", "втрачено"), [])
@@ -198,6 +207,35 @@ class AppendLossRecordTests(unittest.TestCase):
         self.assertEqual(row[0], "М4Т")
         self.assertEqual(row[1], "XYZ")
         self.assertEqual(row[4], "втрачено")
+
+
+class AddNewRowTests(unittest.TestCase):
+    def test_adds_row_to_matching_model_sheet_by_cyrillic_abbreviation(self):
+        reg = _registry()
+        created = reg.add_new_row("М4Т", "9999999999999999NEWW", "Шмель", "В роботі", None)
+        self.assertTrue(created)
+        rows = reg._spreadsheet.worksheet("DJI Matrice 4T").get_all_values()
+        self.assertEqual(rows[-1][1], "9999999999999999NEWW")
+        self.assertEqual(rows[-1][2], "Шмель")
+        self.assertEqual(rows[-1][4], "В роботі")
+
+    def test_returns_false_without_recognized_model(self):
+        reg = _registry()
+        self.assertFalse(reg.add_new_row(None, "9999999999999999NEWW", "Шмель", "В роботі", None))
+
+    def test_returns_false_for_unknown_model(self):
+        reg = _registry()
+        self.assertFalse(reg.add_new_row("Autel EVO", "9999999999999999NEWW", "Шмель", "В роботі", None))
+
+
+class ListNotInServiceTests(unittest.TestCase):
+    def test_excludes_active_status_and_blank_rows(self):
+        reg = _registry()
+        reg.set_status("1581F7K3C263H00DD65Z", "потрібен ремонт")
+        not_in_service = reg.list_not_in_service(active_status="В роботі")
+        serials = {row["serial"] for row in not_in_service}
+        self.assertIn("1581F7K3C263H00DD65Z", serials)
+        self.assertNotIn("1581F7K3C264200DAFYJ", serials)  # лишається "В роботі"
 
 
 if __name__ == "__main__":

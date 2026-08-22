@@ -159,6 +159,115 @@ class MonitorLossEventTests(unittest.TestCase):
             self.assertIn("1581F7K3C265S00DFSGJ", client.sent[0][1])
 
 
+class MonitorActiveEventTests(unittest.TestCase):
+    def test_plain_listing_of_already_active_drone_does_not_alert(self):
+        # "1581F7FVC25AC00DTHLW" у фейковому реєстрі вже "В роботі" —
+        # звичайний перелік наявності не повинен щоразу спамити адміна.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            message = 'Група "Шмель"\nMatrice 4E\n1581F7FVC25AC00DTHLW\n'
+            client = FakeWhatsAppClient(incoming={"Облік БпЛА РР": [message]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_once()
+
+            self.assertEqual(client.sent, [])
+            self.assertEqual(monitor.state.events, [])
+
+    def test_return_to_service_from_repair_alerts_and_counts_as_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            registry.set_status("1581F7FVC25AC00DTHLW", "потрібен ремонт")  # спершу "на ремонті"
+            message = 'Група "Шмель"\nMatrice 4E\n1581F7FVC25AC00DTHLW\n'
+            client = FakeWhatsAppClient(incoming={"Облік БпЛА РР": [message]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_once()
+
+            self.assertEqual(len(client.sent), 1)
+            self.assertIn("В роботі", client.sent[0][1])
+            self.assertEqual(monitor.state.events[0].event_type, "active")
+
+    def test_unrecognized_serial_with_known_model_creates_new_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            message = 'Група "Шмель"\nMatrice 4E\n9999999999999999NEWW\n'
+            client = FakeWhatsAppClient(incoming={"Облік БпЛА РР": [message]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_once()
+
+            self.assertEqual(monitor.state.events[0].event_type, "created")
+            self.assertIn("Новий борт", client.sent[0][1])
+            rows = registry._spreadsheet.worksheet("DJI Matrice 4E").get_all_values()
+            self.assertEqual(rows[-1][1], "9999999999999999NEWW")
+
+    def test_unrecognized_serial_without_model_context_is_silently_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            client = FakeWhatsAppClient(incoming={"Облік БпЛА РР": ["9999999999999999NEWW\n"]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_once()
+
+            self.assertEqual(client.sent, [])
+            self.assertEqual(monitor.state.events, [])
+
+    def test_second_identical_repair_notice_does_not_resend_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            client = FakeWhatsAppClient(incoming={"Облік БпЛА РР": [INVENTORY_MESSAGE]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_once()
+            self.assertEqual(len(client.sent), 1)
+
+            client.sent.clear()
+            monitor._poll_once()  # той самий "на ремонт" ще раз
+            self.assertEqual(client.sent, [])
+
+
+class MonitorListCommandTests(unittest.TestCase):
+    def test_list_command_shows_non_active_drones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            registry = _registry()
+            registry.set_status("1581F7FVC25AC00DTHLW", "потрібен ремонт")
+            client = FakeWhatsAppClient(incoming={"Archi": ["/list"]})
+            monitor = Monitor(config, registry=registry, client=client)
+
+            monitor._poll_admin_commands()
+
+            self.assertEqual(len(client.sent), 1)
+            _, text = client.sent[0]
+            self.assertIn("потрібен ремонт", text)
+            self.assertIn("DTHLW", text)
+
+
+class MonitorReconnectTests(unittest.TestCase):
+    def test_reconnects_after_repeated_full_cycle_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+
+            class AlwaysFailingClient(FakeWhatsAppClient):
+                def fetch_new_messages(self, chat_name, last_seen_text):
+                    raise RuntimeError("Chrome/Selenium впав")
+
+            client = AlwaysFailingClient(incoming={})
+            monitor = Monitor(config, registry=_registry(), client=client)
+
+            for _ in range(3):
+                monitor._poll_once()
+
+            self.assertTrue(client.stopped)
+            self.assertTrue(client.started)
+
+
 class MonitorAdminCommandTests(unittest.TestCase):
     def test_position_command_reads_live_day_night_repair(self):
         with tempfile.TemporaryDirectory() as tmp:

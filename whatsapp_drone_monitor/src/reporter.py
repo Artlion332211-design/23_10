@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import List
+from typing import Dict, List
 
 from .sheets_client import PositionStat
 from .state import ProcessedEvent
@@ -9,8 +9,10 @@ from .state import ProcessedEvent
 RECENT_WINDOW_HOURS = 24
 
 EVENT_LABELS = {
+    "active": "🟢 В роботі",
     "repair": "🔧 На ремонт",
-    "loss": "🚨 Втрата",
+    "loss": "🔴 Втрата",
+    "created": "🆕 Новий борт додано в реєстр",
     "not_found": "❓ Не знайдено в реєстрі",
     "ambiguous": "⚠️ Кілька збігів за серійником",
 }
@@ -56,19 +58,58 @@ def format_daily_report(stats: List[PositionStat], events: List[ProcessedEvent])
     recent = _recent(events)
     losses = [e for e in recent if e.event_type == "loss"]
     repairs = [e for e in recent if e.event_type == "repair"]
+    # "active"-подія трапляється лише при РЕАЛЬНІЙ зміні статусу (set_status
+    # пропускає запис, якщо статус і так уже такий), тому це справді
+    # "повернулось у стрій", а не кожна згадка в інвентарному переліку.
+    returned = [e for e in recent if e.event_type == "active"]
 
     lines = [f"📊 Денний звіт станом на {now.strftime('%H:%M %d.%m.%Y')}", "", "Позиції:"]
     lines.append(format_position_stats(stats))
     lines.append("")
-    lines.append(f"За останні {RECENT_WINDOW_HOURS} год: втрат — {len(losses)}, передано на ремонт — {len(repairs)}")
+    lines.append(
+        f"За останні {RECENT_WINDOW_HOURS} год: передано на ремонт — {len(repairs)}, "
+        f"втрачено — {len(losses)}, повернулось у стрій — {len(returned)}"
+    )
     for e in losses:
         group = f"[{e.group}] " if e.group else ""
-        lines.append(f"  🚨 Втрата {group}{_short_time(e.time)} — {e.serial}")
+        lines.append(f"  🔴 Втрата {group}{_short_time(e.time)} — {e.serial}")
     for e in repairs:
         group = f"[{e.group}] " if e.group else ""
         lines.append(f"  🔧 Ремонт {group}{_short_time(e.time)} — {e.serial}")
+    for e in returned:
+        group = f"[{e.group}] " if e.group else ""
+        lines.append(f"  🟢 Повернувся {group}{_short_time(e.time)} — {e.serial}")
 
     return "\n".join(lines)
+
+
+def format_not_in_service_list(rows: List[Dict[str, str]], limit: int = 40) -> str:
+    if not rows:
+        return "Усі борти в реєстрі зі статусом «в роботі»."
+
+    by_status: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        by_status.setdefault(row["status"], []).append(row)
+
+    lines = [f"📋 Не в роботі: {len(rows)}", ""]
+    shown = 0
+    for status in sorted(by_status):
+        group_rows = by_status[status]
+        lines.append(f"{status} ({len(group_rows)}):")
+        for row in group_rows:
+            if shown >= limit:
+                break
+            group = f" [{row['group']}]" if row["group"] else ""
+            lines.append(f"  {row['model']}{group} — ...{row['serial'][-5:]}")
+            shown += 1
+        lines.append("")
+        if shown >= limit:
+            break
+
+    if len(rows) > shown:
+        lines.append(f"... і ще {len(rows) - shown}, повний список — у самій таблиці.")
+
+    return "\n".join(lines).strip()
 
 
 def _recent(entries: List[ProcessedEvent], hours: int = RECENT_WINDOW_HOURS) -> List[ProcessedEvent]:

@@ -35,6 +35,7 @@ class Config:
     # просто не буде відповідати іншим рядкам з тим самим сенсом.
     status_repair: str = "потрібен ремонт"
     status_lost: str = "втрачено"
+    status_active: str = "В роботі"
 
     poll_interval_seconds: int = 20
     chrome_profile_dir: str = "./chrome_profile"

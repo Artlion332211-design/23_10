@@ -46,26 +46,34 @@ Matrice 4e
 
 
 class ParseInventoryMessageTests(unittest.TestCase):
-    def test_only_annotated_serial_produces_event(self):
+    def test_annotated_serial_is_repair(self):
         events = parse_message(INVENTORY_MESSAGE)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].serial, "1581F7FVC25AC00DTHLW")
-        self.assertIs(events[0].event_type, EventType.REPAIR)
-        self.assertEqual(events[0].group, "Шмель")
+        by_serial = {e.serial: e for e in events}
+        target = by_serial["1581F7FVC25AC00DTHLW"]
+        self.assertIs(target.event_type, EventType.REPAIR)
+        self.assertEqual(target.group, "Шмель")
+        self.assertEqual(target.model, "Matrice 4E")
 
-    def test_plain_listed_serials_are_ignored(self):
+    def test_plain_listed_serials_become_active(self):
         events = parse_message(INVENTORY_MESSAGE)
-        serials = {e.serial for e in events}
-        self.assertNotIn("1581F7K3C264200DAFYJ", serials)
-        self.assertNotIn("1581F7FVC261T00DWDCC", serials)
+        by_serial = {e.serial: e for e in events}
+        for serial in ["1581F7K3C264200DAFYJ", "1581F7K3C263H00DD65Z", "1581F7FVC261T00DWDCC", "1581F7FVC261T00DM6PU"]:
+            self.assertIs(by_serial[serial].event_type, EventType.ACTIVE, serial)
+            self.assertEqual(by_serial[serial].group, "Шмель")
+        self.assertEqual(by_serial["1581F7K3C264200DAFYJ"].model, "Matrice 4T")
+        self.assertEqual(by_serial["1581F7FVC261T00DM6PU"].model, "Matrice 4E")
+
+    def test_total_event_count_matches_all_serials_in_message(self):
+        events = parse_message(INVENTORY_MESSAGE)
+        self.assertEqual(len(events), 5)  # 4 в роботі + 1 ремонт, батарейки/пропи не рахуються
 
 
 class ParseLossMessageTests(unittest.TestCase):
     def test_extracts_full_loss_report(self):
         events = parse_message(LOSS_MESSAGE)
-        self.assertEqual(len(events), 1)
-        e = events[0]
-        self.assertIs(e.event_type, EventType.LOSS)
+        losses = [e for e in events if e.event_type is EventType.LOSS]
+        self.assertEqual(len(losses), 1)
+        e = losses[0]
         self.assertEqual(e.serial, "1581F7K3C265S00DFSGJ")
         self.assertEqual(e.group, "Кобра 1")
         self.assertEqual(e.pilot, "Сурговський А.")
@@ -74,19 +82,24 @@ class ParseLossMessageTests(unittest.TestCase):
         self.assertEqual(e.coordinates, "37U CP 97930 82698")
         self.assertEqual(e.reason, "Почало трусити камеру і сів на дерево")
 
-    def test_trailing_inventory_block_produces_no_events(self):
+    def test_trailing_inventory_becomes_active_not_loss(self):
         events = parse_message(LOSS_MESSAGE)
-        self.assertEqual(len(events), 1)  # лише сама втрата, не подальший перелік
+        trailing = [e for e in events if e.serial in ("1581F7FVC264P00DZMKT", "1581F7FVC261L00DMBB2")]
+        self.assertEqual(len(trailing), 2)
+        for e in trailing:
+            self.assertIs(e.event_type, EventType.ACTIVE)
+            self.assertEqual(e.group, "Сімсон2")
 
 
 class ParseHandoffMessageTests(unittest.TestCase):
     def test_bare_serial_followed_by_repair_phrase(self):
         events = parse_message(HANDOFF_MESSAGE)
-        self.assertEqual(len(events), 1)
-        e = events[0]
-        self.assertIs(e.event_type, EventType.REPAIR)
-        self.assertEqual(e.serial, "1581F7FVC264P00DVWTP")
-        self.assertIn("Коброю 1", e.note)
+        by_serial = {e.serial: e for e in events}
+        target = by_serial["1581F7FVC264P00DVWTP"]
+        self.assertIs(target.event_type, EventType.REPAIR)
+        self.assertIn("Коброю 1", target.note)
+        # Сусідній серійник у тому ж переліку не повинен стати "ремонтом".
+        self.assertIs(by_serial["1581F7FVC264P00DZMKT"].event_type, EventType.ACTIVE)
 
 
 class ClassifyNoteEdgeCasesTests(unittest.TestCase):
@@ -94,7 +107,7 @@ class ClassifyNoteEdgeCasesTests(unittest.TestCase):
         events = parse_message("1581f7fvc25ac00dthlw - (Знімаємо на ремонт)")
         self.assertEqual(events[0].serial, "1581F7FVC25AC00DTHLW")
 
-    def test_no_event_for_message_without_status_trigger(self):
+    def test_no_event_for_message_without_serial(self):
         events = parse_message("Всім привіт, як справи?")
         self.assertEqual(events, [])
 

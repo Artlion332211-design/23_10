@@ -16,13 +16,18 @@ GROUP_STOCK_RE = re.compile(r'["«]([^"»]+)["»]\s+в наявності', re.I
 LOSS_HEADER_RE = re.compile(r"втрата\s+борт", re.IGNORECASE)
 REPAIR_PHRASE_RE = re.compile(r"ремонт", re.IGNORECASE)
 LOSS_PHRASE_RE = re.compile(r"втрат|збил[аи]|збито|підбил[аи]|підбито", re.IGNORECASE)
-MODEL_RE = re.compile(r"\b(Matrice\s*4T|Matrice\s*4E|М4Т|М4Е|M4T|M4E)\b", re.IGNORECASE)
+MODEL_RE = re.compile(
+    r"\b(Matrice\s*4T|Matrice\s*4E|М4Т|М4Е|M4T|M4E|"
+    r"Mavic\s*3T|Mavic\s*3E|Mavic\s*3\s*Pro|Mavic\s*3\s*Classic|Mavic\s*4T|Mavic\s*4E|Autel)\b",
+    re.IGNORECASE,
+)
 FIELD_RE = re.compile(
     r"^(дата|час|орієнтовні координати|координати|причина|пілот)\s*:?\s*(.*)$", re.IGNORECASE
 )
 
 
 class EventType(enum.Enum):
+    ACTIVE = "active"  # борт значиться в переліку наявності — статус "в роботі"
     REPAIR = "repair"
     LOSS = "loss"
 
@@ -43,17 +48,17 @@ class DroneEvent:
 
 
 def parse_message(text: str) -> List[DroneEvent]:
-    """Витягує статусні події (ремонт/втрата) з повідомлення групи.
+    """Витягує статусні події (в роботі / ремонт / втрата) з повідомлення групи.
 
-    Просте перерахування серійників у складі інвентарного звіту (без
-    жодної позначки) НЕ породжує подій — лише явний тригер біля серійника
-    (ремонт/втрата) міняє статус, інакше кожен щоденний перелік наявності
-    перетирав би статуси в таблиці.
+    Кожен серійник у переліку наявності означає "борт у роботі", якщо біля
+    нього нема явної позначки ремонту чи втрати — так адмін бачить, коли
+    борт повернувся в стрій, а не тільки коли його зняли.
     """
     lines = text.splitlines()
     n = len(lines)
     events: List[DroneEvent] = []
     current_group: Optional[str] = None
+    current_model: Optional[str] = None
 
     i = 0
     while i < n:
@@ -65,6 +70,12 @@ def parse_message(text: str) -> List[DroneEvent]:
         header_match = GROUP_HEADER_RE.match(line) or GROUP_STOCK_RE.search(line)
         if header_match:
             current_group = header_match.group(1).strip()
+            i += 1
+            continue
+
+        model_header = MODEL_RE.fullmatch(line)
+        if model_header:
+            current_model = model_header.group(1)
             i += 1
             continue
 
@@ -90,11 +101,13 @@ def parse_message(text: str) -> List[DroneEvent]:
         inline = SERIAL_INLINE_RE.match(line)
         if inline:
             serial, note = inline.group(1).upper(), inline.group(2).strip()
-            event_type = _classify_note(note)
-            if event_type:
-                events.append(
-                    DroneEvent(event_type, serial=serial, group=current_group, note=note, raw=line)
+            event_type = _classify_note(note) or EventType.ACTIVE
+            events.append(
+                DroneEvent(
+                    event_type, serial=serial, group=current_group, model=current_model,
+                    note=note or None, raw=line,
                 )
+            )
             i += 1
             continue
 
@@ -105,19 +118,22 @@ def parse_message(text: str) -> List[DroneEvent]:
             # позначка в інвентарному переліку "прилипає" до попереднього
             # борта замість свого власного.
             next_is_serial_line = bool(SERIAL_RE.match(next_line) or SERIAL_INLINE_RE.match(next_line))
-            event_type = _classify_note(next_line) if next_line and not next_is_serial_line else None
+            note_source = next_line if next_line and not next_is_serial_line else ""
+            event_type = _classify_note(note_source) if note_source else None
+
             if event_type:
                 events.append(
                     DroneEvent(
-                        event_type,
-                        serial=line.upper(),
-                        group=current_group,
-                        note=next_line,
-                        raw=f"{line}\n{next_line}",
+                        event_type, serial=line.upper(), group=current_group, model=current_model,
+                        note=note_source, raw=f"{line}\n{note_source}",
                     )
                 )
                 i += 2
                 continue
+
+            events.append(
+                DroneEvent(EventType.ACTIVE, serial=line.upper(), group=current_group, model=current_model, raw=line)
+            )
             i += 1
             continue
 
