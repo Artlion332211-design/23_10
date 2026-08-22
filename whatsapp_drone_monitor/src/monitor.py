@@ -6,21 +6,25 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from .config import Config
-from .parser import EventType, classify
-from .reporter import format_alert, format_status_report
-from .state import FleetState, load_state, save_state
+from .parser import EventType, parse_message
+from .reporter import format_event_alert, format_status_report
+from .sheets_client import DroneRegistry, open_registry
+from .state import BotState, load_state, save_state
 from .whatsapp_client import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 
-REPORT_COMMANDS = {"звіт", "/звіт", "статус", "/статус"}
+REPORT_COMMANDS = {"звіт", "/звіт", "статус", "/статус", "на позиції", "/на_позиції"}
 
 
 class Monitor:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, registry: Optional[DroneRegistry] = None, client=None):
         self.config = config
-        self.client = WhatsAppClient(config.chrome_profile_dir)
-        self.state: FleetState = load_state(config.state_file)
+        self.client = client or WhatsAppClient(config.chrome_profile_dir)
+        self.registry = registry or open_registry(
+            config.spreadsheet_id, config.credentials_path, config.model_sheets
+        )
+        self.state: BotState = load_state(config.state_file)
         self._last_report_at: Optional[datetime] = None
 
     def run(self) -> None:
@@ -50,29 +54,46 @@ class Monitor:
             if last_text is not None:
                 self.state.last_seen[chat_name] = last_text
             for text in new_messages:
-                self._handle_message(group_label, text)
+                self._handle_message(text)
             if new_messages:
                 save_state(self.state, self.config.state_file)
 
         self._poll_admin_commands()
 
-    def _handle_message(self, group_label: str, text: str) -> None:
-        classified = classify(text, self.config)
+    def _handle_message(self, text: str) -> None:
+        for drone_event in parse_message(text):
+            new_status = (
+                self.config.status_repair
+                if drone_event.event_type is EventType.REPAIR
+                else self.config.status_lost
+            )
+            note = _build_note(drone_event)
 
-        if classified.event_type is EventType.LAUNCH:
-            self.state.record_launch(group_label)
-        elif classified.event_type is EventType.RETURN:
-            self.state.record_return(group_label)
-        elif classified.event_type is EventType.LOSS:
-            self.state.record_loss(group_label, text, classified.matched_keyword)
-            self._alert("Втрата дрона", group_label, text)
-        elif classified.event_type is EventType.INCIDENT:
-            self.state.record_incident(group_label, text, classified.matched_keyword)
-            self._alert("Нештатна ситуація", group_label, text)
+            matches = self.registry.set_status(drone_event.serial, new_status, note=note)
 
-    def _alert(self, label: str, group_label: str, text: str) -> None:
+            if not matches:
+                event = self.state.record_event(
+                    event_type="not_found",
+                    serial=drone_event.serial,
+                    group=drone_event.group,
+                    note=note,
+                )
+            else:
+                match = matches[0]
+                event = self.state.record_event(
+                    event_type=drone_event.event_type.value,
+                    serial=drone_event.serial,
+                    group=drone_event.group,
+                    sheet=match.worksheet.title,
+                    old_status=match.old_status,
+                    new_status=new_status,
+                    note=note,
+                )
+            self._alert(event)
+
+    def _alert(self, event) -> None:
         try:
-            self.client.send_message(self.config.admin_chat, format_alert(label, group_label, text))
+            self.client.send_message(self.config.admin_chat, format_event_alert(event))
         except Exception:
             logger.exception("Не вдалося надіслати алерт адміну")
 
@@ -100,6 +121,28 @@ class Monitor:
 
     def _send_report(self) -> None:
         try:
-            self.client.send_message(self.config.admin_chat, format_status_report(self.state))
+            summary = self.registry.read_position_summary(self.config.position_summary_sheet)
+        except Exception:
+            logger.exception("Не вдалося прочитати лист «%s»", self.config.position_summary_sheet)
+            summary = ""
+        try:
+            self.client.send_message(
+                self.config.admin_chat, format_status_report(summary, self.state.events)
+            )
         except Exception:
             logger.exception("Не вдалося надіслати звіт адміну")
+
+
+def _build_note(drone_event) -> str:
+    parts = []
+    if drone_event.pilot:
+        parts.append(f"Пілот: {drone_event.pilot}")
+    if drone_event.date or drone_event.time:
+        parts.append(f"{drone_event.date or ''} {drone_event.time or ''}".strip())
+    if drone_event.coordinates:
+        parts.append(f"Координати: {drone_event.coordinates}")
+    if drone_event.reason:
+        parts.append(f"Причина: {drone_event.reason}")
+    if not parts and drone_event.note:
+        parts.append(drone_event.note)
+    return "; ".join(parts)

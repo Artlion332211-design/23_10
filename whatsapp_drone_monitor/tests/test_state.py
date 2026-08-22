@@ -2,46 +2,34 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.state import FleetState, load_state, save_state
+from src.state import BotState, load_state, save_state
 
 
-class FleetStateTests(unittest.TestCase):
-    def test_launch_increments_on_position(self):
-        state = FleetState()
-        state.record_launch("ШМЕЛЬ")
-        state.record_launch("ШМЕЛЬ")
-        self.assertEqual(state.group("ШМЕЛЬ").on_position, 2)
-        self.assertEqual(state.total_on_position(), 2)
-
-    def test_loss_decrements_and_logs(self):
-        state = FleetState()
-        state.record_launch("ШМЕЛЬ")
-        state.record_loss("ШМЕЛЬ", "Втрата дрона", "втрата дрон")
-        self.assertEqual(state.group("ШМЕЛЬ").on_position, 0)
-        self.assertEqual(state.group("ШМЕЛЬ").lost_total, 1)
-        self.assertEqual(len(state.losses), 1)
-
-    def test_on_position_never_negative(self):
-        state = FleetState()
-        state.record_return("ШМЕЛЬ")
-        self.assertEqual(state.group("ШМЕЛЬ").on_position, 0)
+class BotStateTests(unittest.TestCase):
+    def test_record_event_stores_fields(self):
+        state = BotState()
+        state.record_event(event_type="repair", serial="ABC123", group="Шмель", new_status="потрібен ремонт")
+        self.assertEqual(len(state.events), 1)
+        self.assertEqual(state.events[0].serial, "ABC123")
 
     def test_roundtrip_serialization(self):
-        state = FleetState()
-        state.record_launch("КОБРА")
-        state.record_incident("КОБРА", "Обрив зв'язку", "обрив зв'язку")
+        state = BotState()
+        state.last_seen["Шмель"] = "остання перевірена фраза"
+        state.record_event(event_type="loss", serial="XYZ789", group="Кобра 1")
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             save_state(state, path)
             loaded = load_state(path)
 
-        self.assertEqual(loaded.group("КОБРА").on_position, 1)
-        self.assertEqual(len(loaded.incidents), 1)
+        self.assertEqual(loaded.last_seen["Шмель"], "остання перевірена фраза")
+        self.assertEqual(len(loaded.events), 1)
+        self.assertEqual(loaded.events[0].serial, "XYZ789")
 
     def test_load_missing_file_returns_empty_state(self):
         state = load_state("/tmp/this-file-does-not-exist-12345.json")
-        self.assertEqual(state.total_on_position(), 0)
+        self.assertEqual(state.events, [])
+        self.assertEqual(state.last_seen, {})
 
 
 if __name__ == "__main__":

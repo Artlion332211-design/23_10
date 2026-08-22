@@ -3,41 +3,50 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import List
 
-from .state import FleetState, LogEntry
+from .state import ProcessedEvent
 
 RECENT_WINDOW_HOURS = 24
 
+EVENT_LABELS = {
+    "repair": "🔧 На ремонт",
+    "loss": "🚨 Втрата",
+    "not_found": "❓ Не знайдено в реєстрі",
+}
 
-def format_status_report(state: FleetState) -> str:
+
+def format_event_alert(event: ProcessedEvent) -> str:
+    label = EVENT_LABELS.get(event.event_type, event.event_type)
+    lines = [f"{label} — серійник {event.serial}"]
+    if event.group:
+        lines.append(f"Група: {event.group}")
+    if event.event_type == "not_found":
+        lines.append("Серійника немає в таблиці «РР-БпЛА» — потрібна ручна перевірка.")
+    else:
+        lines.append(f"Статус у таблиці: {event.old_status or '—'} → {event.new_status}")
+        lines.append(f"Лист: {event.sheet}")
+    if event.note:
+        lines.append(f"Деталі: {_truncate(event.note, 300)}")
+    return "\n".join(lines)
+
+
+def format_status_report(position_summary: str, recent_events: List[ProcessedEvent]) -> str:
     now = datetime.now()
-    lines = [f"\U0001F4CA Звіт по БпЛА станом на {now.strftime('%H:%M %d.%m.%Y')}", ""]
-    lines.append(f"На позиції зараз: {state.total_on_position()} борт(и)")
-    for name in sorted(state.groups):
-        g = state.groups[name]
-        if g.on_position or g.launched_total or g.lost_total:
-            lines.append(f"  {name}: {g.on_position}")
+    lines = [f"📊 Звіт по БпЛА станом на {now.strftime('%H:%M %d.%m.%Y')}", ""]
+    lines.append("На позиції (за даними таблиці «РР-БпЛА»):")
+    lines.append(position_summary if position_summary else "  (не вдалося прочитати лист «На позиції»)")
 
-    recent_losses = _recent(state.losses)
-    recent_incidents = _recent(state.incidents)
-
+    recent = _recent(recent_events)
     lines.append("")
-    lines.append(
-        f"За останні {RECENT_WINDOW_HOURS} год: втрат — {len(recent_losses)}, "
-        f"нештатних ситуацій — {len(recent_incidents)}"
-    )
-    for e in recent_losses:
-        lines.append(f"  ⚠️ Втрата [{e.group}] {_short_time(e.time)} — {_truncate(e.text)}")
-    for e in recent_incidents:
-        lines.append(f"  ⚠️ НС [{e.group}] {_short_time(e.time)} — {_truncate(e.text)}")
+    lines.append(f"Зміни статусів за останні {RECENT_WINDOW_HOURS} год: {len(recent)}")
+    for e in recent:
+        label = EVENT_LABELS.get(e.event_type, e.event_type)
+        group = f"[{e.group}] " if e.group else ""
+        lines.append(f"  {label} {group}{_short_time(e.time)} — {e.serial}")
 
     return "\n".join(lines)
 
 
-def format_alert(event_label: str, group: str, text: str) -> str:
-    return f"\U0001F6A8 {event_label} — {group}\n{_truncate(text, 300)}"
-
-
-def _recent(entries: List[LogEntry], hours: int = RECENT_WINDOW_HOURS) -> List[LogEntry]:
+def _recent(entries: List[ProcessedEvent], hours: int = RECENT_WINDOW_HOURS) -> List[ProcessedEvent]:
     cutoff = datetime.now() - timedelta(hours=hours)
     return [e for e in entries if datetime.fromisoformat(e.time) >= cutoff]
 

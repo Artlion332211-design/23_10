@@ -9,88 +9,54 @@ from typing import Dict, List, Optional, Union
 
 
 @dataclass
-class GroupState:
-    on_position: int = 0
-    launched_total: int = 0
-    lost_total: int = 0
-    returned_total: int = 0
-
-
-@dataclass
-class LogEntry:
+class ProcessedEvent:
     time: str
-    group: str
-    text: str
-    keyword: Optional[str] = None
+    event_type: str  # "repair" / "loss" / "not_found"
+    serial: str
+    group: Optional[str] = None
+    sheet: Optional[str] = None
+    old_status: Optional[str] = None
+    new_status: Optional[str] = None
+    note: Optional[str] = None
 
 
 @dataclass
-class FleetState:
-    groups: Dict[str, GroupState] = field(default_factory=dict)
-    losses: List[LogEntry] = field(default_factory=list)
-    incidents: List[LogEntry] = field(default_factory=list)
+class BotState:
     # chat_name -> текст останнього обробленого повідомлення в цьому чаті
     last_seen: Dict[str, str] = field(default_factory=dict)
+    events: List[ProcessedEvent] = field(default_factory=list)
 
-    def group(self, name: str) -> GroupState:
-        return self.groups.setdefault(name, GroupState())
-
-    def record_launch(self, group: str) -> None:
-        g = self.group(group)
-        g.on_position += 1
-        g.launched_total += 1
-
-    def record_return(self, group: str) -> None:
-        g = self.group(group)
-        g.on_position = max(0, g.on_position - 1)
-        g.returned_total += 1
-
-    def record_loss(self, group: str, text: str, keyword: Optional[str]) -> None:
-        g = self.group(group)
-        g.on_position = max(0, g.on_position - 1)
-        g.lost_total += 1
-        self.losses.append(_log_entry(group, text, keyword))
-
-    def record_incident(self, group: str, text: str, keyword: Optional[str]) -> None:
-        self.incidents.append(_log_entry(group, text, keyword))
-
-    def total_on_position(self) -> int:
-        return sum(g.on_position for g in self.groups.values())
+    def record_event(self, **kwargs) -> ProcessedEvent:
+        entry = ProcessedEvent(time=datetime.now().isoformat(timespec="seconds"), **kwargs)
+        self.events.append(entry)
+        return entry
 
     def to_dict(self) -> dict:
         return {
-            "groups": {name: asdict(g) for name, g in self.groups.items()},
-            "losses": [asdict(e) for e in self.losses],
-            "incidents": [asdict(e) for e in self.incidents],
             "last_seen": self.last_seen,
+            "events": [asdict(e) for e in self.events],
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "FleetState":
+    def from_dict(cls, data: dict) -> "BotState":
         state = cls()
-        state.groups = {name: GroupState(**g) for name, g in data.get("groups", {}).items()}
-        state.losses = [LogEntry(**e) for e in data.get("losses", [])]
-        state.incidents = [LogEntry(**e) for e in data.get("incidents", [])]
         state.last_seen = data.get("last_seen", {})
+        state.events = [ProcessedEvent(**e) for e in data.get("events", [])]
         return state
 
 
-def _log_entry(group: str, text: str, keyword: Optional[str]) -> LogEntry:
-    return LogEntry(time=datetime.now().isoformat(timespec="seconds"), group=group, text=text, keyword=keyword)
-
-
-def load_state(path: Union[str, Path]) -> FleetState:
+def load_state(path: Union[str, Path]) -> BotState:
     p = Path(path)
     if not p.exists():
-        return FleetState()
-    return FleetState.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        return BotState()
+    return BotState.from_dict(json.loads(p.read_text(encoding="utf-8")))
 
 
-def save_state(state: FleetState, path: Union[str, Path]) -> None:
+def save_state(state: BotState, path: Union[str, Path]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     # Атомарний запис (tmp-файл + rename), щоб збій чи Ctrl+C посеред запису
-    # не лишив state.json пошкодженим і не обнулив лічильники на позиції.
+    # не лишив state.json пошкодженим.
     fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=".state_", suffix=".tmp")
     with open(fd, "w", encoding="utf-8") as f:
         json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
