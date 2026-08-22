@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import List
 
+from .sheets_client import PositionStat
 from .state import ProcessedEvent
 
 RECENT_WINDOW_HOURS = 24
@@ -11,6 +12,7 @@ EVENT_LABELS = {
     "repair": "🔧 На ремонт",
     "loss": "🚨 Втрата",
     "not_found": "❓ Не знайдено в реєстрі",
+    "ambiguous": "⚠️ Кілька збігів за серійником",
 }
 
 
@@ -21,6 +23,8 @@ def format_event_alert(event: ProcessedEvent) -> str:
         lines.append(f"Група: {event.group}")
     if event.event_type == "not_found":
         lines.append("Серійника немає в таблиці «РР-БпЛА» — потрібна ручна перевірка.")
+    elif event.event_type == "ambiguous":
+        lines.append("Останні символи збігаються з кількома різними бортами — статус НЕ змінено.")
     else:
         lines.append(f"Статус у таблиці: {event.old_status or '—'} → {event.new_status}")
         lines.append(f"Лист: {event.sheet}")
@@ -29,19 +33,40 @@ def format_event_alert(event: ProcessedEvent) -> str:
     return "\n".join(lines)
 
 
-def format_status_report(position_summary: str, recent_events: List[ProcessedEvent]) -> str:
-    now = datetime.now()
-    lines = [f"📊 Звіт по БпЛА станом на {now.strftime('%H:%M %d.%m.%Y')}", ""]
-    lines.append("На позиції (за даними таблиці «РР-БпЛА»):")
-    lines.append(position_summary if position_summary else "  (не вдалося прочитати лист «На позиції»)")
+def format_position_stats(stats: List[PositionStat]) -> str:
+    lines = []
+    total_day = total_night = total_repair = 0
+    for s in stats:
+        if not s.found:
+            lines.append(f"  {s.group}: не знайдено на листі «На позиції»")
+            continue
+        lines.append(
+            f"  {s.group}: {s.day_drones} денних + {s.night_drones} нічних на позиції, "
+            f"{s.repair_count} у ремонті"
+        )
+        total_day += s.day_drones
+        total_night += s.night_drones
+        total_repair += s.repair_count
+    lines.append(f"  Разом: {total_day} денних, {total_night} нічних, {total_repair} у ремонті")
+    return "\n".join(lines)
 
-    recent = _recent(recent_events)
+
+def format_daily_report(stats: List[PositionStat], events: List[ProcessedEvent]) -> str:
+    now = datetime.now()
+    recent = _recent(events)
+    losses = [e for e in recent if e.event_type == "loss"]
+    repairs = [e for e in recent if e.event_type == "repair"]
+
+    lines = [f"📊 Денний звіт станом на {now.strftime('%H:%M %d.%m.%Y')}", "", "Позиції:"]
+    lines.append(format_position_stats(stats))
     lines.append("")
-    lines.append(f"Зміни статусів за останні {RECENT_WINDOW_HOURS} год: {len(recent)}")
-    for e in recent:
-        label = EVENT_LABELS.get(e.event_type, e.event_type)
+    lines.append(f"За останні {RECENT_WINDOW_HOURS} год: втрат — {len(losses)}, передано на ремонт — {len(repairs)}")
+    for e in losses:
         group = f"[{e.group}] " if e.group else ""
-        lines.append(f"  {label} {group}{_short_time(e.time)} — {e.serial}")
+        lines.append(f"  🚨 Втрата {group}{_short_time(e.time)} — {e.serial}")
+    for e in repairs:
+        group = f"[{e.group}] " if e.group else ""
+        lines.append(f"  🔧 Ремонт {group}{_short_time(e.time)} — {e.serial}")
 
     return "\n".join(lines)
 

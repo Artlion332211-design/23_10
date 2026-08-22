@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 
 from src.config import Config
+from src.reporter import format_position_stats
 from src.sheets_client import open_registry
 
 CONFIG_PATH = "config.yaml"
@@ -22,11 +23,12 @@ def main() -> int:
         print("на email сервісного акаунта (поле client_email у credentials.json) з правами Editor.")
         return 1
 
-    print("Підключення успішне. Листи книги:")
-    for title in registry.list_worksheet_titles():
+    print("Підключення успішне. Листи книги (це може зайняти кілька секунд):")
+    titles = registry.list_worksheet_titles()
+    for title in titles:
         print(f"  - {title}")
 
-    print("\nПробний пошук серійника з config.example.yaml (можна ігнорувати 'не знайдено'):")
+    print(f"\nПробний пошук серійника з {config.spreadsheet_id} (можна ігнорувати 'не знайдено'):")
     test_serial = "1581F7K3C264200DAFYJ"
     matches = registry.find_by_serial(test_serial)
     if matches:
@@ -35,8 +37,24 @@ def main() -> int:
     else:
         print(f"  Серійник {test_serial} не знайдено (ОК, якщо це не той борт).")
 
-    print("\nЛист «На позиції»:")
-    print(registry.read_position_summary(config.position_summary_sheet))
+    print(f"\nЛист «{config.position_summary_sheet}» (денні/нічні/ремонт по позиціях):")
+    stats = registry.read_position_stats(config.daily_report_groups, config.position_summary_sheet)
+    print(format_position_stats(stats))
+    for s in stats:
+        if not s.found:
+            print(f"  УВАГА: групу «{s.group}» не знайдено на цьому листі — звір назву в config.yaml.")
+
+    if config.loss_log_sheet not in titles:
+        print(f"\nУВАГА: листа «{config.loss_log_sheet}» (журнал втрат) немає серед листів книги — "
+              f"перевір назву в config.yaml (loss_log_sheet).")
+    else:
+        header = registry.read_header(config.loss_log_sheet)
+        print(f"\nЛист «{config.loss_log_sheet}» знайдено. Заголовок першого рядка: {header}")
+        if "Серійний номер" not in header:
+            print("  УВАГА: у заголовку немає 'Серійний номер' — бот писатиме новий запис")
+            print("  за позицією колонок з коду (FALLBACK_LOSS_COLUMNS), а не за назвою.")
+            print("  Перевір руками перший тестовий запис після реальної втрати.")
+
     return 0
 
 
