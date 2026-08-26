@@ -55,8 +55,20 @@ _COMMANDS = {
 }
 
 
-def build_application(bot_token: str, ctx: BotContext) -> Application:
-    application = Application.builder().token(bot_token).build()
+def create_application(bot_token: str) -> Application:
+    """Builds the bare `Application` (and its `Bot`) without a `BotContext`.
+
+    Split from `attach_context` because of a construction-order dependency:
+    `TelegramNotifier` needs `application.bot` to exist, but `BotContext`
+    needs a `TelegramNotifier` (it flows into `StrategyEngine`) plus several
+    read-only callables from the fully-wired runtime - so the app
+    composition root builds this bare `Application` first, then the
+    runtime/notifier/context, then calls `attach_context` last.
+    """
+    return Application.builder().token(bot_token).build()
+
+
+def attach_context(application: Application, ctx: BotContext) -> Application:
     application.bot_data[CTX_KEY] = ctx
     for name, handler in _COMMANDS.items():
         application.add_handler(CommandHandler(name, handler))

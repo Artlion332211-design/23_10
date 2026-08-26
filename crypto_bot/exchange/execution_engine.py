@@ -255,6 +255,23 @@ class ExecutionEngine:
             accepted=False, status=OrderStatus.CANCELED, order_id=order.id, error_message="DRY_RUN"
         )
 
+    async def reconcile_pending_order(self, order: Order) -> ExecutionResult:
+        """Called once at startup for every locally NEW/PARTIALLY_FILLED
+        order: asks the exchange for its authoritative current status and
+        persists it - Binance (or, in PAPER mode, the fill ledger the
+        `PaperBroker` was rebuilt from) is the source of truth, never the
+        local row alone. A LIMIT order still resting is re-registered with
+        the in-memory timeout tracker, which does not survive a restart, so
+        `check_pending_limit_orders` resumes enforcing
+        `LIMIT_ORDER_TIMEOUT_SECONDS` on it instead of leaving it to rest
+        forever.
+        """
+        result = await self._executor.get_status(order.symbol, client_order_id=order.client_order_id)
+        self._persist_result(order.id, result)
+        if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+            self._pending_limit_orders[order.client_order_id] = (order.symbol, order.created_at)
+        return result
+
     def _persist_result(self, order_id: int, result: ExecutionResult) -> None:
         with session_scope() as session:
             order_repo = OrderRepository(session)
@@ -328,8 +345,10 @@ class ExecutionEngine:
 
         if self._dry_run:
             with session_scope() as session:
-                dry_run_order = OrderRepository(session).get(order_id)
+                order_repo = OrderRepository(session)
+                dry_run_order = order_repo.get(order_id)
                 assert dry_run_order is not None
+                order_repo.update_status(dry_run_order, OrderStatus.CANCELED)
                 return self._dry_run_result(dry_run_order)
 
         result = await self._executor.submit(request)
@@ -386,8 +405,10 @@ class ExecutionEngine:
 
         if self._dry_run:
             with session_scope() as session:
-                dry_run_order = OrderRepository(session).get(order_id)
+                order_repo = OrderRepository(session)
+                dry_run_order = order_repo.get(order_id)
                 assert dry_run_order is not None
+                order_repo.update_status(dry_run_order, OrderStatus.CANCELED)
                 return self._dry_run_result(dry_run_order)
 
         result = await self._executor.submit(request)

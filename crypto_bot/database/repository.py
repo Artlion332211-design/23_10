@@ -52,6 +52,7 @@ class PositionRepository:
         market_regime_at_entry: str | None = None,
         entry_score: int | None = None,
         entry_signals: dict[str, Any] | None = None,
+        fees_paid_usdt: Decimal = Decimal("0"),
     ) -> Position:
         position = Position(
             symbol=symbol,
@@ -64,7 +65,7 @@ class PositionRepository:
             target_price=target_price,
             trailing_active=False,
             partial_closed_quantity=Decimal("0"),
-            fees_paid_usdt=Decimal("0"),
+            fees_paid_usdt=fees_paid_usdt,
             market_regime_at_entry=market_regime_at_entry,
             entry_score=entry_score,
             entry_signals=entry_signals,
@@ -219,6 +220,27 @@ class OrderRepository:
         stmt = select(Order).order_by(Order.created_at.desc()).limit(limit)
         return list(self.session.scalars(stmt))
 
+    def all_with_fills(self) -> list[Order]:
+        """Every order that has at least one recorded fill, oldest first -
+        the complete cash-flow ledger for a fresh process to replay (see
+        `orchestration.reconciliation.reconcile_paper`). Filtering on
+        `Order.status` instead would miss a LIMIT order that partially
+        filled before being cancelled - it still moved real (paper) cash."""
+        stmt = (
+            select(Order)
+            .where(Order.id.in_(select(Fill.order_id)))
+            .order_by(Order.created_at)
+        )
+        return list(self.session.scalars(stmt))
+
+    def count_filled_between(self, start: datetime, end: datetime) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(Order)
+            .where(Order.status == OrderStatus.FILLED, Order.updated_at >= start, Order.updated_at < end)
+        )
+        return self.session.scalar(stmt) or 0
+
 
 class FillRepository:
     def __init__(self, session: Session) -> None:
@@ -233,6 +255,13 @@ class FillRepository:
     def for_order(self, order_id: int) -> list[Fill]:
         stmt = select(Fill).where(Fill.order_id == order_id)
         return list(self.session.scalars(stmt))
+
+    def total_commission_usdt_between(self, start: datetime, end: datetime) -> Decimal:
+        stmt = select(func.coalesce(func.sum(Fill.commission_usdt_equivalent), 0)).where(
+            Fill.timestamp >= start, Fill.timestamp < end
+        )
+        total = self.session.scalar(stmt)
+        return Decimal(str(total or 0))
 
 
 class SignalRepository:

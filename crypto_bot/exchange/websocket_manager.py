@@ -120,6 +120,11 @@ class WebSocketManager:
             return None
         return time.monotonic() - stream.last_message_at
 
+    async def stop_stream(self, name: str) -> None:
+        stream = self._streams.pop(name, None)
+        if stream is not None:
+            await stream.stop()
+
     async def stop_all(self) -> None:
         await asyncio.gather(*(s.stop() for s in self._streams.values()), return_exceptions=True)
         self._streams.clear()

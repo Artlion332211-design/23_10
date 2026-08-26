@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
+from database.models import DailyStat
 from strategy.strategy_engine import (
     BuyExecutedEvent,
     DCAExecutedEvent,
@@ -168,6 +169,17 @@ class DailyReportData:
     best_trade_symbol: str | None
     best_trade_pct: float | None
     btc_regime: str
+
+    @classmethod
+    def from_model(cls, stat: DailyStat) -> DailyReportData:
+        return cls(
+            date=stat.date, starting_balance=stat.starting_balance, current_balance=stat.ending_balance,
+            realized_pnl=stat.realized_pnl, unrealized_pnl=stat.unrealized_pnl, trades_count=stat.trades_count,
+            closed_trades_count=stat.closed_trades_count, win_rate=stat.win_rate, fees_paid=stat.fees_paid,
+            open_positions_count=stat.open_positions_count, capital_exposure_pct=stat.capital_exposure_pct,
+            best_trade_symbol=stat.best_trade_symbol, best_trade_pct=stat.best_trade_pct,
+            btc_regime=stat.btc_regime or "unknown",
+        )
 
 
 def format_daily_report(data: DailyReportData) -> str:

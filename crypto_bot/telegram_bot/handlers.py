@@ -159,15 +159,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if stat is None:
         await _reply(update, f"No stats recorded yet for {today}.")
         return
-    report = DailyReportData(
-        date=stat.date, starting_balance=stat.starting_balance, current_balance=stat.ending_balance,
-        realized_pnl=stat.realized_pnl, unrealized_pnl=stat.unrealized_pnl, trades_count=stat.trades_count,
-        closed_trades_count=stat.closed_trades_count, win_rate=stat.win_rate, fees_paid=stat.fees_paid,
-        open_positions_count=stat.open_positions_count, capital_exposure_pct=stat.capital_exposure_pct,
-        best_trade_symbol=stat.best_trade_symbol, best_trade_pct=stat.best_trade_pct,
-        btc_regime=stat.btc_regime or "unknown",
-    )
-    await _reply(update, format_daily_report(report))
+    await _reply(update, format_daily_report(DailyReportData.from_model(stat)))
 
 
 @_restricted

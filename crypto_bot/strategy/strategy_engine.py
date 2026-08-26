@@ -321,6 +321,7 @@ class StrategyEngine:
                 target_price=target_price, market_regime_at_entry=btc_regime.level.value,
                 entry_score=int(decision.breakdown.final_score),
                 entry_signals={s.name: s.confirmed for s in decision.breakdown.signals},
+                fees_paid_usdt=result.commission_total_usdt_equivalent,
             )
             position_id = position.id
 

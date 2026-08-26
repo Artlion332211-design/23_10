@@ -7,8 +7,10 @@ positions, the order/fill trail behind them, every scored candidate (even
 ones that were rejected - useful for "why didn't it buy" analysis), news,
 operational events, daily performance, and small runtime flags (settings).
 
-All monetary/quantity columns use `Numeric` (never float) to avoid precision
-drift versus Binance's own decimal amounts.
+All monetary/quantity columns use the `DecimalString` type below (never
+`Numeric` and never float) to avoid precision drift versus Binance's own
+decimal amounts - see its docstring for why plain `Numeric` cannot do this
+against SQLite.
 """
 
 from __future__ import annotations
@@ -17,12 +19,43 @@ import enum
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, ForeignKey, Numeric, String, Text, TypeDecorator, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, String, Text, TypeDecorator, UniqueConstraint
 from sqlalchemy import DateTime as SADateTime
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-MONEY = Numeric(30, 12)
+
+class DecimalString(TypeDecorator):
+    """Exact `Decimal` round-trip via TEXT storage - never a float.
+
+    SQLite has no native DECIMAL type, and SQLAlchemy's generic `Numeric`
+    binds through Python `float` for any dialect where
+    `supports_native_decimal` is False (SQLite is one): every value written
+    through a plain `Numeric` column here would silently round-trip through
+    64-bit IEEE-754 float, which is exactly the precision drift this
+    project's money handling is required to never have (see module
+    docstring, and `exchange/symbol_filters.py`'s Decimal-only rounding).
+    Storing the exact fixed-point string instead - the same non-scientific
+    format Binance's own API requires - avoids the float conversion
+    entirely, at any number of decimal places.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Decimal | None, dialect: object) -> str | None:
+        if value is None:
+            return None
+        return format(value, "f")
+
+    def process_result_value(self, value: str | None, dialect: object) -> Decimal | None:
+        if value is None:
+            return None
+        return Decimal(value)
+
+
+MONEY = DecimalString()
+PERCENT = DecimalString()
 
 
 class UTCDateTime(TypeDecorator):
@@ -129,7 +162,7 @@ class Position(Base):
     partial_closed_quantity: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
 
     realized_pnl_usdt: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
-    realized_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    realized_pnl_pct: Mapped[Decimal | None] = mapped_column(PERCENT, nullable=True)
     fees_paid_usdt: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
 
     market_regime_at_entry: Mapped[str | None] = mapped_column(String(20), nullable=True)

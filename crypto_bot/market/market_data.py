@@ -267,3 +267,11 @@ class MarketDataStore:
 
     def tracked_keys(self) -> list[tuple[str, Timeframe]]:
         return list(self._series.keys())
+
+    def drop_symbol(self, symbol: str) -> None:
+        """Frees a symbol's series once it falls out of the tracked universe
+        (no longer a scan candidate and no open position) - without this,
+        24/7 operation across many scanner rotations would accumulate an
+        unbounded number of stale series in memory."""
+        for key in [k for k in self._series if k[0] == symbol]:
+            del self._series[key]
