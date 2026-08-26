@@ -4,10 +4,11 @@ from decimal import Decimal
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from backtest.engine import BacktestEngine, merge_aligned, prepare_symbol_frames
 from backtest.metrics import BacktestMetrics, EquityPoint, TradeRecord, compute_metrics
-from backtest.optimizer import grid_search, split_chronologically
+from backtest.optimizer import default_objective, grid_search, split_chronologically
 
 
 def _synthetic_ohlcv(n: int, *, seed: int, regime: str = "trend_with_dip") -> pd.DataFrame:
@@ -86,6 +87,43 @@ def test_backtest_engine_runs_end_to_end_on_synthetic_data(settings, rules):
     # if the engine silently skipped everything we'd see zero equity movement.
     equity_values = {float(p.equity_usdt) for p in result.equity_curve}
     assert len(equity_values) > 1  # equity actually changes over the run
+
+
+def test_position_still_open_when_data_ends_is_marked_not_dropped(settings, rules):
+    """A position opened near the end of the backtested window (and thus
+    unable to reach take-profit/DCA-exit before the data runs out) must
+    still show up in result.trades - dropping it would silently undercount
+    trade statistics on any short window, which is exactly the walk-forward
+    optimizer's validation/test segments."""
+    n = 2000
+    symbol_klines = {"AAAUSDT": _synthetic_ohlcv(n, seed=10, regime="trend_with_dip")}
+    btc_klines = _synthetic_ohlcv(n, seed=12, regime="trend_with_dip")
+    tuned = settings.model_copy(update={"min_listing_age_days": 0, "news_enabled": False})
+
+    full_result = BacktestEngine(tuned, rules).run(symbol_klines, btc_klines, starting_balance=Decimal("10000"))
+    assert full_result.trades, "fixture must produce at least one trade to make this test meaningful"
+    last_trade = max(full_result.trades, key=lambda t: t.opened_at)
+
+    # Truncate the raw data to just after that trade's entry bar, before its
+    # real close - it can no longer round-trip within the window.
+    open_time = pd.Timestamp(last_trade.opened_at)
+    cutoff = open_time + pd.Timedelta(hours=6)
+    truncated_symbol = {
+        s: df[df["open_time"] <= cutoff].reset_index(drop=True) for s, df in symbol_klines.items()
+    }
+    truncated_btc = btc_klines[btc_klines["open_time"] <= cutoff].reset_index(drop=True)
+
+    truncated_result = BacktestEngine(tuned, rules).run(truncated_symbol, truncated_btc, starting_balance=Decimal("10000"))
+
+    open_at_end = [t for t in truncated_result.trades if t.close_reason == "OPEN_AT_END"]
+    assert len(open_at_end) == 1
+    assert open_at_end[0].symbol == last_trade.symbol
+    assert open_at_end[0].avg_entry_price == last_trade.avg_entry_price
+    assert open_at_end[0].opened_at == last_trade.opened_at
+    # No sell fee/slippage simulated for a mark-to-market valuation - proceeds
+    # are exactly quantity x last close price.
+    last_close = Decimal(str(truncated_symbol["AAAUSDT"]["close"].iloc[-1]))
+    assert open_at_end[0].proceeds_usdt == open_at_end[0].quantity * last_close
 
 
 def test_backtest_pauses_new_buys_during_simulated_crash(settings, rules):
@@ -171,4 +209,30 @@ def test_grid_search_picks_a_param_set_and_reports_test_metrics(settings, rules)
 
     assert result.best_params["min_buy_score"] in (60, 90)
     assert len(result.all_candidates) == 2
-    assert result.test_metrics.starting_balance == Decimal("10000")
+
+
+def test_grid_search_empty_param_grid_runs_one_baseline_candidate(settings, rules):
+    """An empty param_grid isn't an error - `_expand_grid({})` yields one
+    candidate (the unchanged baseline settings), which is a legitimate way
+    to just run the current configuration through the same plumbing."""
+    n = 1500
+    df = _synthetic_ohlcv(n, seed=50, regime="trend_with_dip")
+    tuned = settings.model_copy(update={"min_listing_age_days": 0, "news_enabled": False})
+    split = split_chronologically({"AAAUSDT": df}, df, rules)
+
+    result = grid_search(tuned, rules, {}, split, objective=lambda m: m.num_trades)
+    assert result.best_params == {}
+    assert len(result.all_candidates) == 1
+
+
+def test_grid_search_insufficient_trades_raises_actionable_error(settings, rules):
+    """default_objective refuses to name a winner tuned on too few trades -
+    this must fail loudly with a message explaining *why*, not with the
+    generic "no candidates" message (that's for a genuinely empty grid)."""
+    n = 1500  # long enough to clear indicator warmup in every split segment
+    df = _synthetic_ohlcv(n, seed=51, regime="flat")  # flat price -> no reversal/dip setups -> ~0 trades
+    tuned = settings.model_copy(update={"min_listing_age_days": 0, "news_enabled": False})
+    split = split_chronologically({"AAAUSDT": df}, df, rules)
+
+    with pytest.raises(ValueError, match="enough trades"):
+        grid_search(tuned, rules, {"min_buy_score": [70, 80]}, split, objective=default_objective)

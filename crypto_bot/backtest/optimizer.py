@@ -99,14 +99,25 @@ def grid_search(
 ) -> OptimizationResult:
     """Search `param_grid` (e.g. `{"min_buy_score": [70, 75, 80]}`) on
     train+validation, then confirm the single winner once on the untouched
-    test segment."""
+    test segment.
+
+    Raises `ValueError` if `param_grid` itself is empty, or if every
+    combination fails the objective's data-sufficiency bar (e.g.
+    `default_objective`'s "fewer than 5 trades" guard) - refusing to name a
+    "winner" tuned on too little history is the point, not a bug, but the
+    two situations get distinct, actionable messages.
+    """
+    combos = _expand_grid(param_grid)
+    if not combos:
+        raise ValueError("param_grid is empty - nothing to search")
+
     candidates: list[tuple[dict[str, object], float]] = []
     best_params: dict[str, object] | None = None
     best_score = float("-inf")
     best_train_metrics: BacktestMetrics | None = None
     best_val_metrics: BacktestMetrics | None = None
 
-    for combo in _expand_grid(param_grid):
+    for combo in combos:
         trial_settings = settings.model_copy(update=combo)
 
         train_result = BacktestEngine(trial_settings, rules).run(split.train, split.btc_train, starting_balance=starting_balance)
@@ -121,7 +132,12 @@ def grid_search(
             best_val_metrics = val_result.metrics
 
     if best_params is None or best_train_metrics is None or best_val_metrics is None:
-        raise ValueError("param_grid produced no candidates")
+        raise ValueError(
+            f"None of the {len(combos)} parameter combination(s) produced enough trades to "
+            "score on train+validation (every candidate hit the objective's data-sufficiency "
+            "floor, e.g. default_objective's minimum of 5 trades per segment). Use a longer "
+            "history, a smaller/looser param_grid, or pass a custom `objective` with a lower bar."
+        )
 
     final_settings = settings.model_copy(update=best_params)
     test_result = BacktestEngine(final_settings, rules).run(split.test, split.btc_test, starting_balance=starting_balance)

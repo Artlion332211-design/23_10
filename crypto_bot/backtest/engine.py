@@ -318,8 +318,53 @@ class BacktestEngine:
         if not equity_curve:
             raise ValueError("Backtest produced no equity points - not enough history past the indicator warmup period")
 
+        self._mark_remaining_open_positions(portfolio, symbol_merged, common_index[-1], trades)
+
         metrics = compute_metrics(trades, equity_curve, starting_balance, portfolio.total_fees)
         return BacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics, no_trade_log=no_trade_log)
+
+    @staticmethod
+    def _mark_remaining_open_positions(
+        portfolio: _BacktestPortfolio,
+        symbol_merged: dict[str, pd.DataFrame],
+        final_ts: pd.Timestamp,
+        trades: list[TradeRecord],
+    ) -> None:
+        """A position opened near the end of the backtested window is a real
+        outcome, not a non-event: without this, trade-level statistics
+        (num_trades, win_rate, avg holding time, ...) would silently
+        undercount whenever a symbol's average holding time approaches the
+        window length - most sharply felt by the walk-forward optimizer's
+        validation/test segments, which are short by design. This marks
+        each still-open position to the last available close price with a
+        distinct `close_reason="OPEN_AT_END"` so it's identifiable in
+        reports; no sell fee/slippage is simulated since nothing was
+        actually sold - this is a mark-to-market valuation, not a fill.
+        The equity curve already reflected this value throughout (its
+        per-bar mark-to-market includes open positions), so total
+        return/drawdown/Sharpe are unaffected either way.
+        """
+        for symbol in list(portfolio.open_positions.keys()):
+            pos = portfolio.open_positions.pop(symbol)
+            exit_price = Decimal(str(symbol_merged[symbol].loc[final_ts, "close"]))
+            cost_basis = pos.avg_entry_price * pos.total_quantity
+            proceeds = pos.total_quantity * exit_price
+            net_pnl = proceeds - cost_basis
+            net_pnl_pct = (proceeds / cost_basis - 1) * 100 if cost_basis > 0 else Decimal("0")
+            worst_dd = (
+                float((pos.worst_price_seen - pos.avg_entry_price) / pos.avg_entry_price * 100)
+                if pos.avg_entry_price > 0
+                else 0.0
+            )
+            trades.append(
+                TradeRecord(
+                    symbol=symbol, opened_at=pos.opened_at, closed_at=final_ts.to_pydatetime(),
+                    avg_entry_price=pos.avg_entry_price, exit_price=exit_price, quantity=pos.total_quantity,
+                    cost_usdt=pos.total_cost_usdt, proceeds_usdt=proceeds, net_pnl_usdt=net_pnl,
+                    net_pnl_percent=net_pnl_pct, dca_count=pos.dca_count, close_reason="OPEN_AT_END",
+                    worst_drawdown_percent=min(0.0, worst_dd),
+                )
+            )
 
     def _build_mtf(self, row: pd.Series, symbol: str) -> MultiTimeframeSnapshot:
         return MultiTimeframeSnapshot(
