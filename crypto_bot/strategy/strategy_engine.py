@@ -311,7 +311,13 @@ class StrategyEngine:
         with session_scope() as session:
             position = PositionRepository(session).create(
                 symbol=symbol, opened_at=utcnow(), avg_entry_price=result.avg_fill_price,
-                total_quantity=result.net_base_quantity, total_cost_usdt=result.filled_quote,
+                total_quantity=result.net_base_quantity,
+                # Cost basis must be derived from the *net* quantity (price x
+                # net_base_quantity), not the gross fill notional
+                # (result.filled_quote) - otherwise the first DCA's call to
+                # apply_fill_and_recompute() mixes a gross-based cost with a
+                # net-based quantity and skews the recomputed average.
+                total_cost_usdt=result.avg_fill_price * result.net_base_quantity,
                 target_price=target_price, market_regime_at_entry=btc_regime.level.value,
                 entry_score=int(decision.breakdown.final_score),
                 entry_signals={s.name: s.confirmed for s in decision.breakdown.signals},

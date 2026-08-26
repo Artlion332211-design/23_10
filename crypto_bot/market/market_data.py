@@ -13,6 +13,7 @@ section of the spec).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,44 +91,58 @@ class IndicatorSnapshot:
         row = df.iloc[index]
         prev = df.iloc[index - 1] if len(df) > 1 and (index == -1 or index > 0) else row
 
-        def g(name: str, default: float = 0.0) -> Any:
-            value = row[name] if name in row.index else default
+        def get(name: str, default: float = 0.0) -> Any:
+            if name.endswith("_prev"):
+                base, source = name[: -len("_prev")], prev
+            else:
+                base, source = name, row
+            value = source[base] if base in source.index else default
             return default if pd.isna(value) else value
 
-        def gp(name: str, default: float = 0.0) -> Any:
-            value = prev[name] if name in prev.index else default
-            return default if pd.isna(value) else value
+        return cls.from_getter(symbol, timeframe, get, open_time=row["open_time"])
 
+    @classmethod
+    def from_getter(
+        cls, symbol: str, timeframe: Timeframe, get: Callable[..., Any], *, open_time: Any
+    ) -> IndicatorSnapshot:
+        """Shared field mapping used both for live/paper (one DataFrame, a
+        "previous row") and backtesting (one `pd.merge_asof`-aligned row
+        with precomputed `*_prev` columns per timeframe) - a single
+        authoritative list of fields/defaults for both code paths.
+
+        `get(name, default=0.0)` resolves one field; callers decide where a
+        name (including a `*_prev` variant) actually comes from.
+        """
         return cls(
             symbol=symbol,
             timeframe=timeframe,
-            open_time=row["open_time"],
-            close=float(g("close")), open=float(g("open")), high=float(g("high")),
-            low=float(g("low")), volume=float(g("volume")),
-            rsi=float(g("rsi", 50.0)), rsi_prev=float(gp("rsi", 50.0)), rsi_slope=float(g("rsi_slope")),
-            rsi_reversal=bool(g("rsi_reversal", False)),
-            rsi_bullish_divergence=bool(g("rsi_bullish_divergence", False)),
-            macd=float(g("macd")), macd_signal=float(g("macd_signal")),
-            macd_hist=float(g("macd_hist")), macd_hist_prev=float(gp("macd_hist")),
-            macd_bullish=bool(g("macd_bullish", False)),
-            ema_fast=float(g("ema_fast", g("close"))), ema_mid=float(g("ema_mid", g("close"))),
-            ema_slow=float(g("ema_slow", g("close"))), ema_trend_ok=bool(g("ema_trend_ok", False)),
-            bb_upper=float(g("bb_upper", g("close"))), bb_mid=float(g("bb_mid", g("close"))),
-            bb_lower=float(g("bb_lower", g("close"))),
-            bb_recovery=bool(g("bb_recovery", False)), bb_squeeze=bool(g("bb_squeeze", False)),
-            atr=float(g("atr", 0.0)), distance_from_ema_fast_atr=float(g("distance_from_ema_fast_atr", 0.0)),
-            adx=float(g("adx", 0.0)), plus_di=float(g("plus_di", 0.0)), minus_di=float(g("minus_di", 0.0)),
-            volume_ma=float(g("volume_ma", g("volume"))), abnormal_volume=bool(g("abnormal_volume", False)),
-            volume_confirmation=bool(g("volume_confirmation", False)),
-            obv=float(g("obv", 0.0)), obv_prev=float(gp("obv", 0.0)),
-            vwap=float(g("vwap", g("close"))), vwap_recovery=bool(g("vwap_recovery", False)),
-            swing_low=bool(g("swing_low", False)), swing_high=bool(g("swing_high", False)),
-            higher_low_structure=bool(g("higher_low_structure", False)),
-            higher_high_structure=bool(g("higher_high_structure", False)),
-            support=float(g("support", g("low"))),
-            distance_from_support_pct=float(g("distance_from_support_pct", 0.0)),
-            candle_pattern_bullish=bool(g("candle_pattern_bullish", False)),
-            market_structure_bullish=bool(g("market_structure_bullish", False)),
+            open_time=open_time,
+            close=float(get("close")), open=float(get("open")), high=float(get("high")),
+            low=float(get("low")), volume=float(get("volume")),
+            rsi=float(get("rsi", 50.0)), rsi_prev=float(get("rsi_prev", 50.0)), rsi_slope=float(get("rsi_slope")),
+            rsi_reversal=bool(get("rsi_reversal", False)),
+            rsi_bullish_divergence=bool(get("rsi_bullish_divergence", False)),
+            macd=float(get("macd")), macd_signal=float(get("macd_signal")),
+            macd_hist=float(get("macd_hist")), macd_hist_prev=float(get("macd_hist_prev")),
+            macd_bullish=bool(get("macd_bullish", False)),
+            ema_fast=float(get("ema_fast", get("close"))), ema_mid=float(get("ema_mid", get("close"))),
+            ema_slow=float(get("ema_slow", get("close"))), ema_trend_ok=bool(get("ema_trend_ok", False)),
+            bb_upper=float(get("bb_upper", get("close"))), bb_mid=float(get("bb_mid", get("close"))),
+            bb_lower=float(get("bb_lower", get("close"))),
+            bb_recovery=bool(get("bb_recovery", False)), bb_squeeze=bool(get("bb_squeeze", False)),
+            atr=float(get("atr", 0.0)), distance_from_ema_fast_atr=float(get("distance_from_ema_fast_atr", 0.0)),
+            adx=float(get("adx", 0.0)), plus_di=float(get("plus_di", 0.0)), minus_di=float(get("minus_di", 0.0)),
+            volume_ma=float(get("volume_ma", get("volume"))), abnormal_volume=bool(get("abnormal_volume", False)),
+            volume_confirmation=bool(get("volume_confirmation", False)),
+            obv=float(get("obv", 0.0)), obv_prev=float(get("obv_prev", 0.0)),
+            vwap=float(get("vwap", get("close"))), vwap_recovery=bool(get("vwap_recovery", False)),
+            swing_low=bool(get("swing_low", False)), swing_high=bool(get("swing_high", False)),
+            higher_low_structure=bool(get("higher_low_structure", False)),
+            higher_high_structure=bool(get("higher_high_structure", False)),
+            support=float(get("support", get("low"))),
+            distance_from_support_pct=float(get("distance_from_support_pct", 0.0)),
+            candle_pattern_bullish=bool(get("candle_pattern_bullish", False)),
+            market_structure_bullish=bool(get("market_structure_bullish", False)),
         )
 
 

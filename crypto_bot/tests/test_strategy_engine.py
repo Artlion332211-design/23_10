@@ -170,6 +170,9 @@ def test_full_buy_dca_take_profit_lifecycle(strategy_setup):
         position_id = position.id
         assert position.dca_count == 0
         assert position.avg_entry_price == Decimal("100")
+        # Cost basis and quantity must be homogeneous (both net-of-commission)
+        # so a later DCA's weighted-average recompute isn't skewed.
+        assert position.total_cost_usdt == position.avg_entry_price * position.total_quantity
 
     # 2. Price drops 3% -> DCA fires
     executor.price = Decimal("97")
@@ -177,6 +180,7 @@ def test_full_buy_dca_take_profit_lifecycle(strategy_setup):
 
     with session_scope() as session:
         position = PositionRepository(session).get(position_id)
+        assert abs(position.total_cost_usdt - position.avg_entry_price * position.total_quantity) < Decimal("1e-8")
         assert position.dca_count == 1
         assert position.avg_entry_price < Decimal("100")
         target = position.target_price
