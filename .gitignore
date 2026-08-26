@@ -183,3 +183,12 @@ fabric.properties
 
 # idea folder, uncomment if you don't need it
  .idea
+
+### crypto_bot project
+crypto_bot/data/*.db
+crypto_bot/data/*.db-journal
+crypto_bot/data/*.sqlite3
+crypto_bot/logs/*.log
+crypto_bot/backtest/reports/
+!crypto_bot/data/.gitkeep
+!crypto_bot/logs/.gitkeep

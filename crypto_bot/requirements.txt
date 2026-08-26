@@ -1,0 +1,25 @@
+# Binance Spot SDK (async client + websocket manager)
+python-binance>=1.0.37,<2.0
+
+# Telegram bot control plane
+python-telegram-bot>=22.8,<23.0
+
+# Persistence
+SQLAlchemy>=2.0.52,<2.1
+
+# Config / validation
+pydantic>=2.9,<3.0
+pydantic-settings>=2.15,<3.0
+python-dotenv>=1.0,<2.0
+PyYAML>=6.0,<7.0
+
+# Data analysis (indicators, backtest, market data handling)
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+
+# HTTP / news sources
+aiohttp>=3.9,<4.0
+feedparser>=6.0.14,<7.0
+
+# Reports (equity curve chart in backtest reports)
+matplotlib>=3.9,<4.0

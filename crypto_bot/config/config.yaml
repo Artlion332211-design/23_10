@@ -1,0 +1,139 @@
+# =============================================================================
+# Strategy / rules configuration.
+#
+# Secrets and per-deployment operational knobs live in `.env` (see
+# `.env.example`). This file holds the structured "strategy internals" that
+# are naturally lists/dicts rather than flat scalars: indicator parameters,
+# signal point-weights, regime policy, and universe filtering rules.
+#
+# Everything here is read by config/settings.py and validated with pydantic.
+# Values can be safely tuned; keep the point-weight sections summing the way
+# they are documented unless you deliberately re-balance the scoring model
+# (recommended: validate any change with the backtester before touching LIVE).
+# =============================================================================
+
+indicators:
+  rsi:
+    period: 14
+    oversold: 30
+    overbought: 70
+    reversal_lookback: 5      # bars to look back for "was oversold and turning up"
+    slope_lookback: 3
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  ema:
+    fast: 20
+    mid: 50
+    slow: 200
+  bollinger:
+    period: 20
+    stddev: 2.0
+    squeeze_lookback: 40      # bars used to detect a bandwidth squeeze
+    squeeze_percentile: 20    # squeeze = bandwidth in bottom 20th percentile
+  adx:
+    period: 14
+    strong_trend: 25
+    very_strong_trend: 40
+  atr:
+    period: 14
+  volume:
+    ma_period: 20
+    abnormal_multiplier: 2.0
+    confirmation_multiplier: 1.2
+  vwap:
+    anchor: session            # "session" = resets each UTC day, or "rolling"
+    rolling_window: 96          # only used when anchor == rolling (96*15m = 24h)
+  swing_structure:
+    order: 3                    # bars on each side to qualify as swing hi/lo
+    lookback: 60
+
+# Point weights for the technical SIGNAL SCORE (0-100). Each signal is mapped
+# to exactly one category so "5 confirmations" can be verified as coming from
+# genuinely different analytical angles (see strategy/scoring.py).
+signal_weights:
+  rsi_reversal: {points: 15, category: momentum}
+  macd_bullish: {points: 15, category: momentum}
+  ema_trend: {points: 20, category: trend}
+  bollinger_recovery: {points: 12, category: volatility}
+  volume_confirmation: {points: 18, category: volume}
+  vwap_recovery: {points: 10, category: structure}
+  market_structure: {points: 10, category: structure}
+
+adx_veto:
+  # If ADX shows a very strong bearish trend, block mean-reversion BUY even
+  # when RSI/other signals look tempting.
+  adx_threshold: 35
+  di_diff_threshold: 10
+
+# BTC/global market regime -> policy applied to every BUY decision.
+regime_policy:
+  STRONG_BULL: {allow_buy: true, min_score_delta: -5}
+  BULL: {allow_buy: true, min_score_delta: 0}
+  NEUTRAL: {allow_buy: true, min_score_delta: 5}
+  BEAR: {allow_buy: true, min_score_delta: 10}
+  STRONG_BEAR: {allow_buy: false, min_score_delta: 0}
+  CRASH: {allow_buy: false, min_score_delta: 0}
+
+crash_detector:
+  window_minutes: 60
+  drop_percent: 4.0
+  volume_multiplier: 2.5
+  strong_bear_drop_percent: 2.5
+  severe_drop_percent: 8.0
+
+anti_fomo:
+  max_price_change_1h_percent: 8.0
+  max_price_change_4h_percent: 15.0
+  max_distance_from_ema20_atr: 3.0
+  rsi_overbought: 80
+  volume_spike_multiplier: 4.0
+
+correlation:
+  lookback_bars: 90
+  timeframe: "1h"
+  correlation_threshold: 0.75
+  max_correlated_positions: 2
+
+universe:
+  quote_asset: "USDT"
+  stablecoin_assets:
+    - USDC
+    - FDUSD
+    - TUSD
+    - DAI
+    - USDP
+    - BUSD
+    - EUR
+    - GBP
+    - TRY
+    - AEUR
+    - USD1
+  leveraged_token_suffixes: ["UP", "DOWN", "BULL", "BEAR"]
+  blacklist_symbols: []
+  min_trades_24h: 10000
+  max_orderbook_spread_depth_usdt: 20000   # depth checked within max_spread band
+
+watchdog:
+  check_interval_seconds: 30
+  task_restart_backoff_seconds: [5, 15, 60]
+  max_restart_attempts: 3
+
+scheduler:
+  position_monitor_interval_seconds: 60
+  news_refresh_minutes: 10
+
+backtest:
+  default_symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - XRPUSDT
+    - ADAUSDT
+    - LINKUSDT
+    - AVAXUSDT
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  test_fraction: 0.2
