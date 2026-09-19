@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/crypto_bot.db"
 
     # --- Position sizing -------------------------------------------------
-    initial_order_usdt: Decimal = Decimal("100")
+    initial_order_usdt: Decimal = Decimal("20")
     max_position_usdt: Decimal = Decimal("300")
     max_open_positions: int = 3
 
