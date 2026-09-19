@@ -13,11 +13,14 @@ from strategy.strategy_engine import (
 )
 from telegram_bot.notifications import (
     DailyReportData,
+    StatusSnapshot,
     TelegramNotifier,
     format_buy_executed,
+    format_buy_signal,
     format_crash_alert,
     format_daily_report,
     format_position_closed,
+    format_status,
 )
 
 
@@ -47,16 +50,29 @@ def test_format_buy_executed_contains_required_sections():
         position_id=1,
     )
     text = format_buy_executed(event)
-    assert "BUY EXECUTED" in text
-    assert "Pair: SOLUSDT" in text
-    assert "Price: $142.5300" in text
-    assert "RSI reversal ✓" in text
-    assert "MACD bullish ✓" in text
-    assert "Bollinger recovery" not in text  # not confirmed in this scenario
-    assert "BTC = NEUTRAL" in text
-    assert "+5 NEUTRAL" in text
+    assert "КУПІВЛЯ ВИКОНАНА" in text
+    assert "Пара: SOLUSDT" in text
+    assert "Ціна: $142.5300" in text
+    assert "Розворот RSI ✓" in text
+    assert "Бичачий MACD ✓" in text
+    assert "Bollinger" not in text  # not confirmed in this scenario
+    assert "BTC = НЕЙТРАЛЬНИЙ" in text
+    assert "+5 НЕЙТРАЛЬНІ" in text
     assert "$156.7800" in text
     assert "-3%" in text and "-6%" in text and "-10%" in text
+
+
+def test_format_buy_signal_translates_signal_names():
+    regime = RegimeAssessment(level=RegimeLevel.BULL, score=20, reasons=[], crash=False)
+    breakdown = _breakdown(["rsi_reversal", "vwap_recovery"])
+    decision = TradeDecision(
+        action="BUY", symbol="SOLUSDT", breakdown=breakdown, regime=regime, required_score=75, news_score=0, reasons=[],
+    )
+    text = format_buy_signal(decision)
+    assert "СИГНАЛ НА КУПІВЛЮ" in text
+    assert "Розворот RSI" in text
+    assert "rsi_reversal" not in text  # internal identifier must not leak into the message
+    assert "ЗРОСТАННЯ" in text
 
 
 def test_format_position_closed_shows_pnl_and_reason():
@@ -66,17 +82,17 @@ def test_format_position_closed_shows_pnl_and_reason():
         close_reason="TAKE_PROFIT", position_id=1,
     )
     text = format_position_closed(event)
-    assert "POSITION CLOSED" in text
-    assert "TAKE_PROFIT" in text
+    assert "ПОЗИЦІЯ ЗАКРИТА" in text
+    assert "ТЕЙК-ПРОФІТ" in text
     assert "+14.25 USDT" in text
     assert "+10.00%" in text
-    assert "26.0h" in text  # under the 48h threshold, shown in hours not days
+    assert "26.0 год" in text  # under the 48h threshold, shown in hours not days
 
 
 def test_format_crash_alert():
     text = format_crash_alert(["BTC dropped 6% in 60m on abnormal volume"])
-    assert text.startswith("CRASH ALERT")
-    assert "CRASH" in text
+    assert text.startswith("ТРИВОГА: ОБВАЛ РИНКУ")
+    assert "ОБВАЛ" in text
     assert "dropped 6%" in text
 
 
@@ -88,8 +104,40 @@ def test_format_daily_report_includes_all_fields():
         best_trade_symbol="SOLUSDT", best_trade_pct=11.5, btc_regime="NEUTRAL",
     )
     text = format_daily_report(data)
-    for expected in ("DAILY REPORT", "10000.00", "10150.00", "+120.00", "+30.00", "Win rate: 100.0%", "SOLUSDT (+11.50%)", "NEUTRAL"):
+    for expected in ("ЩОДЕННИЙ ЗВІТ", "10000.00", "10150.00", "+120.00", "+30.00", "Успішність: 100.0%", "SOLUSDT (+11.50%)", "НЕЙТРАЛЬНИЙ"):
         assert expected in text
+
+
+def _status_snapshot(**overrides: object) -> StatusSnapshot:
+    defaults: dict[str, object] = dict(
+        mode="PAPER", dry_run=False, uptime_seconds=3725, btc_regime="BULL",
+        buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
+        open_positions_count=2, max_open_positions=3, total_unrealized_pnl_usdt=Decimal("15.5"),
+        health={"tracked_symbols": 12},
+    )
+    defaults.update(overrides)
+    return StatusSnapshot(**defaults)  # type: ignore[arg-type]
+
+
+def test_format_status_shows_open_positions_and_pnl_state():
+    text = format_status(_status_snapshot())
+    assert "СТАТУС" in text
+    assert "Відкритих позицій: 2/3" in text
+    assert "+15.50 USDT" in text
+    assert "у плюсі" in text
+    assert "ЗРОСТАННЯ" in text
+
+
+def test_format_status_shows_minus_state_for_negative_pnl():
+    text = format_status(_status_snapshot(total_unrealized_pnl_usdt=Decimal("-8.2")))
+    assert "-8.20 USDT" in text
+    assert "у мінусі" in text
+
+
+def test_format_status_handles_no_regime_and_no_positions_yet():
+    text = format_status(_status_snapshot(btc_regime=None, open_positions_count=0, total_unrealized_pnl_usdt=None))
+    assert "ще не розраховано" in text
+    assert "Відкритих позицій: 0/3" in text
 
 
 class _RecordingSender:
@@ -121,3 +169,10 @@ def test_notifier_on_no_trade_never_sends_anything():
 def test_notifier_send_failure_is_swallowed_not_raised():
     notifier = TelegramNotifier(_FailingSender(), chat_id=123)
     asyncio.run(notifier.on_error("something broke"))  # must not raise
+
+
+def test_notifier_status_ping_sends_raw_text():
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+    asyncio.run(notifier.status_ping("СТАТУС\nусе гаразд"))
+    assert sender.sent == [(123, "СТАТУС\nусе гаразд")]

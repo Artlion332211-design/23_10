@@ -135,6 +135,15 @@ class Settings(BaseSettings):
     # --- Daily report ------------------------------------------------------
     daily_report_hour_utc: int = 21
 
+    # --- Status heartbeat ---------------------------------------------------
+    # Three fixed times per day the bot proactively pushes a /status-style
+    # summary, so it's obvious the bot is still alive without having to ask.
+    # UTC hours - defaults below are ~08:00 / ~14:00 / ~22:00 Kyiv time (EEST,
+    # UTC+3); shift by 1 when Ukraine switches to winter time (EET, UTC+2).
+    status_ping_hour_1_utc: int = 5
+    status_ping_hour_2_utc: int = 11
+    status_ping_hour_3_utc: int = 19
+
     @field_validator("telegram_allowed_user_id", mode="before")
     @classmethod
     def _blank_user_id_to_zero(cls, v: object) -> object:

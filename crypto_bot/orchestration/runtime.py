@@ -6,10 +6,10 @@ engine, optional paper broker) and exposes:
 
 * the long-running scheduler loops `app.py` registers with the `Watchdog`
   (`run_position_monitor_loop`, `run_universe_scanner_loop`,
-  `run_news_refresh_loop`, `run_daily_report_loop`);
+  `run_news_refresh_loop`, `run_daily_report_loop`, `run_status_ping_loop`);
 * the read-only callables `telegram_bot.handlers.BotContext` needs
   (`get_balance_text`, `get_current_regime`, `get_latest_signals`,
-  `get_health_snapshot`).
+  `get_health_snapshot`, `get_mark_prices`, `get_status_snapshot`).
 
 Kept out of `app.py` so the composition root stays readable as "build the
 pieces, wire them into a BotRuntime, hand it to the scheduler" instead of a
@@ -47,7 +47,12 @@ from orchestration.watchdog import Watchdog
 from paper.simulator import PaperBroker
 from risk.risk_manager import RiskManager
 from strategy.strategy_engine import StrategyEngine, TradeDecision
-from telegram_bot.notifications import DailyReportData, TelegramNotifier
+from telegram_bot.notifications import (
+    DailyReportData,
+    StatusSnapshot,
+    TelegramNotifier,
+    format_status,
+)
 from utils.time import Timeframe, floor_to_timeframe, utcnow
 
 logger = logging.getLogger(__name__)
@@ -122,6 +127,7 @@ class BotRuntime:
         if self._settings.news_enabled:
             self._watchdog.register("news_refresh", self.run_news_refresh_loop)
         self._watchdog.register("daily_report", self.run_daily_report_loop)
+        self._watchdog.register("status_ping", self.run_status_ping_loop)
 
     # ------------------------------------------------------------------
     # Universe tracking + market data
@@ -321,7 +327,7 @@ class BotRuntime:
         day_start = floor_to_timeframe(now, Timeframe.D1)
         day_end = day_start + timedelta(days=1)
 
-        mark_prices = self._mark_prices()
+        mark_prices = self.get_mark_prices()
         with session_scope() as session:
             open_positions = PositionRepository(session).get_open_positions()
             unrealized_pnl = Decimal("0")
@@ -334,22 +340,47 @@ class BotRuntime:
 
         current_balance = await self._trading_balance_usdt() + total_open_cost + unrealized_pnl
         exposure_pct = float(total_open_cost / current_balance * 100) if current_balance > 0 else 0.0
-        regime_label = self._btc_regime.level.value if self._btc_regime else "unknown"
+        btc_regime_value = self._btc_regime.level.value if self._btc_regime else "unknown"
 
         with session_scope() as session:
             stat = build_daily_stat(
                 session, date_str=date_str, day_start=day_start, day_end=day_end,
                 current_balance=current_balance, unrealized_pnl=unrealized_pnl,
-                open_positions_count=open_count, capital_exposure_pct=exposure_pct, btc_regime=regime_label,
+                open_positions_count=open_count, capital_exposure_pct=exposure_pct, btc_regime=btc_regime_value,
             )
             report_data = DailyReportData.from_model(stat)
         await self._notifier.daily_report(report_data)
 
     # ------------------------------------------------------------------
+    # Status heartbeat (proactive push 3x/day, independent of /status pull)
+    # ------------------------------------------------------------------
+
+    async def run_status_ping_loop(self) -> None:
+        hours = [
+            self._settings.status_ping_hour_1_utc,
+            self._settings.status_ping_hour_2_utc,
+            self._settings.status_ping_hour_3_utc,
+        ]
+        while True:
+            now = utcnow()
+            candidates = []
+            for hour in hours:
+                target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                candidates.append(target)
+            next_target = min(candidates)
+            await self._sleep_with_heartbeat((next_target - now).total_seconds(), "status_ping")
+            try:
+                await self._notifier.status_ping(format_status(self.build_status_snapshot()))
+            except Exception as exc:  # noqa: BLE001 - a failed ping must not kill the loop
+                logger.exception("Status ping failed: %r", exc)
+
+    # ------------------------------------------------------------------
     # Read-only callables for telegram_bot.handlers.BotContext
     # ------------------------------------------------------------------
 
-    def _mark_prices(self) -> dict[str, Decimal]:
+    def get_mark_prices(self) -> dict[str, Decimal]:
         prices: dict[str, Decimal] = {}
         for symbol in self._tracked_symbols:
             snap = self._market_data.snapshot(symbol, Timeframe.M15)
@@ -359,23 +390,63 @@ class BotRuntime:
 
     async def get_balance_text(self) -> str:
         if self._paper_broker is not None:
-            mark_prices = self._mark_prices()
+            mark_prices = self.get_mark_prices()
             account = self._paper_broker.account
-            lines = ["BALANCE (PAPER)", f"USDT free: {account.usdt_balance:.2f}"]
+            lines = ["БАЛАНС (PAPER)", f"USDT вільно: {account.usdt_balance:.2f}"]
             for asset, qty in account.holdings.items():
                 price = mark_prices.get(f"{asset}USDT")
                 extra = f" (~{qty * price:.2f} USDT)" if price is not None else ""
                 lines.append(f"{asset}: {qty:.6f}{extra}")
-            lines.append(f"Total equity: {account.total_equity(mark_prices):.2f} USDT")
+            lines.append(f"Загальний капітал: {account.total_equity(mark_prices):.2f} USDT")
             return "\n".join(lines)
 
         balances = await self._client.get_account_balances()
         if not balances:
-            return "BALANCE (LIVE)\n(no non-zero balances)"
-        lines = ["BALANCE (LIVE)"]
+            return "БАЛАНС (LIVE)\n(немає ненульових балансів)"
+
+        mark_prices = self.get_mark_prices()
+        lines = ["БАЛАНС (LIVE)"]
+        total_usdt = Decimal("0")
+        priced_everything = True
         for asset, (free, locked) in sorted(balances.items()):
-            lines.append(f"{asset}: free={free} locked={locked}")
+            lines.append(f"{asset}: вільно={free} заблоковано={locked}")
+            if asset == "USDT":
+                total_usdt += free + locked
+                continue
+            price = mark_prices.get(f"{asset}USDT")
+            if price is not None:
+                total_usdt += (free + locked) * price
+            else:
+                priced_everything = False
+        caveat = "" if priced_everything else " (без активів поза відстежуваними парами)"
+        lines.append(f"Загалом приблизно: {total_usdt:.2f} USDT{caveat}")
         return "\n".join(lines)
+
+    def build_status_snapshot(self) -> StatusSnapshot:
+        flags = self._risk_manager.status()
+        mark_prices = self.get_mark_prices()
+        with session_scope() as session:
+            open_positions = PositionRepository(session).get_open_positions()
+            total_unrealized = Decimal("0")
+            priced_any = False
+            for p in open_positions:
+                price = mark_prices.get(p.symbol)
+                if price is not None:
+                    total_unrealized += (price - p.avg_entry_price) * p.total_quantity
+                    priced_any = True
+            open_count = len(open_positions)
+
+        effective_dry_run = self._settings.dry_run if self._settings.mode == TradingMode.LIVE else False
+        return StatusSnapshot(
+            mode=self._settings.mode.value, dry_run=effective_dry_run,
+            uptime_seconds=(utcnow() - self.started_at).total_seconds(),
+            btc_regime=self._btc_regime.level.value if self._btc_regime else None,
+            buy_paused=flags.buy_paused, dca_paused=flags.dca_paused, emergency_stop=flags.emergency_stop,
+            consecutive_bad_trades=flags.consecutive_bad_trades,
+            open_positions_count=open_count, max_open_positions=self._settings.max_open_positions,
+            total_unrealized_pnl_usdt=total_unrealized if priced_any else None,
+            health=self.get_health_snapshot(),
+        )
 
     def get_current_regime(self) -> RegimeAssessment | None:
         return self._btc_regime

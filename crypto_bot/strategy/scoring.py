@@ -48,9 +48,21 @@ class ScoreBreakdown:
     def blocked(self) -> bool:
         return bool(self.vetoes)
 
-    def top_reasons(self, n: int = 5) -> list[str]:
+    def top_reasons(self, n: int = 5, *, label_map: dict[str, str] | None = None) -> list[str]:
+        """Names of the top-`n` confirmed signals, most-points first.
+
+        `label_map` lets a presentation layer (e.g. Telegram) substitute a
+        human-readable/translated label for the internal snake_case signal
+        name without this module needing to know anything about Telegram or
+        language - callers that don't pass one get the raw internal names
+        unchanged, exactly as before.
+        """
         confirmed = sorted((s for s in self.signals if s.confirmed), key=lambda s: s.points, reverse=True)
-        return [f"{s.name} ({s.detail})" if s.detail else s.name for s in confirmed[:n]]
+
+        def _label(name: str) -> str:
+            return label_map.get(name, name) if label_map else name
+
+        return [f"{_label(s.name)} ({s.detail})" if s.detail else _label(s.name) for s in confirmed[:n]]
 
     def explain(self) -> str:
         lines = []

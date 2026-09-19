@@ -20,6 +20,7 @@ from telegram_bot.handlers import (
     cmd_status,
     cmd_stop_dca,
 )
+from telegram_bot.notifications import StatusSnapshot
 from utils.time import utcnow
 
 
@@ -36,14 +37,24 @@ def _make_context(ctx: BotContext):
     return context
 
 
+def _default_status_snapshot() -> StatusSnapshot:
+    return StatusSnapshot(
+        mode="PAPER", dry_run=False, uptime_seconds=0, btc_regime=None,
+        buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
+        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None, health={"last_scan": "n/a"},
+    )
+
+
 def _make_ctx(db_engine, settings, rules, *, allowed_user_id: int = 42) -> BotContext:
     return BotContext(
         settings=settings, rules=rules, risk_manager=RiskManager(settings),
         news_engine=MagicMock(), allowed_user_id=allowed_user_id, started_at=utcnow(),
-        get_balance_text=AsyncMock(return_value="BALANCE\nUSDT: 1000.00"),
+        get_balance_text=AsyncMock(return_value="БАЛАНС\nUSDT: 1000.00"),
         get_current_regime=lambda: None,
         get_latest_signals=lambda: [],
         get_health_snapshot=lambda: {"last_scan": "n/a"},
+        get_mark_prices=lambda: {},
+        get_status_snapshot=_default_status_snapshot,
     )
 
 
@@ -58,13 +69,18 @@ def test_unauthorized_user_is_silently_ignored(db_engine, settings, rules):
 
 def test_authorized_user_gets_a_reply(db_engine, settings, rules):
     ctx = _make_ctx(db_engine, settings, rules, allowed_user_id=42)
+    ctx.get_status_snapshot = lambda: StatusSnapshot(
+        mode=ctx.settings.mode.value, dry_run=False, uptime_seconds=0, btc_regime=None,
+        buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
+        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None, health={},
+    )
     update = _make_update(user_id=42)
     context = _make_context(ctx)
 
     asyncio.run(cmd_status(update, context))
     update.message.reply_text.assert_called_once()
     text = update.message.reply_text.call_args[0][0]
-    assert "STATUS" in text
+    assert "СТАТУС" in text
     assert ctx.settings.mode.value in text
 
 
@@ -95,7 +111,7 @@ def test_emergency_stop_sets_flags_and_replies(db_engine, settings, rules):
     assert flags.emergency_stop is True
     assert flags.buy_paused is True
     text = update.message.reply_text.call_args[0][0]
-    assert "EMERGENCY STOP" in text
+    assert "АВАРІЙНУ ЗУПИНКУ" in text
 
 
 def test_config_never_leaks_secrets(db_engine, settings, rules):
@@ -129,6 +145,24 @@ def test_positions_reports_open_positions(db_engine, settings, rules):
     text = update.message.reply_text.call_args[0][0]
     assert "SOLUSDT" in text
     assert "142.53" in text
+    assert "поточна ціна недоступна" in text  # get_mark_prices() is empty by default
+
+
+def test_positions_shows_current_pnl_state_when_price_is_known(db_engine, settings, rules):
+    with session_scope() as session:
+        PositionRepository(session).create(
+            symbol="SOLUSDT", opened_at=utcnow(), avg_entry_price=Decimal("100"),
+            total_quantity=Decimal("1"), total_cost_usdt=Decimal("100"), target_price=Decimal("110"),
+        )
+    ctx = _make_ctx(db_engine, settings, rules)
+    ctx.get_mark_prices = lambda: {"SOLUSDT": Decimal("94")}
+    context = _make_context(ctx)
+    update = _make_update(user_id=42)
+
+    asyncio.run(cmd_positions(update, context))
+    text = update.message.reply_text.call_args[0][0]
+    assert "PnL=-6.00%" in text
+    assert "у мінусі" in text
 
 
 def test_market_before_and_after_regime_computed(db_engine, settings, rules):
@@ -137,11 +171,11 @@ def test_market_before_and_after_regime_computed(db_engine, settings, rules):
 
     update1 = _make_update(user_id=42)
     asyncio.run(cmd_market(update1, context))
-    assert "not yet computed" in update1.message.reply_text.call_args[0][0]
+    assert "ще не розраховано" in update1.message.reply_text.call_args[0][0]
 
     ctx.get_current_regime = lambda: RegimeAssessment(level=RegimeLevel.BULL, score=42.0, reasons=["strong uptrend"], crash=False)
     update2 = _make_update(user_id=42)
     asyncio.run(cmd_market(update2, context))
     text = update2.message.reply_text.call_args[0][0]
-    assert "BULL" in text
+    assert "ЗРОСТАННЯ" in text
     assert "strong uptrend" in text

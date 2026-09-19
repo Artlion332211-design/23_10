@@ -74,7 +74,7 @@ def test_get_balance_text_paper_mode_reports_holdings_and_equity(db_engine, sett
 
     text = asyncio.run(runtime.get_balance_text())
 
-    assert "BALANCE (PAPER)" in text
+    assert "БАЛАНС (PAPER)" in text
     assert "9000.00" in text
     assert "SOL: 2.000000" in text
     assert "9200.00" in text
@@ -93,3 +93,45 @@ def test_health_snapshot_reports_watchdog_and_websocket_state(settings, rules):
     assert snapshot["websocket_klines_connected"] is True
     assert snapshot["last_kline_age_s"] == 3.2
     assert snapshot["tasks"] == {"position_monitor": {"running": True, "restart_count": 0}}
+
+
+def _mock_snapshot_with_close(close: float):
+    snap = MagicMock()
+    snap.close = close
+    return snap
+
+
+def test_get_balance_text_live_mode_shows_total_usdt_value(settings, rules):
+    client = MagicMock()
+    client.get_account_balances = AsyncMock(return_value={
+        "USDT": (Decimal("500"), Decimal("0")),
+        "SOL": (Decimal("2"), Decimal("0")),
+    })
+    market_data = MagicMock()
+    market_data.snapshot.side_effect = lambda symbol, tf: _mock_snapshot_with_close(100.0) if symbol == "SOLUSDT" else None
+    runtime = _make_runtime(settings, rules, client=client, market_data=market_data, paper_broker=None)
+    runtime._tracked_symbols = {"SOLUSDT"}
+
+    text = asyncio.run(runtime.get_balance_text())
+
+    assert "БАЛАНС (LIVE)" in text
+    assert "SOL: вільно=2" in text
+    assert "Загалом приблизно: 700.00 USDT" in text
+
+
+def test_build_status_snapshot_reports_unrealized_pnl(db_engine, settings, rules):
+    with session_scope() as session:
+        PositionRepository(session).create(
+            symbol="SOLUSDT", opened_at=utcnow(), avg_entry_price=Decimal("100"),
+            total_quantity=Decimal("1"), total_cost_usdt=Decimal("100"), target_price=Decimal("110"),
+        )
+    market_data = MagicMock()
+    market_data.snapshot.side_effect = lambda symbol, tf: _mock_snapshot_with_close(106.0)
+    runtime = _make_runtime(settings, rules, market_data=market_data)
+    runtime._tracked_symbols = {"SOLUSDT"}
+
+    snapshot = runtime.build_status_snapshot()
+
+    assert snapshot.open_positions_count == 1
+    assert snapshot.total_unrealized_pnl_usdt == Decimal("6")
+    assert snapshot.max_open_positions == settings.max_open_positions

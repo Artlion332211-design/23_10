@@ -116,13 +116,14 @@ with open paper positions doesn't lose track of them.
 `TELEGRAM_ALLOWED_USER_ID` is the only user who can issue commands - every
 other caller is silently ignored (the bot never reveals that a command
 exists to anyone else). API keys and secrets never appear in any Telegram
-output, including `/config`.
+output, including `/config`. All message text is Ukrainian (universal
+technical-analysis jargon like RSI/MACD/EMA/BTC/USDT/DCA is left as-is).
 
 | Command | Purpose |
 |---|---|
-| `/status` | Mode, uptime, BTC regime, pause/emergency flags, health |
-| `/balance` | Current balance (real or paper) |
-| `/positions` | Open positions with entry, DCA count, target |
+| `/status` | Mode, uptime, BTC regime, open positions (X/`MAX_OPEN_POSITIONS`), total unrealized PnL (у плюсі/у мінусі), pause/emergency flags, health |
+| `/balance` | Current balance straight from the exchange (or the paper account), including an approximate total portfolio value in USDT |
+| `/positions` | Each open position's entry, current price, live unrealized PnL % (у плюсі/у мінусі), DCA count, target |
 | `/signals` | Most recent scored candidates |
 | `/pnl` | All-time realized PnL and win rate |
 | `/today` | Today's report (balance, PnL, trades, fees, exposure) |
@@ -133,6 +134,15 @@ output, including `/config`.
 | `/news` | Recent news items and sentiment |
 | `/config` | Current configuration (secrets redacted) |
 | `/emergency_stop` | Kill switch: stops new BUYs and DCA immediately. Never auto-sells existing positions - that would need a separate, explicit configuration decision |
+
+On top of the commands above, the bot proactively pushes a `/status`-style
+summary three times a day (`STATUS_PING_HOUR_1_UTC`/`_2_UTC`/`_3_UTC` in
+`.env`, default ~08:00/14:00/22:00 Kyiv time) so it's obvious it's still
+alive without having to ask.
+
+`MAX_OPEN_POSITIONS` (default 3) always means three *different* coins at
+once - the bot never opens a second position on a symbol that already has
+one open; DCA adds to the existing position instead of opening a new one.
 
 ## Before enabling LIVE
 

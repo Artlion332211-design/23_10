@@ -6,6 +6,9 @@ command exists, per the spec's Telegram-security rule). Handlers read live
 state only through `BotContext`, never by importing exchange/market modules
 directly - that keeps this module a thin presentation layer, and keeps it
 unit-testable without a real Binance/Telegram connection.
+
+All reply text is Ukrainian - see `telegram_bot/notifications.py`'s module
+docstring for the one exception (universal technical-analysis jargon).
 """
 
 from __future__ import annotations
@@ -28,12 +31,27 @@ from market.market_regime import RegimeAssessment
 from news.news_engine import NewsEngine
 from risk.risk_manager import RiskManager
 from strategy.strategy_engine import TradeDecision
-from telegram_bot.notifications import DailyReportData, format_daily_report
+from telegram_bot.notifications import (
+    SIGNAL_LABELS,
+    DailyReportData,
+    StatusSnapshot,
+    close_reason_label,
+    format_daily_report,
+    format_status,
+    regime_label,
+)
 from utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
 CTX_KEY = "ctx"
+
+_ACTION_LABELS = {
+    "BUY": "КУПІВЛЯ",
+    "DCA": "ДОКУПКА",
+    "NO_TRADE": "БЕЗ УГОДИ",
+    "BLOCKED": "ЗАБЛОКОВАНО",
+}
 
 
 @dataclass
@@ -48,6 +66,8 @@ class BotContext:
     get_current_regime: Callable[[], RegimeAssessment | None]
     get_latest_signals: Callable[[], list[TradeDecision]]
     get_health_snapshot: Callable[[], dict[str, Any]]
+    get_mark_prices: Callable[[], dict[str, Decimal]]
+    get_status_snapshot: Callable[[], StatusSnapshot]
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -69,12 +89,6 @@ def _restricted(
     return wrapper
 
 
-def _format_uptime(delta_seconds: float) -> str:
-    hours, remainder = divmod(int(delta_seconds), 3600)
-    minutes = remainder // 60
-    return f"{hours}h {minutes}m"
-
-
 async def _reply(update: Update, text: str) -> None:
     assert update.message is not None
     await update.message.reply_text(text)
@@ -82,23 +96,8 @@ async def _reply(update: Update, text: str) -> None:
 
 @_restricted
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx = _ctx(context)
-    flags = ctx.risk_manager.status()
-    regime = ctx.get_current_regime()
-    health = ctx.get_health_snapshot()
-    uptime = (utcnow() - ctx.started_at).total_seconds()
-
-    lines = [
-        "STATUS",
-        f"Mode: {ctx.settings.mode.value}{' (DRY_RUN)' if ctx.settings.dry_run else ''}",
-        f"Uptime: {_format_uptime(uptime)}",
-        f"BTC regime: {regime.level.value if regime else 'not yet computed'}",
-        f"Buy paused: {flags.buy_paused}  DCA paused: {flags.dca_paused}  Emergency stop: {flags.emergency_stop}",
-        f"Consecutive bad trades: {flags.consecutive_bad_trades}",
-    ]
-    for key, value in health.items():
-        lines.append(f"{key}: {value}")
-    await _reply(update, "\n".join(lines))
+    snapshot = _ctx(context).get_status_snapshot()
+    await _reply(update, format_status(snapshot))
 
 
 @_restricted
@@ -109,17 +108,27 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @_restricted
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    max_dca = _ctx(context).settings.max_dca_count
+    ctx = _ctx(context)
+    max_dca = ctx.settings.max_dca_count
+    mark_prices = ctx.get_mark_prices()
     with session_scope() as session:
         positions = PositionRepository(session).get_open_positions()
         if not positions:
-            await _reply(update, "No open positions.")
+            await _reply(update, "Відкритих позицій немає.")
             return
-        lines = ["OPEN POSITIONS"]
+        lines = [f"ВІДКРИТІ ПОЗИЦІЇ ({len(positions)}/{ctx.settings.max_open_positions})"]
         for p in positions:
+            current = mark_prices.get(p.symbol)
+            if current is not None and p.avg_entry_price > 0:
+                pnl_pct = (current / p.avg_entry_price - 1) * 100
+                state = "у плюсі" if pnl_pct > 0 else ("у мінусі" if pnl_pct < 0 else "у нулі")
+                price_info = f"поточна={current:.4f} PnL={pnl_pct:+.2f}% ({state})"
+            else:
+                price_info = "поточна ціна недоступна"
             lines.append(
-                f"{p.symbol}: avg={p.avg_entry_price:.4f} qty={p.total_quantity:.6f} "
-                f"target={p.target_price:.4f} dca={p.dca_count}/{max_dca} opened={p.opened_at.date()}"
+                f"{p.symbol}: вхід={p.avg_entry_price:.4f} к-сть={p.total_quantity:.6f} "
+                f"{price_info} ціль={p.target_price:.4f} DCA={p.dca_count}/{max_dca} "
+                f"відкрито={p.opened_at.date()}"
             )
     await _reply(update, "\n".join(lines))
 
@@ -128,12 +137,13 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     decisions = _ctx(context).get_latest_signals()
     if not decisions:
-        await _reply(update, "No recent scan results yet.")
+        await _reply(update, "Ще немає результатів сканування.")
         return
-    lines = ["TOP SIGNALS"]
+    lines = ["ТОП СИГНАЛИ"]
     for decision in sorted(decisions, key=lambda d: d.breakdown.final_score, reverse=True)[:10]:
-        top = ", ".join(decision.breakdown.top_reasons(3)) or "-"
-        lines.append(f"{decision.symbol}: {decision.breakdown.final_score:.0f}/100 [{decision.action}] - {top}")
+        top = ", ".join(decision.breakdown.top_reasons(3, label_map=SIGNAL_LABELS)) or "-"
+        action = _ACTION_LABELS.get(decision.action, decision.action)
+        lines.append(f"{decision.symbol}: {decision.breakdown.final_score:.0f}/100 [{action}] - {top}")
     await _reply(update, "\n".join(lines))
 
 
@@ -147,7 +157,8 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     win_rate = (wins / total * 100) if total else 0.0
     await _reply(
         update,
-        f"PNL\nRealized PnL (all time): {realized:+.2f} USDT\nClosed trades: {total}\nWin rate: {win_rate:.1f}%",
+        f"PNL\nРеалізований PnL (за весь час): {realized:+.2f} USDT\n"
+        f"Закритих угод: {total}\nУспішність: {win_rate:.1f}%",
     )
 
 
@@ -157,7 +168,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with session_scope() as session:
         stat = DailyStatRepository(session).get(today)
     if stat is None:
-        await _reply(update, f"No stats recorded yet for {today}.")
+        await _reply(update, f"Ще немає статистики за {today}.")
         return
     await _reply(update, format_daily_report(DailyReportData.from_model(stat)))
 
@@ -167,47 +178,48 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     with session_scope() as session:
         closed = PositionRepository(session).recent_closed(limit=10)
     if not closed:
-        await _reply(update, "No closed trades yet.")
+        await _reply(update, "Ще немає закритих угод.")
         return
-    lines = ["RECENT TRADES"]
+    lines = ["ОСТАННІ УГОДИ"]
     for p in closed:
         assert p.closed_at is not None  # recent_closed() only returns CLOSED positions
-        lines.append(f"{p.symbol}: {(p.realized_pnl_pct or Decimal('0')):+.2f}% ({p.close_reason}) closed {p.closed_at.date()}")
+        reason = close_reason_label(p.close_reason or "-")
+        lines.append(f"{p.symbol}: {(p.realized_pnl_pct or Decimal('0')):+.2f}% ({reason}) закрито {p.closed_at.date()}")
     await _reply(update, "\n".join(lines))
 
 
 @_restricted
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ctx(context).risk_manager.pause_buys()
-    await _reply(update, "New BUYs paused.")
+    await _reply(update, "Нові купівлі призупинено.")
 
 
 @_restricted
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ctx(context).risk_manager.resume_buys()
-    await _reply(update, "New BUYs resumed.")
+    await _reply(update, "Нові купівлі відновлено.")
 
 
 @_restricted
 async def cmd_stop_dca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ctx(context).risk_manager.stop_dca()
-    await _reply(update, "DCA disabled.")
+    await _reply(update, "DCA (докупку) вимкнено.")
 
 
 @_restricted
 async def cmd_start_dca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ctx(context).risk_manager.start_dca()
-    await _reply(update, "DCA enabled.")
+    await _reply(update, "DCA (докупку) увімкнено.")
 
 
 @_restricted
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     regime = _ctx(context).get_current_regime()
     if regime is None:
-        await _reply(update, "Market regime not yet computed.")
+        await _reply(update, "Режим ринку ще не розраховано.")
         return
     reasons = "\n".join(regime.reasons[:5]) if regime.reasons else "-"
-    await _reply(update, f"MARKET REGIME\nBTC: {regime.level.value} (score {regime.score:.0f})\n{reasons}")
+    await _reply(update, f"РИНКОВИЙ РЕЖИМ\nBTC: {regime_label(regime.level.value)} (бал {regime.score:.0f})\n{reasons}")
 
 
 @_restricted
@@ -215,9 +227,9 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with session_scope() as session:
         items = NewsRepository(session).recent(10)
     if not items:
-        await _reply(update, "No recent news.")
+        await _reply(update, "Останніх новин немає.")
         return
-    lines = ["RECENT NEWS"]
+    lines = ["ОСТАННІ НОВИНИ"]
     for n in items:
         lines.append(f"[{n.sentiment_score:+d}] {n.title} ({', '.join(n.symbols)})")
     await _reply(update, "\n".join(lines))
@@ -227,13 +239,13 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = _ctx(context).settings
     lines = [
-        "CONFIG",
+        "НАЛАШТУВАННЯ",
         f"MODE={s.mode.value}  DRY_RUN={s.dry_run}",
         f"INITIAL_ORDER_USDT={s.initial_order_usdt}  MAX_POSITION_USDT={s.max_position_usdt}",
         f"MAX_OPEN_POSITIONS={s.max_open_positions}  MAX_TOTAL_EXPOSURE_PERCENT={s.max_total_exposure_percent}%",
         f"TARGET_PROFIT_PERCENT={s.target_profit_percent}%  USE_TRAILING_AFTER_TP={s.use_trailing_after_tp}",
         f"MIN_BUY_SCORE={s.min_buy_score}  MIN_DCA_SCORE={s.min_dca_score}",
-        f"MAX_DCA_COUNT={s.max_dca_count}  DCA levels: {s.dca_level_1}%/{s.dca_level_2}%/{s.dca_level_3}%",
+        f"MAX_DCA_COUNT={s.max_dca_count}  Рівні DCA: {s.dca_level_1}%/{s.dca_level_2}%/{s.dca_level_3}%",
         f"BTC_MARKET_FILTER={s.btc_market_filter}  NEWS_ENABLED={s.news_enabled}",
         f"MAX_CONSECUTIVE_BAD_TRADES={s.max_consecutive_bad_trades}  MARKET_CRASH_PAUSE={s.market_crash_pause}",
     ]
@@ -245,7 +257,7 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _ctx(context).risk_manager.trigger_emergency_stop()
     await _reply(
         update,
-        "EMERGENCY STOP triggered.\n"
-        "New BUYs and DCA are disabled. Existing positions are left untouched "
-        "and continue to be monitored - use /resume after review to re-enable trading.",
+        "АВАРІЙНУ ЗУПИНКУ АКТИВОВАНО.\n"
+        "Нові купівлі та DCA вимкнено. Відкриті позиції не чіпаються "
+        "і продовжують відстежуватись - використай /resume після перевірки, щоб знову дозволити торгівлю.",
     )
