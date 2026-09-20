@@ -107,6 +107,7 @@ class BotRuntime:
         self._alerted_news_ids: set[int] = set()
         self._last_universe_scan_at: datetime | None = None
         self._last_news_refresh_at: datetime | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Startup
@@ -197,7 +198,9 @@ class BotRuntime:
         previous_level = self._btc_regime.level if self._btc_regime else None
         self._btc_regime = self._regime_engine.evaluate(snapshots, recent_15m)  # type: ignore[arg-type]
         if self._btc_regime.level == RegimeLevel.CRASH and previous_level != RegimeLevel.CRASH:
-            asyncio.create_task(self._notifier.crash_alert(self._btc_regime.reasons))
+            task = asyncio.create_task(self._notifier.crash_alert(self._btc_regime.reasons))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     async def _on_user_event(self, event: dict[str, Any]) -> None:
         """Supplementary low-latency signal only - order-state correctness
@@ -263,9 +266,15 @@ class BotRuntime:
             await self._sleep_with_heartbeat(self._rules.scheduler.position_monitor_interval_seconds, "position_monitor")
 
     async def _monitor_open_positions(self) -> None:
+        regime = self._btc_regime or _default_neutral_regime()
+        try:
+            await self._strategy_engine.process_resolved_orders(btc_regime=regime)
+        except Exception as exc:  # noqa: BLE001 - a bad resolution cycle must not block position management
+            logger.exception("Resolving pending limit orders failed: %r", exc)
+            await self._notifier.on_error(f"Order resolution error: {exc!r}")
+
         with session_scope() as session:
             open_positions = [(p.id, p.symbol) for p in PositionRepository(session).get_open_positions()]
-        regime = self._btc_regime or _default_neutral_regime()
         for position_id, symbol in open_positions:
             try:
                 order_book = await self._get_order_book(symbol)
@@ -277,6 +286,30 @@ class BotRuntime:
             except Exception as exc:  # noqa: BLE001 - one bad symbol must not block managing the rest
                 logger.exception("Position monitor failed for %s: %r", symbol, exc)
                 await self._notifier.on_error(f"Position monitor error for {symbol}: {exc!r}")
+
+    # ------------------------------------------------------------------
+    # Emergency stop
+    # ------------------------------------------------------------------
+
+    async def emergency_stop(self) -> list[str] | None:
+        """Triggers the kill switch (stop new BUY/DCA) and, only if
+        `EMERGENCY_AUTO_SELL=true`, immediately market-sells every open
+        position. Returns `None` if no liquidation was attempted (the
+        setting is off), otherwise the list of symbols that failed to
+        liquidate (empty list = every position sold)."""
+        self._risk_manager.trigger_emergency_stop()
+        if not self._settings.emergency_auto_sell:
+            return None
+
+        with session_scope() as session:
+            symbols = [p.symbol for p in PositionRepository(session).get_open_positions()]
+        order_books: dict[str, OrderBookSnapshot] = {}
+        for symbol in symbols:
+            try:
+                order_books[symbol] = await self._get_order_book(symbol)
+            except Exception as exc:  # noqa: BLE001 - a missing book is handled per-symbol below
+                logger.exception("Failed to fetch order book for emergency liquidation of %s: %r", symbol, exc)
+        return await self._strategy_engine.emergency_liquidate_all(order_books=order_books)
 
     # ------------------------------------------------------------------
     # News

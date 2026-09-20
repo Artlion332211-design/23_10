@@ -68,6 +68,7 @@ class BotContext:
     get_health_snapshot: Callable[[], dict[str, Any]]
     get_mark_prices: Callable[[], dict[str, Decimal]]
     get_status_snapshot: Callable[[], StatusSnapshot]
+    trigger_emergency_stop: Callable[[], Awaitable[list[str] | None]]
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -254,10 +255,25 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @_restricted
 async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _ctx(context).risk_manager.trigger_emergency_stop()
-    await _reply(
-        update,
-        "АВАРІЙНУ ЗУПИНКУ АКТИВОВАНО.\n"
-        "Нові купівлі та DCA вимкнено. Відкриті позиції не чіпаються "
-        "і продовжують відстежуватись - використай /resume після перевірки, щоб знову дозволити торгівлю.",
-    )
+    failed = await _ctx(context).trigger_emergency_stop()
+    if failed is None:
+        await _reply(
+            update,
+            "АВАРІЙНУ ЗУПИНКУ АКТИВОВАНО.\n"
+            "Нові купівлі та DCA вимкнено. Відкриті позиції не чіпаються "
+            "і продовжують відстежуватись - використай /resume після перевірки, щоб знову дозволити торгівлю.",
+        )
+    elif failed:
+        await _reply(
+            update,
+            "АВАРІЙНУ ЗУПИНКУ АКТИВОВАНО.\n"
+            "Нові купівлі та DCA вимкнено. EMERGENCY_AUTO_SELL активний: спроба ринкового продажу всіх позицій.\n"
+            f"Не вдалося ліквідувати: {', '.join(failed)}. Перевір вручну!",
+        )
+    else:
+        await _reply(
+            update,
+            "АВАРІЙНУ ЗУПИНКУ АКТИВОВАНО.\n"
+            "Нові купівлі та DCA вимкнено. EMERGENCY_AUTO_SELL активний: "
+            "усі відкриті позиції успішно продано за ринком.",
+        )

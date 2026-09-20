@@ -46,8 +46,14 @@ def _default_status_snapshot() -> StatusSnapshot:
 
 
 def _make_ctx(db_engine, settings, rules, *, allowed_user_id: int = 42) -> BotContext:
+    risk_manager = RiskManager(settings)
+
+    async def _trigger_emergency_stop() -> list[str] | None:
+        risk_manager.trigger_emergency_stop()
+        return None
+
     return BotContext(
-        settings=settings, rules=rules, risk_manager=RiskManager(settings),
+        settings=settings, rules=rules, risk_manager=risk_manager,
         news_engine=MagicMock(), allowed_user_id=allowed_user_id, started_at=utcnow(),
         get_balance_text=AsyncMock(return_value="БАЛАНС\nUSDT: 1000.00"),
         get_current_regime=lambda: None,
@@ -55,6 +61,7 @@ def _make_ctx(db_engine, settings, rules, *, allowed_user_id: int = 42) -> BotCo
         get_health_snapshot=lambda: {"last_scan": "n/a"},
         get_mark_prices=lambda: {},
         get_status_snapshot=_default_status_snapshot,
+        trigger_emergency_stop=_trigger_emergency_stop,
     )
 
 

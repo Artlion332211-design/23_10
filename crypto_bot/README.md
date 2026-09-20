@@ -133,7 +133,7 @@ technical-analysis jargon like RSI/MACD/EMA/BTC/USDT/DCA is left as-is).
 | `/market` | Current BTC market regime and reasons |
 | `/news` | Recent news items and sentiment |
 | `/config` | Current configuration (secrets redacted) |
-| `/emergency_stop` | Kill switch: stops new BUYs and DCA immediately. Never auto-sells existing positions - that would need a separate, explicit configuration decision |
+| `/emergency_stop` | Kill switch: stops new BUYs and DCA immediately. Existing positions are left alone unless `EMERGENCY_AUTO_SELL=true`, in which case every open position is market-sold immediately too |
 
 On top of the commands above, the bot proactively pushes a `/status`-style
 summary three times a day (`STATUS_PING_HOUR_1_UTC`/`_2_UTC`/`_3_UTC` in
