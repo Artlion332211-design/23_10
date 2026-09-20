@@ -159,8 +159,18 @@ class Position(Base):
     target_price: Mapped[Decimal] = mapped_column(MONEY)
     trailing_active: Mapped[bool] = mapped_column(default=False)
     trailing_peak_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
-    partial_closed_quantity: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    # Cumulative cost-basis of every slice ever sold from this position
+    # (each partial take-profit slice, plus the final close) - never
+    # decreases, unlike total_cost_usdt which tracks remaining *unsold*
+    # cost basis. Needed to compute realized_pnl_pct correctly at any
+    # point (realized_pnl_usdt / total_sold_cost_usdt), whether after a
+    # partial sale or the position's eventual full close.
+    total_sold_cost_usdt: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
 
+    # Accumulates across every sold slice (see PositionRepository.apply_sell_fill)
+    # rather than being computed once at final close, so a position that
+    # partially took profit and later fully exits reports its true total
+    # PnL, not just the last leg.
     realized_pnl_usdt: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
     realized_pnl_pct: Mapped[Decimal | None] = mapped_column(PERCENT, nullable=True)
     fees_paid_usdt: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))

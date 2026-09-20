@@ -64,7 +64,7 @@ class PositionRepository:
             dca_count=0,
             target_price=target_price,
             trailing_active=False,
-            partial_closed_quantity=Decimal("0"),
+            total_sold_cost_usdt=Decimal("0"),
             fees_paid_usdt=fees_paid_usdt,
             market_regime_at_entry=market_regime_at_entry,
             entry_score=entry_score,
@@ -92,11 +92,15 @@ class PositionRepository:
         return self.session.scalar(stmt) or 0
 
     def total_open_cost_usdt(self) -> Decimal:
-        stmt = select(func.coalesce(func.sum(Position.total_cost_usdt), 0)).where(
-            Position.status == PositionStatus.OPEN
-        )
-        total = self.session.scalar(stmt)
-        return Decimal(str(total or 0))
+        """Summed in Python, not SQL: `Position.total_cost_usdt` is a
+        DecimalString (TEXT-affinity) column, and SQLite's SUM() aggregate
+        coerces TEXT operands to floating point before adding them -
+        silently reintroducing the exact float-precision drift
+        DecimalString exists to prevent. Fetching the (already-parsed-as-
+        Decimal-by-DecimalString) values and summing them in Python keeps
+        the whole computation on exact Decimal arithmetic throughout."""
+        stmt = select(Position.total_cost_usdt).where(Position.status == PositionStatus.OPEN)
+        return sum(self.session.scalars(stmt), Decimal("0"))
 
     def apply_fill_and_recompute(
         self,
@@ -137,10 +141,75 @@ class PositionRepository:
         self.session.flush()
         return position
 
-    def record_partial_close(self, position: Position, quantity_closed: Decimal) -> Position:
-        position.partial_closed_quantity = position.partial_closed_quantity + quantity_closed
+    def apply_sell_fill(
+        self,
+        position: Position,
+        *,
+        sold_quantity: Decimal,
+        proceeds_usdt: Decimal,
+        now: datetime,
+        close_reason: str,
+    ) -> tuple[Decimal, bool]:
+        """Reduces (or fully closes) a position by a sold quantity, using
+        average-cost-basis accounting uniformly whether this is a full
+        take-profit, a deliberate partial take-profit slice, a trailing-
+        stop exit, or a LIMIT sell that only partially filled before timing
+        out - there is exactly one code path for "some quantity was sold",
+        not a separate under-tested one for the partial case.
+
+        Realized PnL accumulates across every slice ever sold from this
+        position (see `Position.total_sold_cost_usdt`/`realized_pnl_usdt`)
+        rather than being computed only once at final close, so a position
+        that partially took profit and later fully exits reports its true
+        total PnL, not just the last leg.
+
+        `proceeds_usdt` must already be net of this fill's own sell-side
+        commission (the caller subtracts it, since that commission is known
+        only from the sell's own ExecutionResult). Buy-side commission
+        (`fees_paid_usdt`, accumulated from the entry and every DCA fill)
+        is handled here instead: it was never folded into avg_entry_price,
+        so without this every close would silently ignore what was paid to
+        acquire the position, overstating realized PnL. It is allocated
+        proportionally to the fraction of the position being sold.
+
+        Returns (this slice's PnL, whether the position is now fully closed).
+        """
+        fee_fraction = (sold_quantity / position.total_quantity) if position.total_quantity > 0 else Decimal("0")
+        cost_basis = position.avg_entry_price * sold_quantity
+        fee_share = position.fees_paid_usdt * fee_fraction
+        slice_pnl = proceeds_usdt - cost_basis - fee_share
+
+        position.total_quantity = position.total_quantity - sold_quantity
+        position.total_cost_usdt = position.total_cost_usdt - cost_basis
+        position.fees_paid_usdt = position.fees_paid_usdt - fee_share
+        position.total_sold_cost_usdt = position.total_sold_cost_usdt + cost_basis + fee_share
+        position.realized_pnl_usdt = (position.realized_pnl_usdt or Decimal("0")) + slice_pnl
+        position.realized_pnl_pct = (
+            position.realized_pnl_usdt / position.total_sold_cost_usdt * 100
+            if position.total_sold_cost_usdt > 0
+            else Decimal("0")
+        )
+
+        # A "sell everything" request is rounded down to the exchange's lot
+        # step size before being sent (see `ExecutionEngine.sell`), so
+        # `sold_quantity` routinely comes back a hair under what was truly
+        # remaining - a fixed absolute epsilon alone would leave that
+        # unsellable rounding dust looking like a still-open position
+        # forever. Treat anything under 0.1% of *this slice* as dust too;
+        # a genuine partial exit sells a materially larger fraction than
+        # that, so it never gets caught by this.
+        dust = max(Decimal("0.00000001"), sold_quantity * Decimal("0.001"))
+        fully_closed = position.total_quantity <= dust
+        if fully_closed:
+            position.status = PositionStatus.CLOSED
+            position.closed_at = now
+            position.close_reason = close_reason
+            position.total_quantity = Decimal("0")
+            position.total_cost_usdt = Decimal("0")
+            position.fees_paid_usdt = Decimal("0")
+
         self.session.flush()
-        return position
+        return slice_pnl, fully_closed
 
     def close(
         self,
@@ -206,6 +275,16 @@ class OrderRepository:
         self.session.flush()
         return order
 
+    def set_position(self, order: Order, position_id: int) -> Order:
+        """Retroactively links an entry Order to the Position it created -
+        needed because an entry order is placed before any Position exists
+        (see `strategy_engine.StrategyEngine._apply_entry_fill`), unlike
+        DCA/exit orders which already know their position_id at placement
+        time."""
+        order.position_id = position_id
+        self.session.flush()
+        return order
+
     def open_orders(self, symbol: str | None = None) -> list[Order]:
         stmt = select(Order).where(Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED]))
         if symbol:
@@ -257,11 +336,12 @@ class FillRepository:
         return list(self.session.scalars(stmt))
 
     def total_commission_usdt_between(self, start: datetime, end: datetime) -> Decimal:
-        stmt = select(func.coalesce(func.sum(Fill.commission_usdt_equivalent), 0)).where(
-            Fill.timestamp >= start, Fill.timestamp < end
-        )
-        total = self.session.scalar(stmt)
-        return Decimal(str(total or 0))
+        """Summed in Python for the same reason as
+        `PositionRepository.total_open_cost_usdt` - SQLite's SUM() coerces
+        this DecimalString (TEXT-affinity) column to float."""
+        stmt = select(Fill.commission_usdt_equivalent).where(Fill.timestamp >= start, Fill.timestamp < end)
+        values = (v for v in self.session.scalars(stmt) if v is not None)
+        return sum(values, Decimal("0"))
 
 
 class SignalRepository:

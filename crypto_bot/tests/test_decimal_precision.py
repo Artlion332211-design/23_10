@@ -24,7 +24,7 @@ def test_decimal_column_round_trips_high_precision_value_exactly(db_engine):
             symbol="SOLUSDT", status=PositionStatus.OPEN, opened_at=utcnow(),
             avg_entry_price=Decimal("100"), total_quantity=tricky, total_cost_usdt=Decimal("100"),
             dca_count=0, target_price=Decimal("110"), trailing_active=False,
-            partial_closed_quantity=Decimal("0"), fees_paid_usdt=Decimal("0"),
+            fees_paid_usdt=Decimal("0"),
         )
         session.add(position)
         session.flush()

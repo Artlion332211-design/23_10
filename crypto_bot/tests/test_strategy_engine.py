@@ -34,6 +34,9 @@ class FakeMarketDataStore:
     def dataframe(self, symbol, tf):
         return None
 
+    def is_stale(self, symbol, tf, max_age_seconds):
+        return False
+
 
 class FakeNewsProvider:
     async def get_symbol_news_score(self, symbol):

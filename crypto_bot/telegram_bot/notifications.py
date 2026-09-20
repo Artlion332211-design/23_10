@@ -23,6 +23,7 @@ from database.models import DailyStat
 from strategy.strategy_engine import (
     BuyExecutedEvent,
     DCAExecutedEvent,
+    DelayedFillEvent,
     PositionClosedEvent,
     TradeDecision,
 )
@@ -163,6 +164,21 @@ def format_position_closed(event: PositionClosedEvent) -> str:
         f"Вхід: ${event.avg_entry_price:.4f}  Вихід: ${event.exit_price:.4f}\n"
         f"Чистий PnL: {event.net_pnl_usdt:+.2f} USDT ({event.net_pnl_percent:+.2f}%)\n"
         f"Утримувалась: {_format_timedelta_hours(event.holding_time_seconds)}"
+    )
+
+
+_SIDE_LABELS = {"BUY": "купівля", "SELL": "продаж"}
+
+
+def format_delayed_fill(event: DelayedFillEvent) -> str:
+    return (
+        "ВІДКЛАДЕНЕ ВИКОНАННЯ ОРДЕРА\n"
+        f"Пара: {event.symbol}\n"
+        f"Тип: {_SIDE_LABELS.get(event.side, event.side)} ({event.purpose})\n"
+        f"Ціна: ${event.price:.4f}\n"
+        f"Кількість: {event.quantity:.6f}\n"
+        f"Сума: ${event.usdt_amount:.2f}\n"
+        "Ордер стояв у книзі (LIMIT) і щойно виконався."
     )
 
 
@@ -326,6 +342,9 @@ class TelegramNotifier:
 
     async def on_position_closed(self, event: PositionClosedEvent) -> None:
         await self._send(format_position_closed(event))
+
+    async def on_delayed_fill(self, event: DelayedFillEvent) -> None:
+        await self._send(format_delayed_fill(event))
 
     async def on_error(self, message: str) -> None:
         await self._send(format_error(message))
