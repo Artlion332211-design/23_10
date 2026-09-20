@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from config.settings import Settings
-from database.models import BotEventLevel, OrderSide
+from database.models import BotEventLevel, OrderSide, OrderType
 from database.repository import EventRepository, OrderRepository, PositionRepository
 from database.session import session_scope
 from exchange.binance_client import BinanceClient
-from exchange.execution_engine import ExecutionEngine
+from exchange.execution_engine import ExecutionEngine, OrderRequest
 from paper.simulator import PaperBroker, base_asset_of
 
 logger = logging.getLogger(__name__)
@@ -93,25 +93,37 @@ async def reconcile_live(client: BinanceClient, execution_engine: ExecutionEngin
     return report
 
 
-def reconcile_paper(settings: Settings, broker: PaperBroker) -> ReconciliationReport:
-    """Rebuilds `PaperBroker.account` from the durable Fill ledger.
+def reconcile_paper(settings: Settings, broker: PaperBroker, execution_engine: ExecutionEngine) -> ReconciliationReport:
+    """Rebuilds `PaperBroker.account` from the durable Fill ledger, and
+    re-registers every still-open (zero-fill) LIMIT order so it keeps
+    getting polled after the restart.
 
-    A fresh process's `PaperAccount` starts empty; without this, restarting
-    with open positions would report a wrong balance and - worse - be unable
-    to SELL a position it can no longer see any simulated holdings for. The
-    replay mirrors `PaperBroker._fill_at`'s own bookkeeping exactly (BUY
-    commission comes out of the base asset received, SELL commission out of
-    the USDT proceeds), so it reconstructs the exact state a continuously
-    running process would have had.
+    A fresh process's `PaperAccount` starts empty; without the balance
+    rebuild, restarting with open positions would report a wrong balance
+    and - worse - be unable to SELL a position it can no longer see any
+    simulated holdings for. The replay mirrors `PaperBroker._fill_at`'s own
+    bookkeeping exactly (BUY commission comes out of the base asset
+    received, SELL commission out of the USDT proceeds), so it reconstructs
+    the exact state a continuously running process would have had.
+
+    Separately, a fresh `PaperBroker._resting` dict also starts empty, so a
+    LIMIT order that was still resting (unfilled) when the process stopped
+    would otherwise become permanently orphaned: never filled even if price
+    later makes it marketable, never timed out/cancelled, its local Order
+    row stuck at NEW forever. LIVE doesn't have this problem (Binance
+    itself remembers a resting order regardless of the local process), so
+    this half is PAPER-only - `reconcile_live` instead asks Binance for
+    each open order's real current status.
     """
     report = ReconciliationReport(mode="PAPER")
 
     usdt_balance = settings.paper_starting_balance_usdt
     holdings: dict[str, Decimal] = {}
+    resting_client_ids: list[str] = []
 
     with session_scope() as session:
-        orders = OrderRepository(session).all_with_fills()
-        for order in orders:
+        order_repo = OrderRepository(session)
+        for order in order_repo.all_with_fills():
             base_asset = base_asset_of(order.symbol)
             for fill in order.fills:
                 if order.side == OrderSide.BUY:
@@ -123,10 +135,30 @@ def reconcile_paper(settings: Settings, broker: PaperBroker) -> ReconciliationRe
                     usdt_balance += fill.price * fill.quantity - fee_in_usdt
                     holdings[base_asset] = holdings.get(base_asset, Decimal("0")) - fill.quantity
 
+        # PaperBroker never produces a partial fill (see `_fill_at`: every
+        # order either fills in full immediately or rests with zero fills),
+        # so every still-open order here is a zero-fill resting LIMIT order
+        # and its full `requested_qty`/`requested_price` is exactly what was
+        # resting - never a stale/partially-consumed quantity.
+        for order in order_repo.open_orders():
+            if order.type != OrderType.LIMIT or order.requested_price is None:
+                continue
+            request = OrderRequest(
+                symbol=order.symbol, side=order.side, order_type=OrderType.LIMIT,
+                client_order_id=order.client_order_id, quantity=order.requested_qty,
+                limit_price=order.requested_price,
+            )
+            broker.restore_resting_order(request)
+            execution_engine.restore_pending_limit_order(order)
+            resting_client_ids.append(order.client_order_id)
+
     broker.account.usdt_balance = usdt_balance
     broker.account.holdings = {asset: qty for asset, qty in holdings.items() if qty != 0}
+    report.resolved_orders = resting_client_ids
     report.notes.append(
         f"restored paper balance {usdt_balance:.2f} USDT and {len(broker.account.holdings)} holding(s) from fill ledger"
     )
-    logger.info("PAPER reconciliation: %s", report.notes[-1])
+    if resting_client_ids:
+        report.notes.append(f"re-registered {len(resting_client_ids)} still-resting paper LIMIT order(s) for polling")
+    logger.info("PAPER reconciliation: %s", "; ".join(report.notes))
     return report

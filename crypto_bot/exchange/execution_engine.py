@@ -213,7 +213,16 @@ class BinanceExecutionAdapter:
 
     async def get_status(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
         filters = await self._client.get_symbol_filters(symbol)
-        raw = await self._client.get_order_status(symbol, orig_client_order_id=client_order_id)
+        try:
+            raw = await self._client.get_order_status(symbol, orig_client_order_id=client_order_id)
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            # Treat "couldn't confirm status" as still-pending (like `cancel`'s
+            # failure path below), never as resolved - `check_pending_limit_orders`
+            # would otherwise have to interpret an unrelated exception as
+            # FILLED/CANCELED/REJECTED/EXPIRED for every other order still
+            # queued behind this one in the same poll cycle.
+            logger.warning("get_status failed for %s/%s: %s", symbol, client_order_id, exc)
+            return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
         return _parse_order_response(raw, base_asset=filters.base_asset, quote_asset=filters.quote_asset)
 
 
@@ -442,6 +451,15 @@ class ExecutionEngine:
                 self._persist_result_by_client_id(client_order_id, cancel_result)
                 resolved.append((symbol, client_order_id, cancel_result))
         return resolved
+
+    def restore_pending_limit_order(self, order: Order) -> None:
+        """Resumes `LIMIT_ORDER_TIMEOUT_SECONDS` tracking for a still-open
+        order across a restart (see `orchestration.reconciliation`) - this
+        in-memory dict does not survive a restart on its own. Mirrors what
+        `reconcile_pending_order` does for LIVE after a real Binance status
+        check; PAPER has no exchange to ask, so the caller re-hydrates the
+        executor's own resting-order state separately first."""
+        self._pending_limit_orders[order.client_order_id] = (order.symbol, order.created_at)
 
     def _persist_result_by_client_id(self, client_order_id: str, result: ExecutionResult) -> None:
         with session_scope() as session:

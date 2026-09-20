@@ -145,9 +145,39 @@ def test_reconcile_paper_rebuilds_balance_and_holdings_from_fill_ledger(db_engin
     # configured balance, as if the previous run's in-memory state never
     # existed - reconciliation must arrive at the same numbers regardless.
     restarted_broker = PaperBroker(settings, price_source)
-    report = reconcile_paper(settings, restarted_broker)
+    restarted_engine = ExecutionEngine(executor=restarted_broker, filters_provider=filters_provider, settings=settings, dry_run=False)
+    report = reconcile_paper(settings, restarted_broker, restarted_engine)
 
     assert restarted_broker.account.usdt_balance == live_broker.account.usdt_balance
     assert restarted_broker.account.holdings == live_broker.account.holdings
     assert restarted_broker.account.usdt_balance == settings.paper_starting_balance_usdt - Decimal("100") - Decimal("50")
     assert "restored paper balance" in report.notes[0]
+
+
+def test_reconcile_paper_re_registers_a_still_resting_limit_order(db_engine, settings, filters_provider):
+    """A LIMIT order that never got its first fill before the process
+    stopped must not be silently orphaned after a restart - it needs to
+    keep being polled (and eventually filled or timed out) exactly like a
+    live resting order does."""
+    async def never_marketable_price(symbol: str) -> Decimal:
+        return Decimal("1000")  # far from the BUY limit price -> stays resting
+
+    live_broker = PaperBroker(settings, never_marketable_price)
+    live_engine = ExecutionEngine(executor=live_broker, filters_provider=filters_provider, settings=settings, dry_run=False)
+    result = asyncio.run(live_engine.buy(
+        symbol="SOLUSDT", usdt_amount=Decimal("140"), reference_price=Decimal("140"),
+        spread_percent=Decimal("10"), purpose=OrderPurpose.ENTRY, position_id=None,  # wide spread -> LIMIT
+    ))
+    assert result.status == OrderStatus.NEW
+    with session_scope() as session:
+        pending = OrderRepository(session).open_orders()
+        assert len(pending) == 1
+        client_order_id = pending[0].client_order_id
+
+    restarted_broker = PaperBroker(settings, never_marketable_price)
+    restarted_engine = ExecutionEngine(executor=restarted_broker, filters_provider=filters_provider, settings=settings, dry_run=False)
+    report = reconcile_paper(settings, restarted_broker, restarted_engine)
+
+    assert client_order_id in report.resolved_orders
+    assert client_order_id in restarted_broker._resting
+    assert client_order_id in restarted_engine._pending_limit_orders

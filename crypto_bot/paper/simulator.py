@@ -76,6 +76,14 @@ class PaperBroker:
     def get_total_equity(self, mark_prices: dict[str, Decimal]) -> Decimal:
         return self.account.total_equity(mark_prices)
 
+    def restore_resting_order(self, request: OrderRequest) -> None:
+        """Re-registers a still-open LIMIT order after a restart - a fresh
+        process's `_resting` dict starts empty and has no memory of it
+        otherwise, unlike live where Binance itself still remembers the
+        order regardless of the local process (see
+        `orchestration.reconciliation.reconcile_paper`)."""
+        self._resting[request.client_order_id] = request
+
     async def submit(self, request: OrderRequest) -> ExecutionResult:
         current_price = await self._price_source(request.symbol)
 
@@ -90,7 +98,15 @@ class PaperBroker:
         return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id=f"paper-{request.client_order_id}")
 
     async def cancel(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
-        self._resting.pop(client_order_id, None)
+        if client_order_id not in self._resting:
+            # Mirrors live: cancelling an order Binance no longer considers
+            # open (already filled/cancelled/unknown) comes back rejected,
+            # never a silent, unconditional "cancelled".
+            return ExecutionResult(
+                accepted=False, status=OrderStatus.REJECTED,
+                error_message="paper order not found (already resolved)",
+            )
+        del self._resting[client_order_id]
         return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id=f"paper-{client_order_id}")
 
     async def get_status(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
