@@ -72,7 +72,11 @@ def test_indicators_have_no_lookahead():
     full = compute_all_indicators(df, cfg)
     prefix = compute_all_indicators(df.iloc[:150].copy(), cfg)
 
-    for col in ("rsi", "macd", "ema_fast", "atr", "adx"):
+    for col in (
+        "rsi", "macd", "ema_fast", "atr", "adx",
+        "swing_low", "swing_high", "higher_low_structure", "higher_high_structure",
+        "rsi_bullish_divergence", "support", "distance_from_support_pct",
+    ):
         full_val = full[col].iloc[149]
         prefix_val = prefix[col].iloc[149]
         if pd.isna(full_val) and pd.isna(prefix_val):

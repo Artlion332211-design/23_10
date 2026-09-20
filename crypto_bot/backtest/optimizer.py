@@ -32,25 +32,44 @@ class WalkForwardSplit:
     btc_test: pd.DataFrame
 
 
-def _split_three(df: pd.DataFrame, train_fraction: float, validation_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    n = len(df)
-    train_end = int(n * train_fraction)
-    val_end = int(n * (train_fraction + validation_fraction))
-    return df.iloc[:train_end].copy(), df.iloc[train_end:val_end].copy(), df.iloc[val_end:].copy()
+def _split_three_by_time(
+    df: pd.DataFrame, train_end: pd.Timestamp, val_end: pd.Timestamp
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    train = df[df["open_time"] < train_end].copy()
+    validation = df[(df["open_time"] >= train_end) & (df["open_time"] < val_end)].copy()
+    test = df[df["open_time"] >= val_end].copy()
+    return train, validation, test
 
 
 def split_chronologically(
     symbol_klines: dict[str, pd.DataFrame], btc_klines: pd.DataFrame, rules: RulesConfig
 ) -> WalkForwardSplit:
+    """Cutoffs are computed once, from `btc_klines` (the reference series
+    spanning the whole intended backtest window), and applied by calendar
+    time to every symbol - never as a fraction of each symbol's own row
+    count. Symbols can have very different listing dates; splitting each
+    one by its own row count would point different symbols' "train"
+    segments at different calendar periods (a newer symbol's first 60% of
+    rows might be entirely within what an older symbol calls "test"),
+    breaking cross-symbol comparability and silently shrinking the
+    `common_index` intersection `BacktestEngine.run` builds across BTC and
+    every symbol. A symbol listed partway through history naturally ends
+    up with fewer (or zero) rows in an earlier segment - that's correct;
+    it must never get its own independent 60/20/20 split instead."""
     train_frac = rules.backtest.train_fraction
     val_frac = rules.backtest.validation_fraction
 
-    btc_train, btc_val, btc_test = _split_three(btc_klines, train_frac, val_frac)
+    btc_sorted = btc_klines.sort_values("open_time")
+    n = len(btc_sorted)
+    train_end = btc_sorted["open_time"].iloc[min(int(n * train_frac), n - 1)]
+    val_end = btc_sorted["open_time"].iloc[min(int(n * (train_frac + val_frac)), n - 1)]
+
+    btc_train, btc_val, btc_test = _split_three_by_time(btc_klines, train_end, val_end)
     train: dict[str, pd.DataFrame] = {}
     validation: dict[str, pd.DataFrame] = {}
     test: dict[str, pd.DataFrame] = {}
     for symbol, df in symbol_klines.items():
-        train[symbol], validation[symbol], test[symbol] = _split_three(df, train_frac, val_frac)
+        train[symbol], validation[symbol], test[symbol] = _split_three_by_time(df, train_end, val_end)
 
     return WalkForwardSplit(
         train=train, validation=validation, test=test,

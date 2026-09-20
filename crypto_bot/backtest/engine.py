@@ -34,6 +34,7 @@ from market.indicators import compute_all_indicators
 from market.market_data import IndicatorSnapshot
 from market.market_regime import MarketRegimeEngine, RegimeAssessment, RegimeLevel
 from risk.correlation import check_correlation_limit
+from risk.crash_detector import apply_crash_policy
 from strategy.dca import evaluate_dca, next_dca_level
 from strategy.filters import AntiFOMOFilter, check_blacklist
 from strategy.scoring import ScoreBreakdown
@@ -145,9 +146,9 @@ class _OpenPosition:
     target_price: Decimal
     trailing_active: bool = False
     trailing_peak: Decimal | None = None
-    partial_closed_qty: Decimal = Decimal("0")
     fees_paid_usdt: Decimal = Decimal("0")
     worst_price_seen: Decimal = Decimal("0")
+    realized_pnl_usdt: Decimal = Decimal("0")
 
 
 class _BacktestPortfolio:
@@ -170,23 +171,25 @@ class _BacktestPortfolio:
             value += pos.total_quantity * mark_prices.get(symbol, pos.avg_entry_price)
         return value
 
-    def can_open(
-        self, requested_usdt: Decimal, mark_prices: dict[str, Decimal], regime_level: RegimeLevel, day: str
-    ) -> tuple[bool, list[str]]:
+    def can_open(self, requested_usdt: Decimal, regime: RegimeAssessment, day: str) -> tuple[bool, list[str]]:
+        """Mirrors `risk.risk_manager.RiskManager.can_open_new_position`:
+        exposure is measured against free cash (`trading_balance_usdt` in
+        the live equivalent), not mark-to-market equity - dividing by
+        equity here would let a backtest deploy capital far more freely
+        than the live bot actually would at the same exposure limit."""
         reasons: list[str] = []
         if self.buy_paused:
             reasons.append("consecutive-losses pause active")
-        if regime_level == RegimeLevel.CRASH:
-            reasons.append("BTC regime is CRASH")
-        elif regime_level == RegimeLevel.STRONG_BEAR:
-            reasons.append("BTC regime is STRONG_BEAR")
+        crash_policy = apply_crash_policy(regime, self.settings)
+        if crash_policy.buys_paused:
+            reasons.append(crash_policy.reason or "market crash policy blocks new BUYs")
         if len(self.open_positions) >= self.settings.max_open_positions:
             reasons.append("MAX_OPEN_POSITIONS reached")
         if requested_usdt > self.settings.max_position_usdt:
             reasons.append("exceeds MAX_POSITION_USDT")
-        equity = self.equity(mark_prices)
         total_open_cost = sum((p.total_cost_usdt for p in self.open_positions.values()), Decimal("0"))
-        if equity > 0 and (total_open_cost + requested_usdt) / equity * 100 > self.settings.max_total_exposure_percent:
+        projected_pct = (total_open_cost + requested_usdt) / self.cash * 100 if self.cash > 0 else Decimal("100")
+        if projected_pct > self.settings.max_total_exposure_percent:
             reasons.append("exceeds MAX_TOTAL_EXPOSURE_PERCENT")
         deployed_today = self.daily_new_capital.get(day, Decimal("0"))
         if deployed_today + requested_usdt > self.settings.max_daily_new_capital_usdt:
@@ -195,9 +198,10 @@ class _BacktestPortfolio:
             reasons.append("insufficient simulated cash")
         return not reasons, reasons
 
-    def can_dca(self, regime_level: RegimeLevel) -> tuple[bool, list[str]]:
-        if regime_level == RegimeLevel.CRASH:
-            return False, ["BTC regime is CRASH - DCA paused"]
+    def can_dca(self, regime: RegimeAssessment) -> tuple[bool, list[str]]:
+        crash_policy = apply_crash_policy(regime, self.settings)
+        if crash_policy.dca_paused:
+            return False, [crash_policy.reason or "market crash policy blocks DCA"]
         return True, []
 
     def register_deployed(self, day: str, amount: Decimal) -> None:
@@ -304,7 +308,9 @@ class BacktestEngine:
                 row = symbol_merged[symbol].loc[ts]
                 if pd.isna(row.get("rsi_h1")):
                     continue
-                self._manage_position(portfolio, symbol, row, ts, mark_prices[symbol], regime, trades, no_trade_log)
+                self._manage_position(
+                    portfolio, symbol, row, ts, mark_prices[symbol], regime, symbol_merged, trades, no_trade_log
+                )
 
             if len(portfolio.open_positions) < self.settings.max_open_positions:
                 for symbol, df in symbol_merged.items():
@@ -373,18 +379,24 @@ class BacktestEngine:
             h4=_snapshot_from_row(row, "_h4", symbol, Timeframe.H4),
         )
 
-    def _try_open(
+    def _evaluate_breakdown(
         self,
-        portfolio: _BacktestPortfolio,
         symbol: str,
         row: pd.Series,
         ts: pd.Timestamp,
         regime: RegimeAssessment,
-        mark_prices: dict[str, Decimal],
-        day_str: str,
         symbol_merged: dict[str, pd.DataFrame],
-        no_trade_log: list[dict[str, Any]],
-    ) -> None:
+        *,
+        open_position_symbols: list[str] | None = None,
+    ) -> ScoreBreakdown:
+        """Runs the exact same veto pipeline as live's
+        `StrategyEngine.evaluate_candidate` (critical news, BTC regime
+        policy, AntiFOMO, blacklist, correlation) over historical data -
+        shared by `_try_open` (entry) and `_manage_position` (DCA
+        re-analysis), matching the two live call sites: `evaluate_candidate`
+        is called identically for both, with `open_position_symbols` only
+        ever passed for a fresh entry, never for DCA re-analysis on an
+        already-open position."""
         mtf = self._build_mtf(row, symbol)
         h1, h4 = mtf.h1, mtf.h4
 
@@ -405,20 +417,36 @@ class BacktestEngine:
         if not blacklist.passed:
             extra_vetoes.append(blacklist.reason or "blacklisted")
 
-        if portfolio.open_positions:
+        if open_position_symbols:
             candidate_closes = symbol_merged[symbol].loc[:ts, "close"]
-            closes_by_symbol = {s: symbol_merged[s].loc[:ts, "close"] for s in portfolio.open_positions}
+            closes_by_symbol = {s: symbol_merged[s].loc[:ts, "close"] for s in open_position_symbols}
             corr_check = check_correlation_limit(
-                symbol, candidate_closes, list(portfolio.open_positions.keys()), closes_by_symbol, self.rules.correlation
+                symbol, candidate_closes, open_position_symbols, closes_by_symbol, self.rules.correlation
             )
             if not corr_check.passed:
                 extra_vetoes.append(corr_check.reason or "correlation limit reached")
 
         regime_policy = self.rules.regime_policy.get(regime.level.value)
-        breakdown = self.signal_engine.evaluate(
+        return self.signal_engine.evaluate(
             symbol, mtf, news_adjustment=news_adj,
             regime_adjustment=regime_policy.min_score_delta if regime_policy else 0.0,
             extra_vetoes=extra_vetoes,
+        )
+
+    def _try_open(
+        self,
+        portfolio: _BacktestPortfolio,
+        symbol: str,
+        row: pd.Series,
+        ts: pd.Timestamp,
+        regime: RegimeAssessment,
+        mark_prices: dict[str, Decimal],
+        day_str: str,
+        symbol_merged: dict[str, pd.DataFrame],
+        no_trade_log: list[dict[str, Any]],
+    ) -> None:
+        breakdown = self._evaluate_breakdown(
+            symbol, row, ts, regime, symbol_merged, open_position_symbols=list(portfolio.open_positions.keys())
         )
         required_score = self._required_min_score(regime.level)
 
@@ -426,7 +454,7 @@ class BacktestEngine:
             no_trade_log.append(self._log_entry(ts, symbol, "NO_TRADE", breakdown, required_score))
             return
 
-        can_open, risk_reasons = portfolio.can_open(self.settings.initial_order_usdt, mark_prices, regime.level, day_str)
+        can_open, risk_reasons = portfolio.can_open(self.settings.initial_order_usdt, regime, day_str)
         if not can_open:
             no_trade_log.append(self._log_entry(ts, symbol, "BLOCKED", breakdown, required_score, risk_reasons))
             return
@@ -453,6 +481,7 @@ class BacktestEngine:
         ts: pd.Timestamp,
         current_price: Decimal,
         regime: RegimeAssessment,
+        symbol_merged: dict[str, pd.DataFrame],
         trades: list[TradeRecord],
         no_trade_log: list[dict[str, Any]],
     ) -> None:
@@ -463,22 +492,20 @@ class BacktestEngine:
             new_peak = max(pos.trailing_peak or current_price, current_price)
             pos.trailing_peak = new_peak
             if should_exit_trailing(current_price, new_peak, self.settings):
-                remaining = pos.total_quantity - pos.partial_closed_qty
-                self._close(portfolio, symbol, remaining, current_price, ts, "TRAILING_STOP", trades)
+                self._apply_sell(portfolio, pos, symbol, pos.total_quantity, current_price, ts, "TRAILING_STOP", trades)
             return
 
         if current_price >= pos.target_price:
             if self.settings.use_trailing_after_tp:
                 partial_qty = pos.total_quantity * self.settings.trailing_partial_close_fraction
-                fill_price, proceeds, commission = _simulate_sell(current_price, partial_qty, self.settings)
-                pos.partial_closed_qty += partial_qty
-                pos.fees_paid_usdt += commission
-                portfolio.cash += proceeds
-                portfolio.total_fees += commission
-                pos.trailing_active = True
-                pos.trailing_peak = current_price
+                fully_closed = self._apply_sell(
+                    portfolio, pos, symbol, partial_qty, current_price, ts, "TAKE_PROFIT_PARTIAL", trades
+                )
+                if not fully_closed:
+                    pos.trailing_active = True
+                    pos.trailing_peak = current_price
             else:
-                self._close(portfolio, symbol, pos.total_quantity, current_price, ts, "TAKE_PROFIT", trades)
+                self._apply_sell(portfolio, pos, symbol, pos.total_quantity, current_price, ts, "TAKE_PROFIT", trades)
             return
 
         level = next_dca_level(
@@ -488,13 +515,15 @@ class BacktestEngine:
         if level is None:
             return
 
-        mtf = self._build_mtf(row, symbol)
-        breakdown = self.signal_engine.evaluate(symbol, mtf)
-        dca_risk_ok, dca_risk_reasons = portfolio.can_dca(regime.level)
+        breakdown = self._evaluate_breakdown(symbol, row, ts, regime, symbol_merged)
+        dca_risk_ok, dca_risk_reasons = portfolio.can_dca(regime)
+        crash_policy = apply_crash_policy(regime, self.settings)
         dca_decision = evaluate_dca(
             current_price=current_price, avg_entry_price=pos.avg_entry_price, dca_count_done=pos.dca_count,
             current_position_cost_usdt=pos.total_cost_usdt, settings=self.settings, score_breakdown=breakdown,
-            market_crash=(regime.level == RegimeLevel.CRASH), news_blocks_trading=False, liquidity_ok=True,
+            market_crash=crash_policy.dca_paused,
+            news_blocks_trading=any("news" in v.lower() for v in breakdown.vetoes),
+            liquidity_ok=True,
         )
         if not (dca_risk_ok and dca_decision.allowed):
             no_trade_log.append(
@@ -518,36 +547,61 @@ class BacktestEngine:
         portfolio.total_fees += commission
         portfolio.register_deployed(ts.date().isoformat(), level.size_usdt)
 
-    def _close(
+    def _apply_sell(
         self,
         portfolio: _BacktestPortfolio,
+        pos: _OpenPosition,
         symbol: str,
-        quantity: Decimal,
+        sold_qty: Decimal,
         current_price: Decimal,
         ts: pd.Timestamp,
         reason: str,
         trades: list[TradeRecord],
-    ) -> None:
-        pos = portfolio.open_positions.pop(symbol)
-        fill_price, proceeds, commission = _simulate_sell(current_price, quantity, self.settings)
+    ) -> bool:
+        """Reduces or fully closes a position, mirroring
+        `database.repository.PositionRepository.apply_sell_fill`: every
+        sell (a deliberate partial take-profit slice, a trailing-stop
+        exit, or a full close) goes through here so `total_quantity`/
+        `total_cost_usdt`/`fees_paid_usdt` shrink correctly and each
+        slice's own realized PnL (net of its proportional share of
+        buy-side commission) is recorded as its own `TradeRecord` -
+        without this, a partial close leaves the sold coins double-counted
+        in both `portfolio.cash` and the position's still-unreduced
+        mark-to-market value. Returns whether the position is now fully
+        closed."""
+        fill_price, proceeds, commission = _simulate_sell(current_price, sold_qty, self.settings)
+        cost_basis = pos.avg_entry_price * sold_qty
+        fee_fraction = (sold_qty / pos.total_quantity) if pos.total_quantity > 0 else Decimal("0")
+        fee_share = pos.fees_paid_usdt * fee_fraction
+        net_pnl = proceeds - cost_basis - fee_share
+        net_pnl_pct = (net_pnl / cost_basis * 100) if cost_basis > 0 else Decimal("0")
+        worst_dd = float((pos.worst_price_seen - pos.avg_entry_price) / pos.avg_entry_price * 100) if pos.avg_entry_price > 0 else 0.0
+
+        pos.total_quantity -= sold_qty
+        pos.total_cost_usdt -= cost_basis
+        pos.fees_paid_usdt -= fee_share
+        pos.realized_pnl_usdt += net_pnl
         portfolio.cash += proceeds
         portfolio.total_fees += commission
-
-        cost_basis = pos.avg_entry_price * quantity
-        net_pnl = proceeds - cost_basis
-        net_pnl_pct = (proceeds / cost_basis - 1) * 100 if cost_basis > 0 else Decimal("0")
-        worst_dd = float((pos.worst_price_seen - pos.avg_entry_price) / pos.avg_entry_price * 100) if pos.avg_entry_price > 0 else 0.0
 
         trades.append(
             TradeRecord(
                 symbol=symbol, opened_at=pos.opened_at, closed_at=ts.to_pydatetime(),
-                avg_entry_price=pos.avg_entry_price, exit_price=fill_price, quantity=quantity,
-                cost_usdt=pos.total_cost_usdt, proceeds_usdt=proceeds, net_pnl_usdt=net_pnl,
+                avg_entry_price=pos.avg_entry_price, exit_price=fill_price, quantity=sold_qty,
+                cost_usdt=cost_basis, proceeds_usdt=proceeds, net_pnl_usdt=net_pnl,
                 net_pnl_percent=net_pnl_pct, dca_count=pos.dca_count, close_reason=reason,
                 worst_drawdown_percent=min(0.0, worst_dd),
             )
         )
-        portfolio.register_trade_result(is_win=net_pnl > 0)
+
+        # See `database.repository.PositionRepository.apply_sell_fill` for
+        # why this is relative to the slice just sold, not a fixed epsilon.
+        dust = max(Decimal("0.00000001"), sold_qty * Decimal("0.001"))
+        fully_closed = pos.total_quantity <= dust
+        if fully_closed:
+            portfolio.open_positions.pop(symbol)
+            portfolio.register_trade_result(is_win=pos.realized_pnl_usdt > 0)
+        return fully_closed
 
     @staticmethod
     def _log_entry(

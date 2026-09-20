@@ -246,27 +246,42 @@ def vwap_recovery_signal(close: pd.Series, vwap: pd.Series, *, lookback: int = 5
 
 
 def swing_lows(close: pd.Series, *, order: int = 3) -> pd.Series:
-    """True at bar i if close[i] is the (first) minimum within +/- order bars.
-    Confirms `order` bars late by construction - see module docstring."""
+    """True at bar i once a swing low is CONFIRMED as of bar i. The actual
+    local-minimum bar is i - order, but that can only be known once `order`
+    bars have passed without price falling further, so the flag is shifted
+    forward that far - a naive centered-window flag marked at the
+    extremum's own bar would be correct only if this were always
+    recomputed incrementally as new bars close (live/paper, where future
+    bars simply don't exist yet); computed once, vectorized, over a full
+    historical DataFrame (backtest), it would instead leak `order` bars of
+    future price action into the bar where the extremum actually sits.
+    Shifting keeps the two identical, per the module docstring's causality
+    guarantee. Callers that need the extremum's own index/price (not just
+    when it became visible) should use `i - order`, not `i`."""
     values = close.to_numpy()
     n = len(values)
-    result = np.zeros(n, dtype=bool)
+    raw = np.zeros(n, dtype=bool)
     for i in range(order, n - order):
         window = values[i - order : i + order + 1]
         if values[i] == window.min() and int(np.argmin(window)) == order:
-            result[i] = True
-    return pd.Series(result, index=close.index)
+            raw[i] = True
+    confirmed = np.zeros(n, dtype=bool)
+    confirmed[order:] = raw[: n - order]
+    return pd.Series(confirmed, index=close.index)
 
 
 def swing_highs(close: pd.Series, *, order: int = 3) -> pd.Series:
+    """See `swing_lows` - identical confirm-late-and-shift rationale."""
     values = close.to_numpy()
     n = len(values)
-    result = np.zeros(n, dtype=bool)
+    raw = np.zeros(n, dtype=bool)
     for i in range(order, n - order):
         window = values[i - order : i + order + 1]
         if values[i] == window.max() and int(np.argmax(window)) == order:
-            result[i] = True
-    return pd.Series(result, index=close.index)
+            raw[i] = True
+    confirmed = np.zeros(n, dtype=bool)
+    confirmed[order:] = raw[: n - order]
+    return pd.Series(confirmed, index=close.index)
 
 
 def bullish_divergence(close: pd.Series, rsi_series: pd.Series, *, lookback: int = 20, order: int = 3) -> pd.Series:
@@ -279,7 +294,7 @@ def bullish_divergence(close: pd.Series, rsi_series: pd.Series, *, lookback: int
     positions: list[int] = []
     for i in range(n):
         if is_swing_low[i]:
-            positions.append(i)
+            positions.append(i - order)  # the extremum's own bar, not the (later) confirmation bar
         while positions and positions[0] < i - lookback:
             positions.pop(0)
         if len(positions) >= 2:
@@ -299,7 +314,7 @@ def higher_low_structure(close: pd.Series, *, order: int = 3) -> pd.Series:
     positions: list[int] = []
     for i in range(n):
         if is_low[i]:
-            positions.append(i)
+            positions.append(i - order)  # the extremum's own bar, not the (later) confirmation bar
         if len(positions) >= 2 and vals[positions[-1]] > vals[positions[-2]]:
             result[i] = True
     return pd.Series(result, index=close.index)
@@ -313,7 +328,7 @@ def higher_high_structure(close: pd.Series, *, order: int = 3) -> pd.Series:
     positions: list[int] = []
     for i in range(n):
         if is_high[i]:
-            positions.append(i)
+            positions.append(i - order)  # the extremum's own bar, not the (later) confirmation bar
         if len(positions) >= 2 and vals[positions[-1]] > vals[positions[-2]]:
             result[i] = True
     return pd.Series(result, index=close.index)
@@ -331,7 +346,7 @@ def nearest_support(close: pd.Series, *, order: int = 3, lookback: int = 60) -> 
     last_low_val = np.nan
     for i in range(n):
         if is_low[i]:
-            last_low_pos, last_low_val = i, vals[i]
+            last_low_pos, last_low_val = i - order, vals[i - order]  # the extremum's own bar, not the confirmation bar
         if last_low_pos is not None and (i - last_low_pos) <= lookback:
             result[i] = last_low_val
     return pd.Series(result, index=close.index)

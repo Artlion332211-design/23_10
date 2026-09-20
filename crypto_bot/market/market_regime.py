@@ -64,6 +64,14 @@ class RegimeAssessment:
 
 
 def _trend_points(snapshot: IndicatorSnapshot) -> tuple[float, list[str]]:
+    """`IndicatorSnapshot.from_getter` defaults `ema_fast`/`ema_mid`/
+    `ema_slow` to the bar's own `close` (and `macd_hist` to `0.0`) when the
+    underlying EMA/MACD is still NaN during warmup (not enough history yet
+    on that timeframe - EMA-200 on H4 needs ~33 days). A plain `else` below
+    would silently fold that "no real signal yet" tie into the *bearish*
+    branch (`close > close` and `macd_hist > 0` are both `False`), skewing
+    every warmup period bearish instead of neutral; `elif <reversed>`
+    contributes 0 points on a tie instead."""
     points = 0.0
     reasons: list[str] = []
     tf = snapshot.timeframe.value
@@ -71,18 +79,18 @@ def _trend_points(snapshot: IndicatorSnapshot) -> tuple[float, list[str]]:
     if snapshot.close > snapshot.ema_slow:
         points += 15
         reasons.append(f"{tf}: price above EMA200")
-    else:
+    elif snapshot.close < snapshot.ema_slow:
         points -= 15
         reasons.append(f"{tf}: price below EMA200")
 
     if snapshot.ema_fast > snapshot.ema_mid:
         points += 10
-    else:
+    elif snapshot.ema_fast < snapshot.ema_mid:
         points -= 10
 
     if snapshot.macd_hist > 0:
         points += 8
-    else:
+    elif snapshot.macd_hist < 0:
         points -= 8
 
     if snapshot.rsi >= 55:
