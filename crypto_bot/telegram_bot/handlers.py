@@ -203,10 +203,15 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # not just the buy-pause flag, or the kill switch can never be undone
     # from Telegram (can_open_new_position()/can_dca() check emergency_stop
     # independently of buy_paused, and nothing else in the app ever calls
-    # RiskManager.clear_emergency_stop()).
+    # RiskManager.clear_emergency_stop()). emergency_stop() also pauses DCA
+    # (dca_paused=True) alongside buy_paused - resume must undo that too, or
+    # DCA on already-open positions stays silently disabled forever after
+    # the first /emergency_stop, with no separate command telling the
+    # operator that /start_dca is still needed.
     risk_manager.resume_buys()
+    risk_manager.start_dca()
     risk_manager.clear_emergency_stop()
-    await _reply(update, "Нові купівлі відновлено. Аварійну зупинку (якщо була активна) знято.")
+    await _reply(update, "Нові купівлі та DCA відновлено. Аварійну зупинку (якщо була активна) знято.")
 
 
 @_restricted
