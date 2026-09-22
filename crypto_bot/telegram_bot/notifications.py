@@ -24,6 +24,7 @@ from strategy.strategy_engine import (
     BuyExecutedEvent,
     DCAExecutedEvent,
     DelayedFillEvent,
+    DrawdownWarningEvent,
     PositionClosedEvent,
     TradeDecision,
 )
@@ -179,6 +180,15 @@ def format_delayed_fill(event: DelayedFillEvent) -> str:
         f"Кількість: {event.quantity:.6f}\n"
         f"Сума: ${event.usdt_amount:.2f}\n"
         "Ордер стояв у книзі (LIMIT) і щойно виконався."
+    )
+
+
+def format_drawdown_warning(event: DrawdownWarningEvent) -> str:
+    return (
+        f"ПОПЕРЕДЖЕННЯ: ПРОСІДАННЯ ПОЗИЦІЇ НА {event.threshold_percent:.0f}%+\n"
+        f"Пара: {event.symbol}\n"
+        f"Вхід: ${event.avg_entry_price:.4f}  Поточна: ${event.current_price:.4f}\n"
+        f"Фактичне падіння від входу: -{event.drawdown_percent:.2f}%"
     )
 
 
@@ -345,6 +355,9 @@ class TelegramNotifier:
 
     async def on_delayed_fill(self, event: DelayedFillEvent) -> None:
         await self._send(format_delayed_fill(event))
+
+    async def on_drawdown_warning(self, event: DrawdownWarningEvent) -> None:
+        await self._send(format_drawdown_warning(event))
 
     async def on_error(self, message: str) -> None:
         await self._send(format_error(message))

@@ -95,6 +95,23 @@ class Settings(BaseSettings):
     early_profit_arm_percent: Decimal = Decimal("9.5")
     early_profit_trailing_distance_percent: Decimal = Decimal("1.0")
 
+    # Hard profit-ceiling backstop: an absolute, always-on safety net,
+    # independent of EARLY_PROFIT_PROTECTION_ENABLED/USE_TRAILING_AFTER_TP -
+    # if net profit ever reaches this level, manage_position force-closes
+    # the full position immediately regardless of trailing state or a
+    # still-resting order, since normal exit logic should already have
+    # closed well before this point. Set comfortably above
+    # TARGET_PROFIT_PERCENT (and EARLY_PROFIT_ARM_PERCENT, when enabled) so
+    # it only ever fires as a last resort.
+    hard_profit_ceiling_percent: Decimal = Decimal("12")
+
+    # --- Drawdown warnings -------------------------------------------------
+    # One-shot Telegram alert (never re-sent for the same position) the
+    # first time an already-open position's price drops this far below its
+    # average entry - pure risk visibility, does not affect DCA/exit logic.
+    drawdown_warning_percent_1: Decimal = Decimal("20")
+    drawdown_warning_percent_2: Decimal = Decimal("30")
+
     # --- DCA (controlled averaging - NOT martingale) ----------------------
     max_dca_count: int = 3
     dca_level_1: Decimal = Decimal("-3")
@@ -188,6 +205,29 @@ class Settings(BaseSettings):
             # Not an error: this is the safe "shadow live" combination. Left
             # here as documentation of intent, no exception raised.
             pass
+        if self.early_profit_protection_enabled and self.early_profit_arm_percent >= self.target_profit_percent:
+            raise ValueError(
+                f"EARLY_PROFIT_ARM_PERCENT ({self.early_profit_arm_percent}) must be below "
+                f"TARGET_PROFIT_PERCENT ({self.target_profit_percent}) - manage_position checks the "
+                "early-arm condition before the target-price condition, so an arm percent at or above "
+                "target would make the plain take-profit exit unreachable."
+            )
+        if self.hard_profit_ceiling_percent <= self.target_profit_percent:
+            raise ValueError(
+                f"HARD_PROFIT_CEILING_PERCENT ({self.hard_profit_ceiling_percent}) must be above "
+                f"TARGET_PROFIT_PERCENT ({self.target_profit_percent}) - it is a backstop for a position "
+                "that should already have closed by then, not a replacement exit."
+            )
+        if self.early_profit_protection_enabled and self.hard_profit_ceiling_percent <= self.early_profit_arm_percent:
+            raise ValueError(
+                f"HARD_PROFIT_CEILING_PERCENT ({self.hard_profit_ceiling_percent}) must be above "
+                f"EARLY_PROFIT_ARM_PERCENT ({self.early_profit_arm_percent})"
+            )
+        if self.drawdown_warning_percent_2 <= self.drawdown_warning_percent_1:
+            raise ValueError(
+                f"DRAWDOWN_WARNING_PERCENT_2 ({self.drawdown_warning_percent_2}) must be above "
+                f"DRAWDOWN_WARNING_PERCENT_1 ({self.drawdown_warning_percent_1})"
+            )
         return self
 
     def validate_for_live(self) -> None:

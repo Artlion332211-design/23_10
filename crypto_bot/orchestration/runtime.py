@@ -317,7 +317,8 @@ class BotRuntime:
                 order_books[symbol] = await self._get_order_book(symbol)
             except Exception as exc:  # noqa: BLE001 - a missing book is handled per-symbol below
                 logger.exception("Failed to fetch order book for emergency liquidation of %s: %r", symbol, exc)
-        return await self._strategy_engine.emergency_liquidate_all(order_books=order_books)
+        regime = self._btc_regime or _default_neutral_regime()
+        return await self._strategy_engine.emergency_liquidate_all(order_books=order_books, btc_regime=regime)
 
     # ------------------------------------------------------------------
     # News

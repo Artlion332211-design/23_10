@@ -108,3 +108,20 @@ def should_arm_early_protection(
         taker_fee_rate=settings.taker_fee_rate, expected_slippage_percent=settings.expected_slippage_percent,
     )
     return net_pct >= settings.early_profit_arm_percent
+
+
+def should_force_close_ceiling(*, avg_entry_price: Decimal, current_price: Decimal, settings: Settings) -> bool:
+    """Absolute, always-on safety-net backstop - unlike every other check in
+    this module, deliberately NOT gated by any enabled flag. If net profit
+    ever reaches `HARD_PROFIT_CEILING_PERCENT`, the position must be force-
+    closed regardless of trailing state, a still-resting order, or any bug
+    that might otherwise have let it ride past the point the normal exit
+    logic should already have closed it. `HARD_PROFIT_CEILING_PERCENT` is
+    validated (see `config.settings.Settings`) to always sit above both
+    `TARGET_PROFIT_PERCENT` and `EARLY_PROFIT_ARM_PERCENT`, so this should
+    only ever fire as a last resort, never as the position's normal exit."""
+    net_pct = net_profit_percent(
+        avg_entry_price, current_price,
+        taker_fee_rate=settings.taker_fee_rate, expected_slippage_percent=settings.expected_slippage_percent,
+    )
+    return net_pct >= settings.hard_profit_ceiling_percent

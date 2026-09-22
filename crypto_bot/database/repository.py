@@ -146,6 +146,18 @@ class PositionRepository:
         self.session.flush()
         return position
 
+    def mark_drawdown_alert_sent(self, position: Position, *, level: int) -> Position:
+        """One-shot dedup for DRAWDOWN_WARNING_PERCENT_1/2: never re-sent for
+        the same position once its flag is set, even across a restart."""
+        if level == 20:
+            position.drawdown_alert_20_sent = True
+        elif level == 30:
+            position.drawdown_alert_30_sent = True
+        else:
+            raise ValueError(f"unsupported drawdown alert level: {level}")
+        self.session.flush()
+        return position
+
     def apply_sell_fill(
         self,
         position: Position,

@@ -125,6 +125,7 @@ class OrderPurpose(str, enum.Enum):
     TAKE_PROFIT = "TAKE_PROFIT"
     TRAILING_STOP = "TRAILING_STOP"
     EMERGENCY_SELL = "EMERGENCY_SELL"
+    HARD_CEILING = "HARD_CEILING"  # HARD_PROFIT_CEILING_PERCENT backstop force-close
 
 
 class SignalDecision(str, enum.Enum):
@@ -164,6 +165,12 @@ class Position(Base):
     # target - distinguishes which TRAILING_DISTANCE_PERCENT setting
     # applies to this position's exit check.
     trailing_is_early: Mapped[bool] = mapped_column(default=False)
+    # One-shot dedup flags for the DRAWDOWN_WARNING_PERCENT_1/2 Telegram
+    # alert - persisted (not just in-memory) so a restart doesn't re-send an
+    # alert that already went out, per the crash-recovery requirement that
+    # position state survive a restart.
+    drawdown_alert_20_sent: Mapped[bool] = mapped_column(default=False)
+    drawdown_alert_30_sent: Mapped[bool] = mapped_column(default=False)
     # Cumulative cost-basis of every slice ever sold from this position
     # (each partial take-profit slice, plus the final close) - never
     # decreases, unlike total_cost_usdt which tracks remaining *unsold*

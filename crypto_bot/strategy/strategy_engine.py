@@ -34,6 +34,7 @@ from config.settings import RulesConfig, Settings
 from database.models import (
     Order,
     OrderPurpose,
+    OrderStatus,
     PositionStatus,
     SignalDecision,
 )
@@ -54,6 +55,7 @@ from strategy.take_profit import (
     compute_target_price,
     should_arm_early_protection,
     should_exit_trailing,
+    should_force_close_ceiling,
 )
 from utils.time import Timeframe, utcnow
 
@@ -122,6 +124,22 @@ class PositionClosedEvent:
 
 
 @dataclass(frozen=True)
+class DrawdownWarningEvent:
+    """One-shot (per position, per threshold) risk alert - see
+    `Position.drawdown_alert_20_sent`/`_30_sent` and
+    `Settings.drawdown_warning_percent_1`/`_2`. Purely informational: never
+    changes DCA/exit decisions, only tells the operator a held position has
+    dropped significantly below its entry price."""
+
+    symbol: str
+    avg_entry_price: Decimal
+    current_price: Decimal
+    drawdown_percent: Decimal  # positive number, e.g. 24.7 for a -24.7% move
+    threshold_percent: Decimal  # the configured threshold that was crossed (20 or 30)
+    position_id: int
+
+
+@dataclass(frozen=True)
 class DelayedFillEvent:
     """A LIMIT order that was still resting when its submitting call
     returned, and has now resolved (filled, in full or in part) via
@@ -147,6 +165,7 @@ class StrategyNotifier(Protocol):
     async def on_dca_executed(self, event: DCAExecutedEvent) -> None: ...
     async def on_position_closed(self, event: PositionClosedEvent) -> None: ...
     async def on_delayed_fill(self, event: DelayedFillEvent) -> None: ...
+    async def on_drawdown_warning(self, event: DrawdownWarningEvent) -> None: ...
     async def on_error(self, message: str) -> None: ...
 
 
@@ -160,6 +179,7 @@ class NullNotifier:
     async def on_dca_executed(self, event: DCAExecutedEvent) -> None: ...
     async def on_position_closed(self, event: PositionClosedEvent) -> None: ...
     async def on_delayed_fill(self, event: DelayedFillEvent) -> None: ...
+    async def on_drawdown_warning(self, event: DrawdownWarningEvent) -> None: ...
     async def on_error(self, message: str) -> None:
         logger.error(message)
 
@@ -170,6 +190,7 @@ _EXIT_CLOSE_REASON = {
     OrderPurpose.TAKE_PROFIT: "TAKE_PROFIT",
     OrderPurpose.TRAILING_STOP: "TRAILING_STOP",
     OrderPurpose.EMERGENCY_SELL: "EMERGENCY_SELL",
+    OrderPurpose.HARD_CEILING: "HARD_PROFIT_CEILING",
 }
 
 
@@ -430,6 +451,8 @@ class StrategyEngine:
             trailing_active = position.trailing_active
             trailing_peak = position.trailing_peak_price
             trailing_is_early = position.trailing_is_early
+            drawdown_20_sent = position.drawdown_alert_20_sent
+            drawdown_30_sent = position.drawdown_alert_30_sent
             # A LIMIT order can rest for up to LIMIT_ORDER_TIMEOUT_SECONDS
             # (90s by default), longer than this loop's own polling
             # interval (60s by default) - without this guard, the same
@@ -439,6 +462,22 @@ class StrategyEngine:
             # process_resolved_orders() is what finishes the resting one;
             # this method just waits for it.
             has_resting_order = OrderRepository(session).has_resting_order(symbol=symbol, position_id=position_id)
+
+        # Pure notification, no effect on what follows - always evaluated,
+        # regardless of resting orders/trailing/ceiling state below.
+        await self._check_drawdown_warnings(
+            position_id, symbol=symbol, avg_entry=avg_entry, current_price=current_price,
+            already_sent_20=drawdown_20_sent, already_sent_30=drawdown_30_sent,
+        )
+
+        if should_force_close_ceiling(avg_entry_price=avg_entry, current_price=current_price, settings=self._settings):
+            # HARD_PROFIT_CEILING_PERCENT backstop - deliberately checked
+            # before has_resting_order below: this must override a stuck
+            # resting order too, since the whole point is to catch cases
+            # where the normal exit logic should already have closed the
+            # position but, for whatever reason, has not.
+            await self._force_close_ceiling(position_id, symbol=symbol, current_price=current_price, btc_regime=btc_regime)
+            return
 
         if has_resting_order:
             return
@@ -542,6 +581,44 @@ class StrategyEngine:
 
         await self._apply_dca_fill(position_id, level_index=level.level_index, result=result)
 
+    async def _check_drawdown_warnings(
+        self,
+        position_id: int,
+        *,
+        symbol: str,
+        avg_entry: Decimal,
+        current_price: Decimal,
+        already_sent_20: bool,
+        already_sent_30: bool,
+    ) -> None:
+        """One-shot (per position, per threshold) risk alert when price has
+        dropped DRAWDOWN_WARNING_PERCENT_1/2 below avg_entry - never
+        re-sent once its flag is set (see `Position.drawdown_alert_20_sent`/
+        `_30_sent`), including across a restart. Deliberately uses the raw
+        price ratio, not the fee/slippage-adjusted net-profit basis the
+        take-profit side uses: this is a market-risk warning, not an exit
+        price calculation."""
+        if avg_entry <= 0:
+            return
+        drawdown_percent = (avg_entry - current_price) / avg_entry * 100
+        for threshold, already_sent, level in (
+            (self._settings.drawdown_warning_percent_2, already_sent_30, 30),
+            (self._settings.drawdown_warning_percent_1, already_sent_20, 20),
+        ):
+            if drawdown_percent < threshold or already_sent:
+                continue
+            with session_scope() as session:
+                p = PositionRepository(session).get(position_id)
+                if p is None or p.status != PositionStatus.OPEN:
+                    return
+                PositionRepository(session).mark_drawdown_alert_sent(p, level=level)
+            await self._notifier.on_drawdown_warning(
+                DrawdownWarningEvent(
+                    symbol=symbol, avg_entry_price=avg_entry, current_price=current_price,
+                    drawdown_percent=drawdown_percent, threshold_percent=threshold, position_id=position_id,
+                )
+            )
+
     async def _apply_dca_fill(self, position_id: int, *, level_index: int, result: ExecutionResult) -> None:
         """Folds a filled DCA buy into its position - shared by the
         immediate-fill path (`manage_position`) and the delayed-fill path
@@ -608,7 +685,60 @@ class StrategyEngine:
             )
         return slice_pnl, fully_closed
 
-    async def emergency_liquidate_all(self, *, order_books: dict[str, OrderBookSnapshot]) -> list[str]:
+    async def _cancel_resting_orders_for_position(
+        self, position_id: int, symbol: str, *, btc_regime: RegimeAssessment
+    ) -> None:
+        """Cancels any order still resting for this position (a DCA or exit
+        LIMIT order that hasn't resolved yet) and applies whatever fill it
+        had already picked up before being cancelled, via the same dispatch
+        `process_resolved_orders` uses. Without this, a force-close
+        (emergency liquidation or the hard profit-ceiling backstop) would
+        either read a stale `total_quantity` (understating what's actually
+        held) or have its own force-sell rejected/oversized against
+        Binance's real balance, since the resting order's fill was never
+        folded in. Only ever sees DCA_*/TAKE_PROFIT/TRAILING_STOP/
+        EMERGENCY_SELL/HARD_CEILING orders here - an ENTRY order has no
+        `position_id` until it fills (see `OrderRepository.set_position`),
+        so it can never show up in `for_position`.
+        """
+        with session_scope() as session:
+            resting = [
+                o for o in OrderRepository(session).for_position(position_id)
+                if o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
+            ]
+        for order in resting:
+            result = await self._execution_engine.cancel(symbol, client_order_id=order.client_order_id)
+            await self.apply_resolved_order(order, result, btc_regime=btc_regime)
+
+    async def _force_close_ceiling(
+        self, position_id: int, *, symbol: str, current_price: Decimal, btc_regime: RegimeAssessment
+    ) -> None:
+        """HARD_PROFIT_CEILING_PERCENT backstop: cancel anything resting for
+        this position (folding in whatever it already filled), then force a
+        full MARKET close on whatever quantity remains - regardless of
+        trailing state. See `manage_position`'s call site for why this must
+        run before the resting-order early return."""
+        await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+        with session_scope() as session:
+            position = PositionRepository(session).get(position_id)
+            if position is None or position.status != PositionStatus.OPEN:
+                return  # a cancelled order's own fill already closed it
+            quantity = position.total_quantity
+        if quantity <= 0:
+            return
+        result = await self._execution_engine.sell(
+            symbol=symbol, quantity=quantity, reference_price=current_price,
+            spread_percent=Decimal("0"),  # force MARKET: a hard safety-net close must not wait in a resting LIMIT order
+            purpose=OrderPurpose.HARD_CEILING, position_id=position_id,
+        )
+        if not result.accepted:
+            await self._notifier.on_error(f"Hard profit-ceiling SELL for {symbol} failed: {result.error_message}")
+            return
+        await self._apply_sell_result(position_id, result=result, reason="HARD_PROFIT_CEILING")
+
+    async def emergency_liquidate_all(
+        self, *, order_books: dict[str, OrderBookSnapshot], btc_regime: RegimeAssessment
+    ) -> list[str]:
         """Market-sells every open position immediately, regardless of
         current price/target - the explicit, separately-configured action
         `EMERGENCY_AUTO_SELL=true` promises (RiskManager.trigger_emergency_stop
@@ -616,14 +746,25 @@ class StrategyEngine:
         failed to liquidate so the caller can alert on them specifically.
         """
         with session_scope() as session:
-            open_positions = [(p.id, p.symbol, p.total_quantity) for p in PositionRepository(session).get_open_positions()]
+            open_positions = [(p.id, p.symbol) for p in PositionRepository(session).get_open_positions()]
 
         failed: list[str] = []
-        for position_id, symbol, quantity in open_positions:
+        for position_id, symbol in open_positions:
             order_book = order_books.get(symbol)
             if order_book is None or order_book.is_empty:
                 failed.append(symbol)
                 await self._notifier.on_error(f"Emergency liquidation for {symbol} skipped: no order book available")
+                continue
+            # Cancel (and fold in the fill of) anything still resting first,
+            # so the quantity read below is accurate and the force-sell
+            # can't be rejected/oversized against what Binance actually holds.
+            await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+            with session_scope() as session:
+                position = PositionRepository(session).get(position_id)
+                if position is None or position.status != PositionStatus.OPEN:
+                    continue  # a cancelled order's own fill already closed it
+                quantity = position.total_quantity
+            if quantity <= 0:
                 continue
             result = await self._execution_engine.sell(
                 symbol=symbol, quantity=quantity, reference_price=order_book.mid_price,
@@ -652,21 +793,35 @@ class StrategyEngine:
         its own.
         """
         resolved = await self._execution_engine.check_pending_limit_orders()
-        for symbol, client_order_id, result in resolved:
+        for _symbol, client_order_id, result in resolved:
             with session_scope() as session:
                 order = OrderRepository(session).get_by_client_id(client_order_id)
             if order is None:
                 continue
-            try:
-                if order.purpose == OrderPurpose.ENTRY:
-                    await self._resolve_entry_order(order, result, btc_regime)
-                elif order.purpose in _DCA_LEVEL_BY_PURPOSE:
-                    await self._resolve_dca_order(order, result)
-                elif order.purpose in _EXIT_CLOSE_REASON:
-                    await self._resolve_exit_order(order, result)
-            except Exception as exc:  # noqa: BLE001 - one bad resolution must not block the rest
-                logger.exception("Failed to resolve order %s (%s) for %s: %r", client_order_id, order.purpose, symbol, exc)
-                await self._notifier.on_error(f"Failed to finalize resolved order for {symbol}: {exc!r}")
+            await self.apply_resolved_order(order, result, btc_regime=btc_regime)
+
+    async def apply_resolved_order(self, order: Order, result: ExecutionResult, *, btc_regime: RegimeAssessment) -> None:
+        """Turns one resolved order (from the polling loop above, from
+        `_cancel_resting_orders_for_position`, or from startup reconciliation
+        - see `orchestration.reconciliation.reconcile_live`) into the
+        matching Position update, dispatching by `order.purpose` exactly
+        like the immediate-fill call sites do."""
+        if result.fill_data_incomplete:
+            await self._notifier.on_error(
+                f"{order.symbol} order {order.client_order_id} ({order.purpose.value}) resolved as "
+                f"{result.status.value} but the real fill breakdown could not be confirmed - the position's "
+                "tracked quantity may be understated. Check Binance manually."
+            )
+        try:
+            if order.purpose == OrderPurpose.ENTRY:
+                await self._resolve_entry_order(order, result, btc_regime)
+            elif order.purpose in _DCA_LEVEL_BY_PURPOSE:
+                await self._resolve_dca_order(order, result)
+            elif order.purpose in _EXIT_CLOSE_REASON:
+                await self._resolve_exit_order(order, result)
+        except Exception as exc:  # noqa: BLE001 - one bad resolution must not block the rest
+            logger.exception("Failed to resolve order %s (%s) for %s: %r", order.client_order_id, order.purpose, order.symbol, exc)
+            await self._notifier.on_error(f"Failed to finalize resolved order for {order.symbol}: {exc!r}")
 
     async def _resolve_entry_order(self, order: Order, result: ExecutionResult, btc_regime: RegimeAssessment) -> None:
         if result.net_base_quantity <= 0:
@@ -705,6 +860,20 @@ class StrategyEngine:
         reason = _EXIT_CLOSE_REASON[order.purpose]
         outcome = await self._apply_sell_result(order.position_id, result=result, reason=reason)
         if outcome is not None and not outcome[1]:
+            # Mirrors manage_position's immediate-fill partial-TP path
+            # (USE_TRAILING_AFTER_TP branch): a partial exit that didn't
+            # fully close the position must arm trailing on the remainder
+            # too, or the remainder is left with trailing_active=False and
+            # manage_position keeps re-submitting a fresh partial-close
+            # order against a shrinking remainder every tick instead of
+            # trailing it - silently breaking USE_TRAILING_AFTER_TP whenever
+            # the partial TP happens to rest as a LIMIT order first. Uses
+            # the fill price as the trailing peak since there is no "current
+            # price" available this long after the fact.
+            with session_scope() as session:
+                p = PositionRepository(session).get(order.position_id)
+                if p is not None and p.status == PositionStatus.OPEN:
+                    PositionRepository(session).set_trailing(p, active=True, peak_price=result.avg_fill_price)
             await self._notifier.on_delayed_fill(
                 DelayedFillEvent(
                     symbol=order.symbol, side="SELL", price=result.avg_fill_price, quantity=result.filled_quantity,

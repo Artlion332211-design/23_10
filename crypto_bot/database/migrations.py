@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,15 @@ from utils.time import utcnow
 logger = logging.getLogger(__name__)
 
 Migration = tuple[int, str, Callable[[Engine], None]]
+
+
+def _existing_columns(engine: Engine, table_name: str) -> set[str]:
+    """Dialect-portable column check via SQLAlchemy reflection (works on
+    SQLite, Postgres, etc.) - a raw `PRAGMA table_info(...)` would silently
+    fail (or worse, just error) on anything but SQLite, breaking the
+    documented "Postgres is a config change away" invariant every other
+    part of this codebase relies on."""
+    return {col["name"] for col in inspect(engine).get_columns(table_name)}
 
 
 def _migration_001_initial_schema(engine: Engine) -> None:
@@ -41,16 +50,27 @@ def _migration_002_trailing_is_early(engine: Engine) -> None:
     than assumed, so this migration stays additive/idempotent-safe (the
     documented contract every migration here must meet) instead of
     colliding with migration 1 on a fresh database."""
+    if "trailing_is_early" not in _existing_columns(engine, "positions"):
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE positions ADD COLUMN trailing_is_early BOOLEAN NOT NULL DEFAULT FALSE"))
+
+
+def _migration_003_drawdown_alerts(engine: Engine) -> None:
+    """Same idempotent-if-pre-existing pattern as migration 2, for the two
+    DRAWDOWN_WARNING_PERCENT_1/2 dedup columns."""
+    existing = _existing_columns(engine, "positions")
     with engine.begin() as conn:
-        existing_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(positions)"))}
-        if "trailing_is_early" not in existing_columns:
-            conn.execute(text("ALTER TABLE positions ADD COLUMN trailing_is_early BOOLEAN NOT NULL DEFAULT 0"))
+        if "drawdown_alert_20_sent" not in existing:
+            conn.execute(text("ALTER TABLE positions ADD COLUMN drawdown_alert_20_sent BOOLEAN NOT NULL DEFAULT FALSE"))
+        if "drawdown_alert_30_sent" not in existing:
+            conn.execute(text("ALTER TABLE positions ADD COLUMN drawdown_alert_30_sent BOOLEAN NOT NULL DEFAULT FALSE"))
 
 
 MIGRATIONS: list[Migration] = [
     (1, "initial schema (positions/orders/fills/signals/snapshots/news/events/daily_stats/settings)",
      _migration_001_initial_schema),
     (2, "positions.trailing_is_early (early profit protection)", _migration_002_trailing_is_early),
+    (3, "positions.drawdown_alert_20_sent/30_sent (drawdown warnings)", _migration_003_drawdown_alerts),
 ]
 
 

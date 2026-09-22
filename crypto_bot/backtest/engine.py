@@ -43,6 +43,7 @@ from strategy.take_profit import (
     compute_target_price,
     should_arm_early_protection,
     should_exit_trailing,
+    should_force_close_ceiling,
 )
 from utils.time import Timeframe
 
@@ -492,6 +493,15 @@ class BacktestEngine:
     ) -> None:
         pos = portfolio.open_positions[symbol]
         pos.worst_price_seen = min(pos.worst_price_seen, current_price) if pos.worst_price_seen > 0 else current_price
+
+        if should_force_close_ceiling(avg_entry_price=pos.avg_entry_price, current_price=current_price, settings=self.settings):
+            # Mirrors live's HARD_PROFIT_CEILING_PERCENT backstop
+            # (strategy_engine.StrategyEngine._force_close_ceiling) - a
+            # backtest has no resting-order/async state to override, so
+            # this is just an unconditional full close, checked before
+            # trailing/target so it reflects the same "always wins" priority.
+            self._apply_sell(portfolio, pos, symbol, pos.total_quantity, current_price, ts, "HARD_PROFIT_CEILING", trades)
+            return
 
         if pos.trailing_active:
             new_peak = max(pos.trailing_peak or current_price, current_price)
