@@ -197,8 +197,16 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_restricted
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _ctx(context).risk_manager.resume_buys()
-    await _reply(update, "Нові купівлі відновлено.")
+    risk_manager = _ctx(context).risk_manager
+    # /emergency_stop's own confirmation message tells the operator to use
+    # /resume to recover - so this must also clear emergency_stop itself,
+    # not just the buy-pause flag, or the kill switch can never be undone
+    # from Telegram (can_open_new_position()/can_dca() check emergency_stop
+    # independently of buy_paused, and nothing else in the app ever calls
+    # RiskManager.clear_emergency_stop()).
+    risk_manager.resume_buys()
+    risk_manager.clear_emergency_stop()
+    await _reply(update, "Нові купівлі відновлено. Аварійну зупинку (якщо була активна) знято.")
 
 
 @_restricted

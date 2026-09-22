@@ -121,6 +121,22 @@ def test_emergency_stop_sets_flags_and_replies(db_engine, settings, rules):
     assert "АВАРІЙНУ ЗУПИНКУ" in text
 
 
+def test_resume_also_clears_emergency_stop(db_engine, settings, rules):
+    """/emergency_stop's own reply tells the operator to use /resume to
+    recover - so /resume must clear emergency_stop itself, not just
+    buy_paused, or the kill switch can never be undone from Telegram."""
+    ctx = _make_ctx(db_engine, settings, rules)
+    context = _make_context(ctx)
+
+    asyncio.run(cmd_emergency_stop(_make_update(user_id=42), context))
+    assert ctx.risk_manager.status().emergency_stop is True
+
+    asyncio.run(cmd_resume(_make_update(user_id=42), context))
+    flags = ctx.risk_manager.status()
+    assert flags.emergency_stop is False
+    assert flags.buy_paused is False
+
+
 def test_config_never_leaks_secrets(db_engine, settings, rules):
     from config.settings import Settings as SettingsCls
 
