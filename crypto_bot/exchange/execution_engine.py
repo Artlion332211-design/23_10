@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
@@ -105,31 +105,59 @@ def _new_client_order_id(purpose: OrderPurpose) -> str:
     return f"bot-{purpose.value[:12].lower()}-{uuid.uuid4().hex[:12]}"
 
 
+def _commission_usdt_equivalent(commission: Decimal, commission_asset: str, price: Decimal, *, base_asset: str, quote_asset: str) -> Decimal:
+    if commission_asset == quote_asset:
+        return commission
+    if commission_asset == base_asset:
+        return commission * price
+    # e.g. BNB fee discount: exact fee is preserved on the Fill row via
+    # `commission` / `commission_asset`, but converting an arbitrary third
+    # asset to USDT here would need an extra price lookup this parsing step
+    # doesn't have access to. Documented approximation: it only affects the
+    # *reported* USDT-equivalent fee total, never the actual traded
+    # price/quantity accounting.
+    return Decimal("0")
+
+
 def _parse_fill(raw: dict[str, Any], *, base_asset: str, quote_asset: str) -> ExecutionFill:
+    """One entry of an order-*placement* response's `fills` array (`POST
+    /api/v3/order`) - the only Binance response shape that carries this."""
     price = Decimal(raw["price"])
     quantity = Decimal(raw["qty"])
     commission = Decimal(raw.get("commission", "0"))
     commission_asset = raw.get("commissionAsset", quote_asset)
-    if commission_asset == quote_asset:
-        commission_usdt = commission
-    elif commission_asset == base_asset:
-        commission_usdt = commission * price
-    else:
-        # e.g. BNB fee discount: exact fee is preserved on the Fill row via
-        # `commission` / `commission_asset`, but converting an arbitrary
-        # third asset to USDT here would need an extra price lookup this
-        # parsing step doesn't have access to. Documented approximation:
-        # it only affects the *reported* USDT-equivalent fee total, never
-        # the actual traded price/quantity accounting.
-        commission_usdt = Decimal("0")
     return ExecutionFill(
         price=price,
         quantity=quantity,
         commission=commission,
         commission_asset=commission_asset,
-        commission_usdt_equivalent=commission_usdt,
+        commission_usdt_equivalent=_commission_usdt_equivalent(
+            commission, commission_asset, price, base_asset=base_asset, quote_asset=quote_asset
+        ),
         trade_id=str(raw.get("tradeId")) if raw.get("tradeId") is not None else None,
         timestamp=utcnow(),
+    )
+
+
+def _parse_trade(raw: dict[str, Any], *, base_asset: str, quote_asset: str) -> ExecutionFill:
+    """One entry of `GET /api/v3/myTrades` - same information as an
+    order-placement fill, but under different keys (`id`/`time` instead of
+    `tradeId`, with a real historical trade timestamp instead of "now")."""
+    price = Decimal(raw["price"])
+    quantity = Decimal(raw["qty"])
+    commission = Decimal(raw.get("commission", "0"))
+    commission_asset = raw.get("commissionAsset", quote_asset)
+    trade_time = raw.get("time")
+    return ExecutionFill(
+        price=price,
+        quantity=quantity,
+        commission=commission,
+        commission_asset=commission_asset,
+        commission_usdt_equivalent=_commission_usdt_equivalent(
+            commission, commission_asset, price, base_asset=base_asset, quote_asset=quote_asset
+        ),
+        trade_id=str(raw.get("id")) if raw.get("id") is not None else None,
+        timestamp=datetime.fromtimestamp(trade_time / 1000, tz=UTC) if trade_time is not None else utcnow(),
     )
 
 
@@ -145,8 +173,7 @@ _BINANCE_STATUS_MAP = {
 }
 
 
-def _parse_order_response(raw: dict[str, Any], *, base_asset: str, quote_asset: str) -> ExecutionResult:
-    fills = [_parse_fill(f, base_asset=base_asset, quote_asset=quote_asset) for f in raw.get("fills", [])]
+def _build_execution_result(raw: dict[str, Any], fills: list[ExecutionFill], *, base_asset: str) -> ExecutionResult:
     filled_qty = sum((f.quantity for f in fills), Decimal("0"))
     filled_quote = sum((f.price * f.quantity for f in fills), Decimal("0"))
     base_commission = sum((f.commission for f in fills if f.commission_asset == base_asset), Decimal("0"))
@@ -200,7 +227,10 @@ class BinanceExecutionAdapter:
             logger.error("Order rejected by Binance: %s %s", request, exc)
             return ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message=str(exc))
 
-        return _parse_order_response(raw, base_asset=filters.base_asset, quote_asset=filters.quote_asset)
+        # The order-*placement* response is the one Binance response that
+        # does carry `fills` directly - no extra round-trip needed here.
+        fills = [_parse_fill(f, base_asset=filters.base_asset, quote_asset=filters.quote_asset) for f in raw.get("fills", [])]
+        return _build_execution_result(raw, fills, base_asset=filters.base_asset)
 
     async def cancel(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
         filters = await self._client.get_symbol_filters(symbol)
@@ -209,7 +239,8 @@ class BinanceExecutionAdapter:
         except (BinanceAPIException, BinanceRequestException) as exc:
             logger.warning("Cancel failed for %s/%s: %s", symbol, client_order_id, exc)
             return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
-        return _parse_order_response(raw, base_asset=filters.base_asset, quote_asset=filters.quote_asset)
+        fills = await self._resolve_fills(raw, symbol=symbol, filters=filters)
+        return _build_execution_result(raw, fills, base_asset=filters.base_asset)
 
     async def get_status(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
         filters = await self._client.get_symbol_filters(symbol)
@@ -223,7 +254,35 @@ class BinanceExecutionAdapter:
             # queued behind this one in the same poll cycle.
             logger.warning("get_status failed for %s/%s: %s", symbol, client_order_id, exc)
             return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
-        return _parse_order_response(raw, base_asset=filters.base_asset, quote_asset=filters.quote_asset)
+        fills = await self._resolve_fills(raw, symbol=symbol, filters=filters)
+        return _build_execution_result(raw, fills, base_asset=filters.base_asset)
+
+    async def _resolve_fills(
+        self, raw: dict[str, Any], *, symbol: str, filters: SymbolFilters
+    ) -> list[ExecutionFill]:
+        """`GET /api/v3/order` and `DELETE /api/v3/order` (unlike the
+        order-*placement* response) never include a `fills` breakdown, even
+        when `executedQty`/`status` show the order genuinely filled - this
+        is a real Binance API contract gap, not a transient omission.
+        Without this, `get_status`/`cancel` would silently report zero
+        filled quantity for exactly the case `check_pending_limit_orders`/
+        `reconcile_pending_order` exist to handle: a resting LIMIT order
+        that only resolves later. Falls back to `GET /api/v3/myTrades`
+        (which does carry real per-trade commission) whenever something
+        was actually executed."""
+        if raw.get("fills"):
+            return [_parse_fill(f, base_asset=filters.base_asset, quote_asset=filters.quote_asset) for f in raw["fills"]]
+        if Decimal(raw.get("executedQty", "0")) <= 0:
+            return []
+        order_id = raw.get("orderId")
+        if order_id is None:
+            return []
+        try:
+            trades = await self._client.get_my_trades(symbol, order_id=str(order_id))
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.warning("get_my_trades failed for %s/order %s: %s", symbol, order_id, exc)
+            return []
+        return [_parse_trade(t, base_asset=filters.base_asset, quote_asset=filters.quote_asset) for t in trades]
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +336,15 @@ class ExecutionEngine:
         """
         result = await self._executor.get_status(order.symbol, client_order_id=order.client_order_id)
         self._persist_result(order.id, result)
-        if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+        if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED) or (
+            result.status == OrderStatus.FILLED and result.filled_quantity <= 0
+        ):
+            # The FILLED-with-zero-quantity case means the fill detail
+            # couldn't be fetched this time (e.g. a transient
+            # GET /api/v3/myTrades failure inside `_resolve_fills`) - keep
+            # polling rather than accepting a phantom empty resolution as
+            # final; startup reconciliation runs once, so this is the only
+            # chance to retry before the order goes unmonitored forever.
             self._pending_limit_orders[order.client_order_id] = (order.symbol, order.created_at)
         return result
 
@@ -439,6 +506,13 @@ class ExecutionEngine:
         for client_order_id, (symbol, placed_at) in list(self._pending_limit_orders.items()):
             age = (now - placed_at).total_seconds()
             status = await self._executor.get_status(symbol, client_order_id=client_order_id)
+            if status.status == OrderStatus.FILLED and status.filled_quantity <= 0:
+                # Exchange confirms it filled but the fill breakdown wasn't
+                # fetchable this cycle - retry next cycle instead of
+                # resolving off a phantom zero-quantity fill. Also not
+                # cancellable anymore, so skip the timeout check below too.
+                logger.warning("LIMIT order %s/%s reports FILLED with no fill data yet, will retry", symbol, client_order_id)
+                continue
             if status.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
                 del self._pending_limit_orders[client_order_id]
                 self._persist_result_by_client_id(client_order_id, status)

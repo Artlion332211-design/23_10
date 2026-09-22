@@ -302,6 +302,15 @@ class BinanceClient:
             kwargs["origClientOrderId"] = orig_client_order_id
         return await self._call("get_order", **kwargs)
 
+    async def get_my_trades(self, symbol: str, *, order_id: str) -> list[dict[str, Any]]:
+        """GET /api/v3/myTrades restricted to one order. Needed because
+        GET/DELETE .../order (unlike the order-*placement* response) never
+        include a `fills` breakdown - this is the only way to recover the
+        real fill price/quantity/commission for an order resolved via
+        `get_order_status`/`cancel_order` instead of `create_order`."""
+        result = await self._call("get_my_trades", symbol=symbol, orderId=order_id)
+        return list(result)
+
     # ------------------------------------------------------------------
     # Trading endpoints - by convention only exchange/execution_engine.py
     # should call these.
