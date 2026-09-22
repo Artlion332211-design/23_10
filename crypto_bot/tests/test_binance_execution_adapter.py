@@ -32,6 +32,7 @@ class FakeBinanceClient:
         self.order_status_raw: dict = {}
         self.my_trades_raw: list[dict] = []
         self.my_trades_should_raise = False
+        self.cancel_should_raise = False
 
     async def get_symbol_filters(self, symbol: str, *, force_refresh: bool = False) -> SymbolFilters:
         return self._filters
@@ -40,6 +41,9 @@ class FakeBinanceClient:
         return self.order_status_raw
 
     async def cancel_order(self, **kwargs) -> dict:
+        if self.cancel_should_raise:
+            from binance.exceptions import BinanceRequestException
+            raise BinanceRequestException("cancel rejected (e.g. already FILLED)")
         return self.order_status_raw
 
     async def get_my_trades(self, symbol: str, *, order_id: str) -> list[dict]:
@@ -107,7 +111,8 @@ def test_get_status_uses_placement_response_fills_directly_without_extra_call(so
 def test_get_status_treats_my_trades_failure_as_unresolved_not_zero_fill(sol_filters):
     """A transient failure fetching the real fill breakdown must not look
     identical to 'nothing filled' - callers (check_pending_limit_orders)
-    rely on filled_quantity<=0 plus status to decide whether to retry."""
+    rely on fill_data_incomplete (not filled_quantity<=0 alone) to decide
+    whether to retry rather than resolve off a phantom zero fill."""
     client = FakeBinanceClient(sol_filters)
     client.order_status_raw = {"orderId": 555, "status": "FILLED", "executedQty": "1.5"}
     client.my_trades_should_raise = True
@@ -117,3 +122,57 @@ def test_get_status_treats_my_trades_failure_as_unresolved_not_zero_fill(sol_fil
 
     assert result.status == OrderStatus.FILLED
     assert result.filled_quantity == Decimal("0")  # caller (ExecutionEngine) is what retries on this combination
+    assert result.fill_data_incomplete is True
+
+
+def test_get_status_treats_empty_my_trades_as_unresolved_despite_executed_qty(sol_filters):
+    """executedQty>0 but myTrades legitimately returns nothing (e.g.
+    eventual-consistency lag right after the trade) must get the same
+    retry treatment as an outright myTrades failure, not resolve as a
+    genuine zero fill."""
+    client = FakeBinanceClient(sol_filters)
+    client.order_status_raw = {"orderId": 555, "status": "FILLED", "executedQty": "1.5"}
+    client.my_trades_raw = []
+    adapter = BinanceExecutionAdapter(client)  # type: ignore[arg-type]
+
+    result = asyncio.run(adapter.get_status("SOLUSDT", client_order_id="bot-entry-abc"))
+
+    assert result.status == OrderStatus.FILLED
+    assert result.filled_quantity == Decimal("0")
+    assert result.fill_data_incomplete is True
+
+
+def test_cancel_falls_back_to_get_status_when_the_cancel_call_itself_fails(sol_filters):
+    """Binance rejects a cancel for more than one reason - 'already FILLED'
+    rejects with the same exception type as a transient network blip.
+    Blindly reporting NEW here would make a caller believe an already-
+    filled order is still open, silently losing that fill - the adapter
+    must ask get_status for the real state instead of guessing."""
+    client = FakeBinanceClient(sol_filters)
+    client.cancel_should_raise = True
+    client.order_status_raw = {"orderId": 555, "status": "FILLED", "executedQty": "1.0"}
+    client.my_trades_raw = [
+        {"id": 1, "price": "100.00", "qty": "1.0", "commission": "0.001", "commissionAsset": "SOL", "time": 1700000000000},
+    ]
+    adapter = BinanceExecutionAdapter(client)  # type: ignore[arg-type]
+
+    result = asyncio.run(adapter.cancel("SOLUSDT", client_order_id="bot-entry-abc"))
+
+    assert result.status == OrderStatus.FILLED
+    assert result.filled_quantity == Decimal("1.0")
+    assert result.fill_data_incomplete is False
+
+
+def test_get_status_recovered_fill_is_not_marked_incomplete(sol_filters):
+    """The successful-recovery case (the first test in this file) must NOT
+    be flagged incomplete - only genuinely unresolved attempts are."""
+    client = FakeBinanceClient(sol_filters)
+    client.order_status_raw = {"orderId": 555, "status": "FILLED", "executedQty": "1.0"}
+    client.my_trades_raw = [
+        {"id": 1, "price": "100.00", "qty": "1.0", "commission": "0.001", "commissionAsset": "SOL", "time": 1700000000000},
+    ]
+    adapter = BinanceExecutionAdapter(client)  # type: ignore[arg-type]
+
+    result = asyncio.run(adapter.get_status("SOLUSDT", client_order_id="bot-entry-abc"))
+
+    assert result.fill_data_incomplete is False

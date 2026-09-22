@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
-from database.models import OrderPurpose, OrderStatus
+from database.models import OrderPurpose, OrderSide, OrderStatus, OrderType
+from database.repository import OrderRepository
+from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
 from utils.time import utcnow
@@ -115,3 +118,95 @@ def test_notional_too_small_is_rejected_before_touching_exchange(db_engine, sett
     assert result.accepted is False
     assert "minNotional" in (result.error_message or "")
     assert executor.submitted == []
+
+
+class _ScriptedExecutor:
+    """Returns a scripted sequence of get_status() results (repeating the
+    last one once exhausted) - for exercising retry/give-up timing
+    precisely, independent of FakeExecutor's fixed always-fills behavior."""
+
+    def __init__(self, results: list[ExecutionResult]):
+        self._results = list(results)
+        self.get_status_calls = 0
+        self.cancel_calls: list[str] = []
+
+    async def submit(self, request):  # pragma: no cover - unused by these tests
+        raise AssertionError("submit should not be called")
+
+    async def cancel(self, symbol, *, client_order_id):
+        self.cancel_calls.append(client_order_id)
+        return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id="124")
+
+    async def get_status(self, symbol, *, client_order_id):
+        idx = min(self.get_status_calls, len(self._results) - 1)
+        self.get_status_calls += 1
+        return self._results[idx]
+
+
+def _seed_order(client_order_id: str) -> None:
+    with session_scope() as session:
+        OrderRepository(session).create(
+            symbol="SOLUSDT", client_order_id=client_order_id, side=OrderSide.BUY, type=OrderType.LIMIT,
+            purpose=OrderPurpose.ENTRY, requested_price=Decimal("140"), requested_qty=Decimal("1"), requested_usdt=Decimal("140"),
+        )
+
+
+def test_reconcile_pending_order_does_not_persist_a_phantom_filled_status(db_engine, settings, filters_provider):
+    """A terminal status with fill_data_incomplete=True must not be written
+    to the DB yet - doing so would defeat has_resting_order()'s duplicate-
+    order guard for an order this same call is about to retry (this is the
+    exact self-contradiction the code review caught: persisting the status
+    unconditionally, then separately deciding the fill data was unusable
+    and re-queuing for retry)."""
+    _seed_order("bot-reconcile-1")
+    executor = _ScriptedExecutor([
+        ExecutionResult(accepted=True, status=OrderStatus.FILLED, exchange_order_id="1", fill_data_incomplete=True),
+    ])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    with session_scope() as session:
+        order = OrderRepository(session).get_by_client_id("bot-reconcile-1")
+
+    result = asyncio.run(engine.reconcile_pending_order(order))
+
+    assert result.status == OrderStatus.FILLED
+    assert result.fill_data_incomplete is True
+    with session_scope() as session:
+        stored = OrderRepository(session).get_by_client_id("bot-reconcile-1")
+        assert stored.status == OrderStatus.NEW  # unchanged - not persisted while unresolved
+    assert "bot-reconcile-1" in engine._pending_limit_orders
+
+
+def test_check_pending_limit_orders_retries_incomplete_fill_data_then_gives_up(db_engine, settings, filters_provider):
+    tuned = settings.model_copy(update={"limit_order_timeout_seconds": 1})
+    incomplete = ExecutionResult(accepted=True, status=OrderStatus.FILLED, exchange_order_id="1", fill_data_incomplete=True)
+    executor = _ScriptedExecutor([incomplete])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=tuned, dry_run=False)
+    engine._pending_limit_orders["bot-stuck-1"] = ("SOLUSDT", utcnow())
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+    assert resolved == []  # still within the retry window - not yet given up
+    assert "bot-stuck-1" in engine._pending_limit_orders
+
+    # Backdate placed_at past the give-up window (5x the 1s timeout) instead
+    # of sleeping in the test.
+    engine._pending_limit_orders["bot-stuck-1"] = ("SOLUSDT", utcnow() - timedelta(seconds=10))
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert len(resolved) == 1
+    assert resolved[0][2].fill_data_incomplete is True
+    assert "bot-stuck-1" not in engine._pending_limit_orders
+
+
+def test_execution_engine_cancel_persists_and_clears_pending_tracking(db_engine, settings, sol_filters, filters_provider):
+    _seed_order("bot-cancel-1")
+    executor = FakeExecutor(sol_filters)
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-cancel-1"] = ("SOLUSDT", utcnow())
+
+    result = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-1"))
+
+    assert result.status == OrderStatus.CANCELED
+    assert "bot-cancel-1" not in engine._pending_limit_orders
+    with session_scope() as session:
+        stored = OrderRepository(session).get_by_client_id("bot-cancel-1")
+        assert stored.status == OrderStatus.CANCELED
