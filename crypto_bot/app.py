@@ -188,7 +188,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
 
     try:
         if mode == TradingMode.LIVE:
-            report = await reconcile_live(client, execution_engine)
+            report = await reconcile_live(client, execution_engine, strategy_engine)
         else:
             assert paper_broker is not None
             report = reconcile_paper(settings, paper_broker, execution_engine)

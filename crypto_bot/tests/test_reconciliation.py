@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from database.models import OrderPurpose, OrderSide, OrderStatus, OrderType
 from database.repository import OrderRepository, PositionRepository
 from database.session import session_scope
-from exchange.execution_engine import ExecutionEngine, ExecutionResult
+from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
+from news.news_engine import NewsEngine
 from orchestration.reconciliation import reconcile_live, reconcile_paper
 from paper.simulator import PaperBroker
+from risk.risk_manager import RiskManager
+from strategy.signal_engine import SignalEngine
+from strategy.strategy_engine import StrategyEngine
 from utils.time import utcnow
+
+
+def _stub_strategy_engine() -> MagicMock:
+    """A StrategyEngine stand-in for tests that only exercise order-status
+    reconciliation itself, not what happens to a genuinely resolved fill -
+    see test_reconcile_live_applies_a_fill_discovered_while_offline below
+    for a real, fully-wired StrategyEngine exercising that path."""
+    stub = MagicMock()
+    stub.apply_resolved_order = AsyncMock()
+    return stub
 
 
 @pytest.fixture
@@ -75,7 +90,7 @@ def test_reconcile_live_persists_an_order_that_resolved_while_offline(db_engine,
     executor = _StatusExecutor(ExecutionResult(accepted=True, status=OrderStatus.FILLED, exchange_order_id="999"))
     engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
 
-    report = asyncio.run(reconcile_live(_FakeClient({}), engine))
+    report = asyncio.run(reconcile_live(_FakeClient({}), engine, _stub_strategy_engine()))
 
     assert report.resolved_orders == ["pending-1"]
     with session_scope() as session:
@@ -89,7 +104,7 @@ def test_reconcile_live_re_registers_a_limit_order_still_resting(db_engine, sett
     executor = _StatusExecutor(ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id="999"))
     engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
 
-    asyncio.run(reconcile_live(_FakeClient({}), engine))
+    asyncio.run(reconcile_live(_FakeClient({}), engine, _stub_strategy_engine()))
 
     assert "pending-2" in engine._pending_limit_orders
 
@@ -104,7 +119,7 @@ def test_reconcile_live_flags_a_position_binance_no_longer_backs(db_engine, sett
     engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
     client = _FakeClient({"SOL": (Decimal("0.1"), Decimal("0"))})  # far less than the 1.0 the DB expects
 
-    report = asyncio.run(reconcile_live(client, engine))
+    report = asyncio.run(reconcile_live(client, engine, _stub_strategy_engine()))
 
     assert report.has_warnings
     assert "SOLUSDT" in report.position_mismatches[0]
@@ -120,9 +135,45 @@ def test_reconcile_live_accepts_a_position_binance_fully_backs(db_engine, settin
     engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
     client = _FakeClient({"SOL": (Decimal("1.0"), Decimal("0"))})
 
-    report = asyncio.run(reconcile_live(client, engine))
+    report = asyncio.run(reconcile_live(client, engine, _stub_strategy_engine()))
 
     assert not report.has_warnings
+
+
+def test_reconcile_live_applies_a_fill_discovered_while_offline(db_engine, settings, rules, filters_provider):
+    """The crash-recovery requirement in full: an ENTRY LIMIT order that
+    actually filled on Binance while the bot was down must not just have
+    its Order/Fill rows persisted - it must create the Position too, or the
+    bot comes back up with real money moved on the exchange and zero
+    tracking of it (no target price, no DCA, no take-profit, nothing)."""
+    _seed_pending_order("pending-entry")
+    filled = ExecutionResult(
+        accepted=True, status=OrderStatus.FILLED, exchange_order_id="999",
+        fills=[ExecutionFill(
+            price=Decimal("140"), quantity=Decimal("1"), commission=Decimal("0.001"),
+            commission_asset="SOL", commission_usdt_equivalent=Decimal("0.14"), trade_id="t1", timestamp=utcnow(),
+        )],
+        avg_fill_price=Decimal("140"), filled_quantity=Decimal("1"), net_base_quantity=Decimal("0.999"),
+        filled_quote=Decimal("140"), commission_total_usdt_equivalent=Decimal("0.14"),
+    )
+    executor = _StatusExecutor(filled)
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+
+    strategy = StrategyEngine(
+        settings=settings, rules=rules, signal_engine=SignalEngine(settings, rules), risk_manager=RiskManager(settings),
+        execution_engine=engine, market_data=MagicMock(), news_provider=NewsEngine(settings),
+    )
+
+    asyncio.run(reconcile_live(_FakeClient({}), engine, strategy))
+
+    with session_scope() as session:
+        position = PositionRepository(session).get_open_position_for_symbol("SOLUSDT")
+        assert position is not None
+        assert position.avg_entry_price == Decimal("140")
+        assert position.total_quantity == Decimal("0.999")
+        order = OrderRepository(session).get_by_client_id("pending-entry")
+        assert order is not None
+        assert order.position_id == position.id
 
 
 def test_reconcile_paper_rebuilds_balance_and_holdings_from_fill_ledger(db_engine, settings, filters_provider):

@@ -23,18 +23,28 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from config.settings import Settings
-from database.models import BotEventLevel, OrderSide, OrderType
+from database.models import BotEventLevel, OrderSide, OrderStatus, OrderType
 from database.repository import EventRepository, OrderRepository, PositionRepository
 from database.session import session_scope
 from exchange.binance_client import BinanceClient
 from exchange.execution_engine import ExecutionEngine, OrderRequest
+from market.market_regime import RegimeAssessment, RegimeLevel
 from paper.simulator import PaperBroker, base_asset_of
+from strategy.strategy_engine import StrategyEngine
 
 logger = logging.getLogger(__name__)
 
 # A restart can legitimately race a fill by a few dust units (base-asset
 # rounding); only flag a mismatch big enough to mean something real changed.
 BALANCE_TOLERANCE_FRACTION = Decimal("0.001")
+
+# reconcile_live runs before BotRuntime.initialize() has computed a real BTC
+# regime - only used as informational context for a Position's
+# market_regime_at_entry field when an ENTRY order turns out to have filled
+# while the bot was down; no decision logic ever reads that field back.
+_STARTUP_PLACEHOLDER_REGIME = RegimeAssessment(
+    level=RegimeLevel.NEUTRAL, score=0.0, reasons=["BTC regime not yet computed at startup"], crash=False
+)
 
 
 @dataclass
@@ -49,18 +59,38 @@ class ReconciliationReport:
         return bool(self.position_mismatches)
 
 
-async def reconcile_live(client: BinanceClient, execution_engine: ExecutionEngine) -> ReconciliationReport:
+async def reconcile_live(
+    client: BinanceClient, execution_engine: ExecutionEngine, strategy_engine: StrategyEngine
+) -> ReconciliationReport:
     report = ReconciliationReport(mode="LIVE")
 
     with session_scope() as session:
         pending_orders = OrderRepository(session).open_orders()
-        for order in pending_orders:
-            try:
-                await execution_engine.reconcile_pending_order(order)
-                report.resolved_orders.append(order.client_order_id)
-            except Exception as exc:  # noqa: BLE001 - one bad order must never abort startup
-                logger.error("Failed to reconcile pending order %s: %r", order.client_order_id, exc)
-                report.notes.append(f"could not reconcile order {order.client_order_id}: {exc!r}")
+
+    for order in pending_orders:
+        try:
+            result = await execution_engine.reconcile_pending_order(order)
+            report.resolved_orders.append(order.client_order_id)
+            if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED) or result.fill_data_incomplete:
+                # Still resting, or its fill data couldn't be confirmed this
+                # attempt - reconcile_pending_order already re-registered it
+                # with check_pending_limit_orders for ongoing polling, so
+                # there is nothing to apply to a Position yet.
+                continue
+            # A genuine terminal resolution discovered only now, while the
+            # bot was down, must still be turned into Position state exactly
+            # like a delayed fill discovered while running (see
+            # StrategyEngine.process_resolved_orders) - otherwise Binance
+            # would show real money moved (an ENTRY/DCA fill, or an exit
+            # that only partially closed) but the bot would come back up
+            # with no Position/DCA/target tracking it at all. This is the
+            # crux of "remember open orders across a restart": the Order/
+            # Fill rows alone are not enough, the Position has to be
+            # created/updated from them too.
+            await strategy_engine.apply_resolved_order(order, result, btc_regime=_STARTUP_PLACEHOLDER_REGIME)
+        except Exception as exc:  # noqa: BLE001 - one bad order must never abort startup
+            logger.error("Failed to reconcile pending order %s: %r", order.client_order_id, exc)
+            report.notes.append(f"could not reconcile order {order.client_order_id}: {exc!r}")
 
     try:
         balances = await client.get_account_balances()
