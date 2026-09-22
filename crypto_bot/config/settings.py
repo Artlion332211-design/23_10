@@ -84,8 +84,13 @@ class Settings(BaseSettings):
     # target and reverses before actually reaching it still locks in most
     # of the gain, instead of riding all the way back down. Independent of
     # USE_TRAILING_AFTER_TP (which only ever arms *after* the full target is
-    # hit, on the partial remainder): once this arms, it pre-empts the
-    # target-price check entirely for that position.
+    # hit, on the partial remainder): once this arms (which happens first,
+    # since the arm percent is always below the full target), it pre-empts
+    # the target-price check entirely for that position - so with BOTH
+    # enabled, USE_TRAILING_AFTER_TP's partial-close-then-trail-the-rest
+    # behavior never actually runs; the position rides the early-armed
+    # trail on its full size instead. Turning both on at once is contradictory
+    # by design, not a bug: pick one exit style per position.
     early_profit_protection_enabled: bool = False
     early_profit_arm_percent: Decimal = Decimal("9.5")
     early_profit_trailing_distance_percent: Decimal = Decimal("1.0")
