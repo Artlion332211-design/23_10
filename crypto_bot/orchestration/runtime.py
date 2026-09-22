@@ -32,7 +32,8 @@ from decimal import Decimal
 from typing import Any
 
 from config.settings import RulesConfig, Settings, TradingMode
-from database.repository import NewsRepository, PositionRepository
+from database.models import OrderPurpose
+from database.repository import NewsRepository, OrderRepository, PositionRepository
 from database.session import session_scope
 from exchange.binance_client import BinanceClient
 from exchange.execution_engine import ExecutionEngine
@@ -232,6 +233,13 @@ class BotRuntime:
         with session_scope() as session:
             position_repo = PositionRepository(session)
             if position_repo.get_open_position_for_symbol(symbol) is not None:
+                return
+            # A resting entry LIMIT order has no Position yet (that's only
+            # created on an actual fill - see StrategyEngine._apply_entry_fill),
+            # so the check above alone doesn't stop a second candle-close
+            # from submitting a duplicate entry while the first is still
+            # resolving; process_resolved_orders() is what finishes it.
+            if OrderRepository(session).has_resting_order(symbol=symbol, purpose=OrderPurpose.ENTRY):
                 return
             open_count = position_repo.count_open()
             open_symbols = [p.symbol for p in position_repo.get_open_positions()]

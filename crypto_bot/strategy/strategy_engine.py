@@ -430,6 +430,18 @@ class StrategyEngine:
             trailing_active = position.trailing_active
             trailing_peak = position.trailing_peak_price
             trailing_is_early = position.trailing_is_early
+            # A LIMIT order can rest for up to LIMIT_ORDER_TIMEOUT_SECONDS
+            # (90s by default), longer than this loop's own polling
+            # interval (60s by default) - without this guard, the same
+            # DCA/target/trailing-exit condition still being true on the
+            # next tick would submit a second order for the same
+            # level/exit before the first has had a chance to resolve.
+            # process_resolved_orders() is what finishes the resting one;
+            # this method just waits for it.
+            has_resting_order = OrderRepository(session).has_resting_order(symbol=symbol, position_id=position_id)
+
+        if has_resting_order:
+            return
 
         if trailing_active:
             new_peak = max(trailing_peak or current_price, current_price)

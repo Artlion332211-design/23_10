@@ -4,7 +4,8 @@ import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
-from database.repository import PositionRepository
+from database.models import OrderPurpose, OrderSide, OrderType
+from database.repository import OrderRepository, PositionRepository
 from database.session import session_scope
 from orchestration.runtime import BotRuntime
 from risk.risk_manager import RiskManager
@@ -43,6 +44,26 @@ def test_evaluate_entry_skips_when_emergency_stop_is_active(db_engine, settings,
     strategy_engine = MagicMock()
     strategy_engine.try_open_position = AsyncMock()
     runtime = _make_runtime(settings, rules, risk_manager=risk_manager, strategy_engine=strategy_engine)
+
+    asyncio.run(runtime._evaluate_entry("SOLUSDT"))
+
+    strategy_engine.try_open_position.assert_not_called()
+
+
+def test_evaluate_entry_skips_when_an_entry_order_is_already_resting(db_engine, settings, rules):
+    """A resting entry LIMIT order has no Position yet (only created on an
+    actual fill), so get_open_position_for_symbol alone doesn't stop a
+    second candle-close from submitting a duplicate entry while the first
+    is still resolving."""
+    with session_scope() as session:
+        OrderRepository(session).create(
+            position_id=None, symbol="SOLUSDT", client_order_id="bot-entry-resting",
+            side=OrderSide.BUY, type=OrderType.LIMIT, purpose=OrderPurpose.ENTRY,
+            requested_price=Decimal("100"), requested_qty=Decimal("1"), requested_usdt=Decimal("100"),
+        )
+    strategy_engine = MagicMock()
+    strategy_engine.try_open_position = AsyncMock()
+    runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
 
     asyncio.run(runtime._evaluate_entry("SOLUSDT"))
 

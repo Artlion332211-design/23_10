@@ -26,6 +26,7 @@ from database.models import (
     MarketSnapshot,
     News,
     Order,
+    OrderPurpose,
     OrderStatus,
     Position,
     PositionStatus,
@@ -294,6 +295,27 @@ class OrderRepository:
         if symbol:
             stmt = stmt.where(Order.symbol == symbol)
         return list(self.session.scalars(stmt))
+
+    def has_resting_order(
+        self, *, symbol: str, position_id: int | None = None, purpose: OrderPurpose | None = None
+    ) -> bool:
+        """True if a NEW/PARTIALLY_FILLED order already exists matching the
+        given filters - the guard that keeps `manage_position`/entry
+        evaluation from re-submitting a duplicate DCA/exit/entry order on
+        every poll tick while the first one is still resting. A LIMIT order
+        can rest for up to LIMIT_ORDER_TIMEOUT_SECONDS (90s by default),
+        which is longer than POSITION_MONITOR_INTERVAL_SECONDS (60s by
+        default) - without this, the same trigger condition being true on
+        the next tick submits a second order for the same DCA level/exit
+        before the first has had a chance to fill or time out."""
+        stmt = select(Order.id).where(
+            Order.symbol == symbol, Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED])
+        )
+        if position_id is not None:
+            stmt = stmt.where(Order.position_id == position_id)
+        if purpose is not None:
+            stmt = stmt.where(Order.purpose == purpose)
+        return self.session.scalar(stmt) is not None
 
     def for_position(self, position_id: int) -> list[Order]:
         stmt = select(Order).where(Order.position_id == position_id).order_by(Order.created_at)

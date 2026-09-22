@@ -50,8 +50,13 @@ class FakeExecutor:
 
     def __init__(self):
         self.price = Decimal("100")
+        self.resting = False  # when True, submit() leaves the order resting (accepted, zero fill) instead of filling
+        self.submit_calls = 0
 
     async def submit(self, request):
+        self.submit_calls += 1
+        if self.resting:
+            return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id="resting")
         price = self.price
         qty = (request.quote_amount / price) if request.quote_amount else request.quantity
         is_buy = request.side.value == "BUY"
@@ -123,6 +128,13 @@ def strategy_setup(db_engine, settings, rules, bullish_snapshots):
         "max_open_positions": 3, "max_total_exposure_percent": Decimal("50"),
         "max_daily_new_capital_usdt": Decimal("1000"), "target_profit_percent": Decimal("10"),
         "dca_level_1": Decimal("-3"), "dca_size_1_usdt": Decimal("50"),
+        # This fixture's scenarios test the plain target-price exit path
+        # directly (jump straight to target+0.5 and expect an immediate
+        # full close) - pinned explicitly, not left to whatever the
+        # ambient .env happens to have EARLY_PROFIT_PROTECTION_ENABLED set
+        # to, since that changes the exit mechanism entirely (arms a
+        # trailing-stop at 9.5% instead of closing at target).
+        "early_profit_protection_enabled": False,
     })
 
     market_data = FakeMarketDataStore()
@@ -201,6 +213,38 @@ def test_full_buy_dca_take_profit_lifecycle(strategy_setup):
 
     event_types = [e[0] for e in notifier.events]
     assert event_types == ["buy_signal", "buy_executed", "dca_signal", "dca_executed", "position_closed"]
+
+
+def test_manage_position_does_not_resubmit_while_an_order_is_still_resting(strategy_setup):
+    """A LIMIT order can rest for up to LIMIT_ORDER_TIMEOUT_SECONDS (90s by
+    default), longer than the position-monitor poll interval (60s by
+    default) - manage_position must not submit a second DCA order for the
+    same level while the first is still unresolved."""
+    strategy, executor, notifier, book = strategy_setup
+    neutral = RegimeAssessment(level=RegimeLevel.NEUTRAL, score=0, reasons=[], crash=False)
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=neutral, trading_balance_usdt=Decimal("10000"), order_book=book
+    ))
+    assert decision.action == "BUY"
+    with session_scope() as session:
+        position_id = PositionRepository(session).get_open_position_for_symbol("SOLUSDT").id
+
+    executor.price = Decimal("97")  # a -3% move -> DCA level 1 triggers
+    executor.resting = True
+    submits_before = executor.submit_calls
+
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book))
+    assert executor.submit_calls == submits_before + 1  # the DCA buy was submitted once and now rests
+
+    with session_scope() as session:
+        position = PositionRepository(session).get(position_id)
+        assert position.dca_count == 0  # unfilled - no fill was ever applied
+
+    # Same triggering price/condition on the next poll tick - must not
+    # submit a second DCA order while the first is still resting.
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book))
+    assert executor.submit_calls == submits_before + 1
 
 
 def test_crash_regime_blocks_new_entry(strategy_setup):
