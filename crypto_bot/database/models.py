@@ -159,6 +159,11 @@ class Position(Base):
     target_price: Mapped[Decimal] = mapped_column(MONEY)
     trailing_active: Mapped[bool] = mapped_column(default=False)
     trailing_peak_price: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    # True when trailing was armed early (EARLY_PROFIT_PROTECTION_ENABLED,
+    # before the full target was reached) rather than after the full
+    # target - distinguishes which TRAILING_DISTANCE_PERCENT setting
+    # applies to this position's exit check.
+    trailing_is_early: Mapped[bool] = mapped_column(default=False)
     # Cumulative cost-basis of every slice ever sold from this position
     # (each partial take-profit slice, plus the final close) - never
     # decreases, unlike total_cost_usdt which tracks remaining *unsold*

@@ -78,6 +78,18 @@ class Settings(BaseSettings):
     trailing_partial_close_fraction: Decimal = Decimal("0.6")
     trailing_distance_percent: Decimal = Decimal("2.5")
 
+    # Early profit protection: arms a (tighter) trailing-stop on the FULL
+    # position as soon as net profit reaches EARLY_PROFIT_ARM_PERCENT -
+    # below the full TARGET_PROFIT_PERCENT - so a move that gets close to
+    # target and reverses before actually reaching it still locks in most
+    # of the gain, instead of riding all the way back down. Independent of
+    # USE_TRAILING_AFTER_TP (which only ever arms *after* the full target is
+    # hit, on the partial remainder): once this arms, it pre-empts the
+    # target-price check entirely for that position.
+    early_profit_protection_enabled: bool = False
+    early_profit_arm_percent: Decimal = Decimal("9.5")
+    early_profit_trailing_distance_percent: Decimal = Decimal("1.0")
+
     # --- DCA (controlled averaging - NOT martingale) ----------------------
     max_dca_count: int = 3
     dca_level_1: Decimal = Decimal("-3")

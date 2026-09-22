@@ -50,7 +50,11 @@ from strategy.dca import DCALevel, dca_plan, evaluate_dca, next_dca_level
 from strategy.filters import AntiFOMOFilter, check_blacklist, check_liquidity_fresh
 from strategy.scoring import ScoreBreakdown
 from strategy.signal_engine import MultiTimeframeSnapshot, SignalEngine
-from strategy.take_profit import compute_target_price, should_exit_trailing
+from strategy.take_profit import (
+    compute_target_price,
+    should_arm_early_protection,
+    should_exit_trailing,
+)
 from utils.time import Timeframe, utcnow
 
 logger = logging.getLogger(__name__)
@@ -425,6 +429,7 @@ class StrategyEngine:
             total_qty = position.total_quantity
             trailing_active = position.trailing_active
             trailing_peak = position.trailing_peak_price
+            trailing_is_early = position.trailing_is_early
 
         if trailing_active:
             new_peak = max(trailing_peak or current_price, current_price)
@@ -432,8 +437,12 @@ class StrategyEngine:
                 with session_scope() as session:
                     p = PositionRepository(session).get(position_id)
                     assert p is not None
-                    PositionRepository(session).set_trailing(p, active=True, peak_price=new_peak)
-            if should_exit_trailing(current_price, new_peak, self._settings):
+                    PositionRepository(session).set_trailing(p, active=True, peak_price=new_peak, is_early=trailing_is_early)
+            distance = (
+                self._settings.early_profit_trailing_distance_percent
+                if trailing_is_early else self._settings.trailing_distance_percent
+            )
+            if should_exit_trailing(current_price, new_peak, distance):
                 result = await self._execution_engine.sell(
                     symbol=symbol, quantity=total_qty, reference_price=current_price,
                     spread_percent=order_book.spread_percent, purpose=OrderPurpose.TRAILING_STOP, position_id=position_id,
@@ -442,6 +451,13 @@ class StrategyEngine:
                     await self._notifier.on_error(f"SELL order for {symbol} failed: {result.error_message}")
                     return
                 await self._apply_sell_result(position_id, result=result, reason="TRAILING_STOP")
+            return
+
+        if should_arm_early_protection(avg_entry_price=avg_entry, current_price=current_price, settings=self._settings):
+            with session_scope() as session:
+                p = PositionRepository(session).get(position_id)
+                assert p is not None
+                PositionRepository(session).set_trailing(p, active=True, peak_price=current_price, is_early=True)
             return
 
         if current_price >= target_price:

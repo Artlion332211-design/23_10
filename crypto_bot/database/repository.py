@@ -134,10 +134,14 @@ class PositionRepository:
         self.session.flush()
         return position
 
-    def set_trailing(self, position: Position, *, active: bool, peak_price: Decimal | None = None) -> Position:
+    def set_trailing(
+        self, position: Position, *, active: bool, peak_price: Decimal | None = None, is_early: bool = False
+    ) -> Position:
         position.trailing_active = active
         if peak_price is not None:
             position.trailing_peak_price = peak_price
+        if active:
+            position.trailing_is_early = is_early
         self.session.flush()
         return position
 

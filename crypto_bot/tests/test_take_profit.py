@@ -8,6 +8,7 @@ from strategy.take_profit import (
     Fill,
     compute_target_price,
     net_profit_percent,
+    should_arm_early_protection,
     should_exit_trailing,
     should_start_trailing,
     trailing_stop_price,
@@ -57,7 +58,7 @@ def test_compute_target_price_rejects_non_positive_entry():
 
 def test_trailing_stop_price_below_peak(settings):
     peak = Decimal("120")
-    stop = trailing_stop_price(peak, settings)
+    stop = trailing_stop_price(peak, settings.trailing_distance_percent)
     assert stop < peak
     expected = peak * (Decimal(1) - settings.trailing_distance_percent / Decimal(100))
     assert stop == expected
@@ -74,6 +75,25 @@ def test_should_start_trailing_only_when_enabled_and_target_reached(settings):
 
 def test_should_exit_trailing_on_retrace(settings):
     peak = Decimal("120")
-    stop = trailing_stop_price(peak, settings)
-    assert should_exit_trailing(stop - Decimal("0.01"), peak, settings)
-    assert not should_exit_trailing(peak, peak, settings)
+    stop = trailing_stop_price(peak, settings.trailing_distance_percent)
+    assert should_exit_trailing(stop - Decimal("0.01"), peak, settings.trailing_distance_percent)
+    assert not should_exit_trailing(peak, peak, settings.trailing_distance_percent)
+
+
+def test_should_arm_early_protection_only_when_enabled_and_close_to_target(settings):
+    enabled = settings.model_copy(update={"early_profit_protection_enabled": True, "early_profit_arm_percent": Decimal("9.5")})
+    disabled = settings.model_copy(update={"early_profit_protection_enabled": False})
+    avg_entry = Decimal("100")
+
+    # Price close enough to net ~9.5%+ after fees/slippage arms it.
+    near_target_price = compute_target_price(
+        avg_entry, target_profit_percent=Decimal("9.5"), taker_fee_rate=enabled.taker_fee_rate,
+        expected_slippage_percent=enabled.expected_slippage_percent,
+    )
+    assert should_arm_early_protection(avg_entry_price=avg_entry, current_price=near_target_price, settings=enabled)
+
+    # Well below the arm threshold does not.
+    assert not should_arm_early_protection(avg_entry_price=avg_entry, current_price=Decimal("101"), settings=enabled)
+
+    # Disabled never arms, no matter the price.
+    assert not should_arm_early_protection(avg_entry_price=avg_entry, current_price=near_target_price * 2, settings=disabled)

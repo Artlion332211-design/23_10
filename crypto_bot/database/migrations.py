@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -33,9 +33,24 @@ def _migration_001_initial_schema(engine: Engine) -> None:
     Base.metadata.create_all(engine)
 
 
+def _migration_002_trailing_is_early(engine: Engine) -> None:
+    """`Base.metadata.create_all` (migration 1) already creates this column
+    on any brand-new database, since `Position.trailing_is_early` is part
+    of the current model - only a database that already existed *before*
+    this field was added is actually missing it. Checked explicitly rather
+    than assumed, so this migration stays additive/idempotent-safe (the
+    documented contract every migration here must meet) instead of
+    colliding with migration 1 on a fresh database."""
+    with engine.begin() as conn:
+        existing_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(positions)"))}
+        if "trailing_is_early" not in existing_columns:
+            conn.execute(text("ALTER TABLE positions ADD COLUMN trailing_is_early BOOLEAN NOT NULL DEFAULT 0"))
+
+
 MIGRATIONS: list[Migration] = [
     (1, "initial schema (positions/orders/fills/signals/snapshots/news/events/daily_stats/settings)",
      _migration_001_initial_schema),
+    (2, "positions.trailing_is_early (early profit protection)", _migration_002_trailing_is_early),
 ]
 
 

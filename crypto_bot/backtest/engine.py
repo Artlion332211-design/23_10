@@ -39,7 +39,11 @@ from strategy.dca import evaluate_dca, next_dca_level
 from strategy.filters import AntiFOMOFilter, check_blacklist
 from strategy.scoring import ScoreBreakdown
 from strategy.signal_engine import MultiTimeframeSnapshot, SignalEngine
-from strategy.take_profit import compute_target_price, should_exit_trailing
+from strategy.take_profit import (
+    compute_target_price,
+    should_arm_early_protection,
+    should_exit_trailing,
+)
 from utils.time import Timeframe
 
 logger = logging.getLogger(__name__)
@@ -146,6 +150,7 @@ class _OpenPosition:
     target_price: Decimal
     trailing_active: bool = False
     trailing_peak: Decimal | None = None
+    trailing_is_early: bool = False
     fees_paid_usdt: Decimal = Decimal("0")
     worst_price_seen: Decimal = Decimal("0")
     realized_pnl_usdt: Decimal = Decimal("0")
@@ -491,8 +496,18 @@ class BacktestEngine:
         if pos.trailing_active:
             new_peak = max(pos.trailing_peak or current_price, current_price)
             pos.trailing_peak = new_peak
-            if should_exit_trailing(current_price, new_peak, self.settings):
+            distance = (
+                self.settings.early_profit_trailing_distance_percent
+                if pos.trailing_is_early else self.settings.trailing_distance_percent
+            )
+            if should_exit_trailing(current_price, new_peak, distance):
                 self._apply_sell(portfolio, pos, symbol, pos.total_quantity, current_price, ts, "TRAILING_STOP", trades)
+            return
+
+        if should_arm_early_protection(avg_entry_price=pos.avg_entry_price, current_price=current_price, settings=self.settings):
+            pos.trailing_active = True
+            pos.trailing_is_early = True
+            pos.trailing_peak = current_price
             return
 
         if current_price >= pos.target_price:

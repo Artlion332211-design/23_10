@@ -74,13 +74,37 @@ def net_profit_percent(
     return (net_proceeds / avg_entry_price - Decimal(1)) * Decimal(100)
 
 
-def trailing_stop_price(peak_price: Decimal, settings: Settings) -> Decimal:
-    return peak_price * (Decimal(1) - settings.trailing_distance_percent / Decimal(100))
+def trailing_stop_price(peak_price: Decimal, distance_percent: Decimal) -> Decimal:
+    return peak_price * (Decimal(1) - distance_percent / Decimal(100))
 
 
 def should_start_trailing(*, current_price: Decimal, target_price: Decimal, settings: Settings) -> bool:
     return settings.use_trailing_after_tp and current_price >= target_price
 
 
-def should_exit_trailing(current_price: Decimal, peak_price: Decimal, settings: Settings) -> bool:
-    return current_price <= trailing_stop_price(peak_price, settings)
+def should_exit_trailing(current_price: Decimal, peak_price: Decimal, distance_percent: Decimal) -> bool:
+    """`distance_percent` is the caller's choice, not read from `Settings`
+    directly: a position trailing after the full target uses
+    `TRAILING_DISTANCE_PERCENT`, one armed early by
+    `should_arm_early_protection` uses the (typically tighter)
+    `EARLY_PROFIT_TRAILING_DISTANCE_PERCENT` - the two must not be
+    conflated, so the caller picks based on `Position.trailing_is_early`."""
+    return current_price <= trailing_stop_price(peak_price, distance_percent)
+
+
+def should_arm_early_protection(
+    *, avg_entry_price: Decimal, current_price: Decimal, settings: Settings
+) -> bool:
+    """True once net profit (fee/slippage-aware, same basis as the target
+    itself) reaches `EARLY_PROFIT_ARM_PERCENT`, so a move that gets close
+    to the full target and reverses before actually reaching it still gets
+    a trailing-stop armed under it, instead of having no protection at all
+    until the exact target price. No-ops unless
+    `EARLY_PROFIT_PROTECTION_ENABLED` is set."""
+    if not settings.early_profit_protection_enabled:
+        return False
+    net_pct = net_profit_percent(
+        avg_entry_price, current_price,
+        taker_fee_rate=settings.taker_fee_rate, expected_slippage_percent=settings.expected_slippage_percent,
+    )
+    return net_pct >= settings.early_profit_arm_percent
