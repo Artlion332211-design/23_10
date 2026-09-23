@@ -98,7 +98,8 @@ class PaperBroker:
         return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id=f"paper-{request.client_order_id}")
 
     async def cancel(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
-        if client_order_id not in self._resting:
+        request = self._resting.get(client_order_id)
+        if request is None:
             # Mirrors live: cancelling an order Binance no longer considers
             # open (already filled/cancelled/unknown) comes back rejected,
             # never a silent, unconditional "cancelled".
@@ -106,6 +107,23 @@ class PaperBroker:
                 accepted=False, status=OrderStatus.REJECTED,
                 error_message="paper order not found (already resolved)",
             )
+        current_price = await self._price_source(symbol)
+        if self._is_marketable(request, current_price):
+            # Mirrors live: a cancel that loses the race against a matching
+            # engine which already crossed the limit price comes back
+            # filled (or rejected as "already filled"), never a clean
+            # CANCELED - get_status() already handles this; cancel() must
+            # too, since callers besides check_pending_limit_orders' own
+            # get_status-then-cancel timeout sequence now call cancel()
+            # directly (see StrategyEngine._cancel_resting_orders_for_position,
+            # used by the hard profit-ceiling backstop and emergency
+            # liquidation). Without this check, PAPER would silently report
+            # a phantom empty cancel and force-close the stale pre-fill
+            # quantity instead of the true remainder - exactly the scenario
+            # those callers exist to handle correctly.
+            del self._resting[client_order_id]
+            assert request.limit_price is not None
+            return self._fill_at(request, request.limit_price)
         del self._resting[client_order_id]
         return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id=f"paper-{client_order_id}")
 

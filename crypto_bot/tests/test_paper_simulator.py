@@ -102,6 +102,35 @@ def test_cancel_removes_resting_order(settings):
     assert not status.accepted  # order no longer tracked
 
 
+def test_cancel_fills_instead_when_price_already_crossed_the_limit(settings):
+    """Mirrors get_status(): a cancel that loses the race against a price
+    that already crossed the limit must fill, not silently report a clean
+    zero-fill CANCELED - StrategyEngine._cancel_resting_orders_for_position
+    (used by the hard profit-ceiling backstop and emergency liquidation)
+    calls cancel() directly, with no prior get_status() call, so this path
+    must get the marketability check on its own."""
+    prices = {"value": Decimal("110")}
+
+    async def moving_price(symbol: str) -> Decimal:
+        return prices["value"]
+
+    broker = PaperBroker(settings, moving_price, starting_balance=Decimal("1000"))
+    request = OrderRequest(
+        symbol="SOLUSDT", side=OrderSide.BUY, order_type=OrderType.LIMIT, client_order_id="c6",
+        quantity=Decimal("1"), limit_price=Decimal("100"),
+    )
+    asyncio.run(broker.submit(request))
+
+    prices["value"] = Decimal("99")  # price drops through the limit before the cancel arrives
+    cancel_result = asyncio.run(broker.cancel("SOLUSDT", client_order_id="c6"))
+
+    assert cancel_result.status == OrderStatus.FILLED
+    assert cancel_result.avg_fill_price == Decimal("100")
+    assert broker.account.holdings["SOL"] == cancel_result.net_base_quantity
+    status = asyncio.run(broker.get_status("SOLUSDT", client_order_id="c6"))
+    assert not status.accepted  # order no longer tracked (filled and removed by cancel())
+
+
 def test_paper_broker_integrates_with_real_execution_engine(db_engine, settings):
     """PaperBroker must satisfy the OrderExecutor protocol well enough for
     the real ExecutionEngine (rounding, DB persistence, DRY_RUN gating) -
