@@ -237,6 +237,19 @@ class BinanceExecutionAdapter:
         except (BinanceAPIException, BinanceRequestException) as exc:
             logger.error("Order rejected by Binance: %s %s", request, exc)
             return ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message=str(exc))
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            # Unlike the rejection above, a raw network failure here means we
+            # genuinely don't know whether Binance received and accepted this
+            # order - the response, not necessarily the order, was lost.
+            # Reporting REJECTED would be actively misleading (a caller could
+            # trust that nothing happened when it might have); reporting NEW
+            # leaves the write-ahead Order row (already committed before this
+            # call - see module docstring) exactly where a genuinely-still-
+            # pending order would be, for the startup reconciliation service
+            # (or, for a LIMIT order, the next check_pending_limit_orders
+            # poll - see ExecutionEngine.buy()/sell()) to resolve for real.
+            logger.error("Network error submitting order to Binance: %s %s", request, exc)
+            return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
 
         # The order-*placement* response is the one Binance response that
         # does carry `fills` directly - no extra round-trip needed here.
@@ -247,7 +260,7 @@ class BinanceExecutionAdapter:
         filters = await self._client.get_symbol_filters(symbol)
         try:
             raw = await self._client.cancel_order(symbol=symbol, origClientOrderId=client_order_id)
-        except (BinanceAPIException, BinanceRequestException) as exc:
+        except (BinanceAPIException, BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
             # Binance rejects a cancel for more than one reason - "still
             # resting" is only one of them; "already FILLED" or "already
             # CANCELED" reject too, with the same exception type. Blindly
@@ -268,7 +281,7 @@ class BinanceExecutionAdapter:
         filters = await self._client.get_symbol_filters(symbol)
         try:
             raw = await self._client.get_order_status(symbol, orig_client_order_id=client_order_id)
-        except (BinanceAPIException, BinanceRequestException) as exc:
+        except (BinanceAPIException, BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
             # Treat "couldn't confirm status" as still-pending (like `cancel`'s
             # failure path below), never as resolved - `check_pending_limit_orders`
             # would otherwise have to interpret an unrelated exception as
@@ -307,7 +320,7 @@ class BinanceExecutionAdapter:
             return [], False
         try:
             trades = await self._client.get_my_trades(symbol, order_id=str(order_id))
-        except (BinanceAPIException, BinanceRequestException) as exc:
+        except (BinanceAPIException, BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
             logger.warning("get_my_trades failed for %s/order %s: %s", symbol, order_id, exc)
             return [], True
         if not trades:
@@ -533,52 +546,71 @@ class ExecutionEngine:
             self._pending_limit_orders[client_order_id] = (symbol, utcnow())
         return result
 
+    def _should_keep_retrying_incomplete_result(
+        self, result: ExecutionResult, *, symbol: str, client_order_id: str, age: float, timeout: float
+    ) -> bool:
+        """True if `result` reports a terminal status but with
+        `fill_data_incomplete=True` - i.e. it must NOT be treated as a final
+        answer yet, per `ExecutionResult.fill_data_incomplete`'s own
+        contract - UNLESS this order has been stuck long enough that giving
+        up (and resolving anyway, still carrying the incomplete flag so the
+        caller can alert a human) beats retrying silently forever. Shared by
+        every place `check_pending_limit_orders` below obtains a result that
+        could turn out terminal-but-incomplete (both the `get_status` poll
+        and the `cancel`-on-timeout call), so neither path can persist a
+        phantom-empty result as final while the other one retries.
+        """
+        if not (result.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED) and result.fill_data_incomplete):
+            return False
+        if age < timeout * _FILL_DATA_GIVEUP_MULTIPLIER:
+            logger.warning(
+                "LIMIT order %s/%s reports %s with incomplete fill data, will retry (age=%.0fs)",
+                symbol, client_order_id, result.status.value, age,
+            )
+            return True
+        logger.error(
+            "LIMIT order %s/%s stuck reporting %s with incomplete fill data for %.0fs - giving up and "
+            "resolving anyway; manual reconciliation against the exchange may be needed",
+            symbol, client_order_id, result.status.value, age,
+        )
+        return False
+
     async def check_pending_limit_orders(self) -> list[tuple[str, str, ExecutionResult]]:
         """Poll resting LIMIT orders; cancel any that have sat unfilled past
         `LIMIT_ORDER_TIMEOUT_SECONDS`. Returns (symbol, client_order_id, result)
         for every order that was cancelled or discovered filled, so the
         caller (StrategyEngine) can react (retry as MARKET, finalize a
-        position, etc).
+        position, etc). One order's exception is logged and skipped rather
+        than aborting the poll for every other pending order this cycle.
         """
         timeout = self._settings.limit_order_timeout_seconds
         now = utcnow()
         resolved: list[tuple[str, str, ExecutionResult]] = []
         for client_order_id, (symbol, placed_at) in list(self._pending_limit_orders.items()):
             age = (now - placed_at).total_seconds()
-            status = await self._executor.get_status(symbol, client_order_id=client_order_id)
-            if status.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED) and status.fill_data_incomplete:
-                # Exchange confirms a terminal status but the real fill
-                # breakdown wasn't fetchable this cycle - retry rather than
-                # resolving off a phantom zero-quantity result. Not
-                # cancellable anymore either way, so the timeout check below
-                # is skipped too - UNLESS this has been stuck long enough
-                # that continuing to retry silently forever is worse than
-                # resolving with what little data is available: at that
-                # point, resolve anyway (status.fill_data_incomplete stays
-                # True on the returned result) so the caller can at least
-                # alert a human to reconcile the order manually.
-                if age < timeout * _FILL_DATA_GIVEUP_MULTIPLIER:
-                    logger.warning(
-                        "LIMIT order %s/%s reports %s with incomplete fill data, will retry (age=%.0fs)",
-                        symbol, client_order_id, status.status.value, age,
-                    )
+            try:
+                status = await self._executor.get_status(symbol, client_order_id=client_order_id)
+                if self._should_keep_retrying_incomplete_result(
+                    status, symbol=symbol, client_order_id=client_order_id, age=age, timeout=timeout
+                ):
                     continue
-                logger.error(
-                    "LIMIT order %s/%s stuck reporting %s with incomplete fill data for %.0fs - giving up and "
-                    "resolving anyway; manual reconciliation against the exchange may be needed",
-                    symbol, client_order_id, status.status.value, age,
-                )
-            if status.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
-                del self._pending_limit_orders[client_order_id]
-                self._persist_result_by_client_id(client_order_id, status)
-                resolved.append((symbol, client_order_id, status))
-                continue
-            if age >= timeout:
-                logger.info("LIMIT order %s/%s timed out after %.0fs, cancelling", symbol, client_order_id, age)
-                cancel_result = await self._executor.cancel(symbol, client_order_id=client_order_id)
-                del self._pending_limit_orders[client_order_id]
-                self._persist_result_by_client_id(client_order_id, cancel_result)
-                resolved.append((symbol, client_order_id, cancel_result))
+                if status.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    del self._pending_limit_orders[client_order_id]
+                    self._persist_result_by_client_id(client_order_id, status)
+                    resolved.append((symbol, client_order_id, status))
+                    continue
+                if age >= timeout:
+                    logger.info("LIMIT order %s/%s timed out after %.0fs, cancelling", symbol, client_order_id, age)
+                    cancel_result = await self._executor.cancel(symbol, client_order_id=client_order_id)
+                    if self._should_keep_retrying_incomplete_result(
+                        cancel_result, symbol=symbol, client_order_id=client_order_id, age=age, timeout=timeout
+                    ):
+                        continue
+                    del self._pending_limit_orders[client_order_id]
+                    self._persist_result_by_client_id(client_order_id, cancel_result)
+                    resolved.append((symbol, client_order_id, cancel_result))
+            except Exception as exc:  # noqa: BLE001 - one bad order must never block polling every other one
+                logger.exception("Failed to poll pending LIMIT order %s/%s: %r", symbol, client_order_id, exc)
         return resolved
 
     def restore_pending_limit_order(self, order: Order) -> None:

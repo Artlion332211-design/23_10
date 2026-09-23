@@ -87,7 +87,11 @@ def test_wide_spread_uses_limit_order_and_times_out(db_engine, settings, sol_fil
     assert executor.submitted[0].order_type.value == "LIMIT"
     assert len(engine._pending_limit_orders) == 1
 
-    asyncio.run(asyncio.sleep(1.1))
+    # Backdate placed_at past the 1s timeout instead of a real sleep, which
+    # left only ~100ms of margin and could flake under a loaded/parallel
+    # CI runner.
+    client_order_id, (symbol, _placed_at) = next(iter(engine._pending_limit_orders.items()))
+    engine._pending_limit_orders[client_order_id] = (symbol, utcnow() - timedelta(seconds=1.1))
     resolved = asyncio.run(engine.check_pending_limit_orders())
     assert len(resolved) == 1
     assert resolved[0][2].status == OrderStatus.CANCELED
@@ -122,11 +126,13 @@ def test_notional_too_small_is_rejected_before_touching_exchange(db_engine, sett
 
 class _ScriptedExecutor:
     """Returns a scripted sequence of get_status() results (repeating the
-    last one once exhausted) - for exercising retry/give-up timing
-    precisely, independent of FakeExecutor's fixed always-fills behavior."""
+    last one once exhausted), and an independently scriptable cancel()
+    result - for exercising retry/give-up timing precisely, independent of
+    FakeExecutor's fixed always-fills behavior."""
 
-    def __init__(self, results: list[ExecutionResult]):
+    def __init__(self, results: list[ExecutionResult], *, cancel_results: list[ExecutionResult] | None = None):
         self._results = list(results)
+        self._cancel_results = list(cancel_results) if cancel_results is not None else None
         self.get_status_calls = 0
         self.cancel_calls: list[str] = []
 
@@ -135,6 +141,9 @@ class _ScriptedExecutor:
 
     async def cancel(self, symbol, *, client_order_id):
         self.cancel_calls.append(client_order_id)
+        if self._cancel_results is not None:
+            idx = min(len(self.cancel_calls) - 1, len(self._cancel_results) - 1)
+            return self._cancel_results[idx]
         return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id="124")
 
     async def get_status(self, symbol, *, client_order_id):
@@ -177,6 +186,7 @@ def test_reconcile_pending_order_does_not_persist_a_phantom_filled_status(db_eng
 
 
 def test_check_pending_limit_orders_retries_incomplete_fill_data_then_gives_up(db_engine, settings, filters_provider):
+    _seed_order("bot-stuck-1")
     tuned = settings.model_copy(update={"limit_order_timeout_seconds": 1})
     incomplete = ExecutionResult(accepted=True, status=OrderStatus.FILLED, exchange_order_id="1", fill_data_incomplete=True)
     executor = _ScriptedExecutor([incomplete])
@@ -186,6 +196,8 @@ def test_check_pending_limit_orders_retries_incomplete_fill_data_then_gives_up(d
     resolved = asyncio.run(engine.check_pending_limit_orders())
     assert resolved == []  # still within the retry window - not yet given up
     assert "bot-stuck-1" in engine._pending_limit_orders
+    with session_scope() as session:
+        assert OrderRepository(session).get_by_client_id("bot-stuck-1").status == OrderStatus.NEW
 
     # Backdate placed_at past the give-up window (5x the 1s timeout) instead
     # of sleeping in the test.
@@ -195,6 +207,37 @@ def test_check_pending_limit_orders_retries_incomplete_fill_data_then_gives_up(d
     assert len(resolved) == 1
     assert resolved[0][2].fill_data_incomplete is True
     assert "bot-stuck-1" not in engine._pending_limit_orders
+    with session_scope() as session:
+        assert OrderRepository(session).get_by_client_id("bot-stuck-1").status == OrderStatus.FILLED
+
+
+def test_check_pending_limit_orders_retries_a_cancel_that_comes_back_with_incomplete_fill_data(
+    db_engine, settings, filters_provider,
+):
+    """The cancel()-on-timeout branch must apply the exact same incomplete-
+    fill-data retry treatment as the get_status() poll above it - a resting
+    order that ages past the timeout, whose cancel() call comes back
+    reporting CANCELED but with the real fill breakdown unobtainable (e.g. a
+    genuine partial fill right as the cancel raced it, and a transient
+    myTrades failure), must not be silently persisted as a clean zero-fill
+    cancel - that would permanently lose the partial fill."""
+    _seed_order("bot-cancel-incomplete")
+    tuned = settings.model_copy(update={"limit_order_timeout_seconds": 1})
+    still_new = ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id="1")
+    incomplete_cancel = ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id="1", fill_data_incomplete=True)
+    executor = _ScriptedExecutor([still_new], cancel_results=[incomplete_cancel])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=tuned, dry_run=False)
+    # Past the 1s timeout (triggers the cancel branch) but well under the
+    # 5x give-up window (5s), so this must still retry, not resolve.
+    engine._pending_limit_orders["bot-cancel-incomplete"] = ("SOLUSDT", utcnow() - timedelta(seconds=2))
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert resolved == []  # the incomplete cancel result must not be resolved as final
+    assert "bot-cancel-incomplete" in engine._pending_limit_orders
+    assert executor.cancel_calls == ["bot-cancel-incomplete"]
+    with session_scope() as session:
+        assert OrderRepository(session).get_by_client_id("bot-cancel-incomplete").status == OrderStatus.NEW
 
 
 def test_execution_engine_cancel_persists_and_clears_pending_tracking(db_engine, settings, sol_filters, filters_provider):

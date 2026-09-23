@@ -161,7 +161,12 @@ class BinanceClient:
                 return True
             if isinstance(exc, BinanceAPIException):
                 return exc.status_code in RATE_LIMIT_STATUS_CODES or exc.status_code >= 500
-            return isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError))
+            # OSError, not just its more specific ConnectionError/TimeoutError
+            # subclasses - a DNS failure (socket.gaierror) or "Network is
+            # unreachable" surfaces as a bare OSError, and the except clause
+            # below already catches OSError broadly, so it must be retryable
+            # too or those errors get zero retry/backoff on attempt 1.
+            return isinstance(exc, (TimeoutError, ConnectionError, OSError, asyncio.TimeoutError))
 
         max_attempts = 5
         last_exc: BaseException | None = None
