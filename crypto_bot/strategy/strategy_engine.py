@@ -436,7 +436,13 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     async def manage_position(
-        self, position_id: int, *, btc_regime: RegimeAssessment, current_price: Decimal, order_book: OrderBookSnapshot
+        self,
+        position_id: int,
+        *,
+        btc_regime: RegimeAssessment,
+        current_price: Decimal,
+        order_book: OrderBookSnapshot,
+        trading_balance_usdt: Decimal,
     ) -> None:
         with session_scope() as session:
             position = PositionRepository(session).get(position_id)
@@ -494,14 +500,11 @@ class StrategyEngine:
                 if trailing_is_early else self._settings.trailing_distance_percent
             )
             if should_exit_trailing(current_price, new_peak, distance):
-                result = await self._execution_engine.sell(
-                    symbol=symbol, quantity=total_qty, reference_price=current_price,
-                    spread_percent=order_book.spread_percent, purpose=OrderPurpose.TRAILING_STOP, position_id=position_id,
+                await self._submit_and_apply_sell(
+                    position_id, symbol=symbol, quantity=total_qty, reference_price=current_price,
+                    spread_percent=order_book.spread_percent, purpose=OrderPurpose.TRAILING_STOP,
+                    reason="TRAILING_STOP", error_context="SELL order",
                 )
-                if not result.accepted:
-                    await self._notifier.on_error(f"SELL order for {symbol} failed: {result.error_message}")
-                    return
-                await self._apply_sell_result(position_id, result=result, reason="TRAILING_STOP")
             return
 
         if should_arm_early_protection(avg_entry_price=avg_entry, current_price=current_price, settings=self._settings):
@@ -518,28 +521,22 @@ class StrategyEngine:
                 partial_qty = (total_qty * self._settings.trailing_partial_close_fraction).quantize(
                     Decimal("0.00000001"), rounding=ROUND_DOWN
                 )
-                result = await self._execution_engine.sell(
-                    symbol=symbol, quantity=partial_qty, reference_price=current_price,
-                    spread_percent=order_book.spread_percent, purpose=OrderPurpose.TAKE_PROFIT, position_id=position_id,
+                outcome = await self._submit_and_apply_sell(
+                    position_id, symbol=symbol, quantity=partial_qty, reference_price=current_price,
+                    spread_percent=order_book.spread_percent, purpose=OrderPurpose.TAKE_PROFIT,
+                    reason="TAKE_PROFIT", error_context="Partial take-profit",
                 )
-                if not result.accepted:
-                    await self._notifier.on_error(f"Partial take-profit for {symbol} failed: {result.error_message}")
-                    return
-                outcome = await self._apply_sell_result(position_id, result=result, reason="TAKE_PROFIT")
                 if outcome is not None and not outcome[1]:
                     with session_scope() as session:
                         p = PositionRepository(session).get(position_id)
                         assert p is not None
                         PositionRepository(session).set_trailing(p, active=True, peak_price=current_price)
                 return
-            result = await self._execution_engine.sell(
-                symbol=symbol, quantity=total_qty, reference_price=current_price,
-                spread_percent=order_book.spread_percent, purpose=OrderPurpose.TAKE_PROFIT, position_id=position_id,
+            await self._submit_and_apply_sell(
+                position_id, symbol=symbol, quantity=total_qty, reference_price=current_price,
+                spread_percent=order_book.spread_percent, purpose=OrderPurpose.TAKE_PROFIT,
+                reason="TAKE_PROFIT", error_context="SELL order",
             )
-            if not result.accepted:
-                await self._notifier.on_error(f"SELL order for {symbol} failed: {result.error_message}")
-                return
-            await self._apply_sell_result(position_id, result=result, reason="TAKE_PROFIT")
             return
 
         level = next_dca_level(
@@ -550,7 +547,9 @@ class StrategyEngine:
 
         decision = await self.evaluate_candidate(symbol, btc_regime=btc_regime)
         liquidity_check = check_liquidity_fresh(order_book, self._settings)
-        dca_risk = self._risk_manager.can_dca(regime=btc_regime)
+        dca_risk = self._risk_manager.can_dca(
+            regime=btc_regime, requested_usdt=level.size_usdt, trading_balance_usdt=trading_balance_usdt
+        )
         dca_decision = evaluate_dca(
             current_price=current_price, avg_entry_price=avg_entry, dca_count_done=dca_count,
             current_position_cost_usdt=total_cost, settings=self._settings, score_breakdown=decision.breakdown,
@@ -685,6 +684,36 @@ class StrategyEngine:
             )
         return slice_pnl, fully_closed
 
+    async def _submit_and_apply_sell(
+        self,
+        position_id: int,
+        *,
+        symbol: str,
+        quantity: Decimal,
+        reference_price: Decimal,
+        spread_percent: Decimal,
+        purpose: OrderPurpose,
+        reason: str,
+        error_context: str,
+    ) -> tuple[Decimal, bool] | None:
+        """Submits a SELL and, if accepted, applies whatever it filled via
+        `_apply_sell_result` - the "submit -> check accepted -> notify on
+        rejection -> apply the fill" sequence every exit path (trailing-
+        stop, full/partial take-profit, the hard profit-ceiling backstop,
+        emergency liquidation) needs, so a future change to how a
+        rejected/partial sell is handled only has to be made once. Returns
+        `_apply_sell_result`'s own `(slice_pnl, fully_closed)` on success,
+        or `None` if the exchange rejected the order outright (already
+        notified) or nothing ended up filled."""
+        result = await self._execution_engine.sell(
+            symbol=symbol, quantity=quantity, reference_price=reference_price,
+            spread_percent=spread_percent, purpose=purpose, position_id=position_id,
+        )
+        if not result.accepted:
+            await self._notifier.on_error(f"{error_context} for {symbol} failed: {result.error_message}")
+            return None
+        return await self._apply_sell_result(position_id, result=result, reason=reason)
+
     async def _cancel_resting_orders_for_position(
         self, position_id: int, symbol: str, *, btc_regime: RegimeAssessment
     ) -> None:
@@ -726,15 +755,11 @@ class StrategyEngine:
             quantity = position.total_quantity
         if quantity <= 0:
             return
-        result = await self._execution_engine.sell(
-            symbol=symbol, quantity=quantity, reference_price=current_price,
+        await self._submit_and_apply_sell(
+            position_id, symbol=symbol, quantity=quantity, reference_price=current_price,
             spread_percent=Decimal("0"),  # force MARKET: a hard safety-net close must not wait in a resting LIMIT order
-            purpose=OrderPurpose.HARD_CEILING, position_id=position_id,
+            purpose=OrderPurpose.HARD_CEILING, reason="HARD_PROFIT_CEILING", error_context="Hard profit-ceiling SELL",
         )
-        if not result.accepted:
-            await self._notifier.on_error(f"Hard profit-ceiling SELL for {symbol} failed: {result.error_message}")
-            return
-        await self._apply_sell_result(position_id, result=result, reason="HARD_PROFIT_CEILING")
 
     async def emergency_liquidate_all(
         self, *, order_books: dict[str, OrderBookSnapshot], btc_regime: RegimeAssessment
@@ -766,16 +791,13 @@ class StrategyEngine:
                 quantity = position.total_quantity
             if quantity <= 0:
                 continue
-            result = await self._execution_engine.sell(
-                symbol=symbol, quantity=quantity, reference_price=order_book.mid_price,
+            outcome = await self._submit_and_apply_sell(
+                position_id, symbol=symbol, quantity=quantity, reference_price=order_book.mid_price,
                 spread_percent=Decimal("0"),  # force MARKET: an emergency sell must not wait in a resting LIMIT order
-                purpose=OrderPurpose.EMERGENCY_SELL, position_id=position_id,
+                purpose=OrderPurpose.EMERGENCY_SELL, reason="EMERGENCY_SELL", error_context="Emergency SELL",
             )
-            if not result.accepted:
+            if outcome is None:
                 failed.append(symbol)
-                await self._notifier.on_error(f"Emergency SELL for {symbol} failed: {result.error_message}")
-                continue
-            await self._apply_sell_result(position_id, result=result, reason="EMERGENCY_SELL")
         return failed
 
     # ------------------------------------------------------------------

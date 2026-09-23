@@ -202,15 +202,15 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # /resume to recover - so this must also clear emergency_stop itself,
     # not just the buy-pause flag, or the kill switch can never be undone
     # from Telegram (can_open_new_position()/can_dca() check emergency_stop
-    # independently of buy_paused, and nothing else in the app ever calls
-    # RiskManager.clear_emergency_stop()). emergency_stop() also pauses DCA
+    # independently of buy_paused). emergency_stop() also pauses DCA
     # (dca_paused=True) alongside buy_paused - resume must undo that too, or
     # DCA on already-open positions stays silently disabled forever after
     # the first /emergency_stop, with no separate command telling the
-    # operator that /start_dca is still needed.
-    risk_manager.resume_buys()
-    risk_manager.start_dca()
-    risk_manager.clear_emergency_stop()
+    # operator that /start_dca is still needed. One bundled, atomic call
+    # (mirroring trigger_emergency_stop()'s own single transaction) rather
+    # than three separate ones - a failure partway through must never leave
+    # these three flags silently inconsistent.
+    risk_manager.resume_trading()
     await _reply(update, "Нові купівлі та DCA відновлено. Аварійну зупинку (якщо була активна) знято.")
 
 

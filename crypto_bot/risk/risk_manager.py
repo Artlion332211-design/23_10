@@ -96,6 +96,20 @@ class RiskManager:
         with session_scope() as session:
             SettingsRepository(session).set_bool(KEY_EMERGENCY_STOP, False)
 
+    def resume_trading(self) -> None:
+        """The full undo of `trigger_emergency_stop()` plus a plain
+        `/pause`: clears buy_paused, dca_paused, and emergency_stop in one
+        atomic transaction - mirroring `trigger_emergency_stop()`'s own
+        bundled write. Kept as one DB commit (rather than three separate
+        `resume_buys()`/`start_dca()`/`clear_emergency_stop()` calls, each
+        its own transaction) so a failure partway through can never leave
+        the flags in a silently inconsistent, partially-resumed state."""
+        with session_scope() as session:
+            repo = SettingsRepository(session)
+            repo.set_bool(KEY_BUY_PAUSED, False)
+            repo.set_bool(KEY_DCA_PAUSED, False)
+            repo.set_bool(KEY_EMERGENCY_STOP, False)
+
     def register_trade_result(self, *, is_win: bool) -> int:
         """Call once per closed position. Returns the updated consecutive
         bad-trade count. Resets to 0 on a win; a losing streak reaching
@@ -174,16 +188,47 @@ class RiskManager:
 
         return RiskDecision(allowed=not reasons, reasons=reasons or ["risk checks passed"])
 
-    def can_dca(self, *, regime: RegimeAssessment) -> RiskDecision:
-        with session_scope() as session:
-            flags = self._read_flags(SettingsRepository(session))
-
+    def can_dca(
+        self, *, regime: RegimeAssessment, requested_usdt: Decimal, trading_balance_usdt: Decimal
+    ) -> RiskDecision:
+        """`requested_usdt`/`trading_balance_usdt` mirror `can_open_new_position`'s
+        exposure/daily-capital checks - a DCA fill deploys new capital just
+        like a fresh entry does (both call `record_new_capital_deployed`),
+        so MAX_TOTAL_EXPOSURE_PERCENT/MAX_DAILY_NEW_CAPITAL_USDT must bound
+        DCA too, not only new positions. `evaluate_dca`'s own
+        MAX_POSITION_USDT check is a separate, per-position limit and stays
+        there."""
         reasons: list[str] = []
-        if flags.emergency_stop:
-            reasons.append("emergency stop is active (/emergency_stop)")
-        if flags.dca_paused:
-            reasons.append("DCA is paused (/stop_dca)")
-        crash_policy = apply_crash_policy(regime, self._settings)
-        if crash_policy.dca_paused:
-            reasons.append(crash_policy.reason or "market crash policy blocks DCA")
+        with session_scope() as session:
+            settings_repo = SettingsRepository(session)
+            position_repo = PositionRepository(session)
+            flags = self._read_flags(settings_repo)
+
+            if flags.emergency_stop:
+                reasons.append("emergency stop is active (/emergency_stop)")
+            if flags.dca_paused:
+                reasons.append("DCA is paused (/stop_dca)")
+            crash_policy = apply_crash_policy(regime, self._settings)
+            if crash_policy.dca_paused:
+                reasons.append(crash_policy.reason or "market crash policy blocks DCA")
+
+            total_open_cost, _ = current_exposure(position_repo, trading_balance_usdt)
+            if trading_balance_usdt > 0:
+                projected_pct = (total_open_cost + requested_usdt) / trading_balance_usdt * 100
+            else:
+                projected_pct = Decimal("100")
+            if projected_pct > self._settings.max_total_exposure_percent:
+                reasons.append(
+                    f"would push exposure to {projected_pct:.1f}% "
+                    f"(max {self._settings.max_total_exposure_percent}%)"
+                )
+
+            today = utcnow().date().isoformat()
+            daily_deployed = get_daily_new_capital(settings_repo, today)
+            if daily_deployed + requested_usdt > self._settings.max_daily_new_capital_usdt:
+                reasons.append(
+                    f"would exceed MAX_DAILY_NEW_CAPITAL_USDT for {today} "
+                    f"({daily_deployed + requested_usdt} > {self._settings.max_daily_new_capital_usdt})"
+                )
+
         return RiskDecision(allowed=not reasons, reasons=reasons or ["DCA risk checks passed"])

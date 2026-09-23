@@ -248,8 +248,11 @@ class BotRuntime:
 
         regime = self._btc_regime or _default_neutral_regime()
         try:
-            order_book = await self._get_order_book(symbol)
-            trading_balance = await self._trading_balance_usdt()
+            # Independent REST round trips - run concurrently rather than
+            # paying both latencies back-to-back on this candle-close path.
+            order_book, trading_balance = await asyncio.gather(
+                self._get_order_book(symbol), self._trading_balance_usdt()
+            )
             decision = await self._strategy_engine.try_open_position(
                 symbol, btc_regime=regime, trading_balance_usdt=trading_balance,
                 order_book=order_book, open_position_symbols=open_symbols,
@@ -283,6 +286,12 @@ class BotRuntime:
 
         with session_scope() as session:
             open_positions = [(p.id, p.symbol) for p in PositionRepository(session).get_open_positions()]
+        if not open_positions:
+            return
+        # Fetched once per cycle, not once per position - manage_position
+        # needs it to gate DCA against MAX_TOTAL_EXPOSURE_PERCENT/
+        # MAX_DAILY_NEW_CAPITAL_USDT the same way entry evaluation already does.
+        trading_balance = await self._trading_balance_usdt()
         for position_id, symbol in open_positions:
             try:
                 order_book = await self._get_order_book(symbol)
@@ -290,6 +299,7 @@ class BotRuntime:
                     continue
                 await self._strategy_engine.manage_position(
                     position_id, btc_regime=regime, current_price=order_book.mid_price, order_book=order_book,
+                    trading_balance_usdt=trading_balance,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad symbol must not block managing the rest
                 logger.exception("Position monitor failed for %s: %r", symbol, exc)

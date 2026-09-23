@@ -70,6 +70,47 @@ def test_evaluate_entry_skips_when_an_entry_order_is_already_resting(db_engine, 
     strategy_engine.try_open_position.assert_not_called()
 
 
+def test_monitor_open_positions_isolates_one_bad_symbol_from_the_rest(db_engine, settings, rules):
+    """_monitor_open_positions wraps each open position's management in its
+    own try/except specifically so one bad symbol (here: a failed order-
+    book fetch) can never block managing every other open position that
+    cycle - this was previously never exercised by any test."""
+    with session_scope() as session:
+        PositionRepository(session).create(
+            symbol="BADUSDT", opened_at=utcnow(), avg_entry_price=Decimal("100"),
+            total_quantity=Decimal("1"), total_cost_usdt=Decimal("100"), target_price=Decimal("110"),
+        )
+        PositionRepository(session).create(
+            symbol="GOODUSDT", opened_at=utcnow(), avg_entry_price=Decimal("50"),
+            total_quantity=Decimal("1"), total_cost_usdt=Decimal("50"), target_price=Decimal("55"),
+        )
+    strategy_engine = MagicMock()
+    strategy_engine.process_resolved_orders = AsyncMock()
+    strategy_engine.manage_position = AsyncMock()
+    paper_broker = MagicMock()
+    paper_broker.account.usdt_balance = Decimal("10000")
+    notifier = MagicMock()
+    notifier.on_error = AsyncMock()
+    runtime = _make_runtime(
+        settings, rules, strategy_engine=strategy_engine, paper_broker=paper_broker, notifier=notifier
+    )
+
+    good_book = MagicMock()
+    good_book.is_empty = False
+    good_book.mid_price = Decimal("50")
+
+    async def fake_get_order_book(symbol):
+        if symbol == "BADUSDT":
+            raise RuntimeError("simulated order-book fetch failure")
+        return good_book
+
+    runtime._get_order_book = fake_get_order_book
+
+    asyncio.run(runtime._monitor_open_positions())
+
+    assert strategy_engine.manage_position.call_count == 1  # GOODUSDT still got managed despite BADUSDT failing
+
+
 def test_evaluate_entry_respects_max_open_positions(db_engine, settings, rules):
     tuned = settings.model_copy(update={"max_open_positions": 1})
     with session_scope() as session:

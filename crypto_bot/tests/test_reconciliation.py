@@ -75,6 +75,29 @@ class _StatusExecutor:
         return self._status
 
 
+class _PerOrderStatusExecutor:
+    """get_status() raises for one specific client_order_id and returns a
+    fixed status for every other one - for verifying reconcile_live's
+    per-order try/except actually isolates one bad order from the rest."""
+
+    def __init__(self, *, raise_for: str, status: ExecutionResult) -> None:
+        self._raise_for = raise_for
+        self._status = status
+        self.get_status_calls: list[str] = []
+
+    async def submit(self, request):  # pragma: no cover - must never be called
+        raise AssertionError("submit should never be called during reconciliation")
+
+    async def cancel(self, symbol, *, client_order_id):  # pragma: no cover - must never be called
+        raise AssertionError("cancel should never be called during reconciliation")
+
+    async def get_status(self, symbol, *, client_order_id):
+        self.get_status_calls.append(client_order_id)
+        if client_order_id == self._raise_for:
+            raise RuntimeError("simulated Binance failure for this one order")
+        return self._status
+
+
 def _seed_pending_order(client_order_id: str) -> None:
     with session_scope() as session:
         order = OrderRepository(session).create(
@@ -174,6 +197,29 @@ def test_reconcile_live_applies_a_fill_discovered_while_offline(db_engine, setti
         order = OrderRepository(session).get_by_client_id("pending-entry")
         assert order is not None
         assert order.position_id == position.id
+
+
+def test_reconcile_live_isolates_one_bad_order_from_the_rest(db_engine, settings, filters_provider):
+    """reconcile_live wraps each pending order in its own try/except
+    specifically so one bad order can never abort startup reconciliation
+    for every other resting order - this must actually hold with 2+ orders
+    present, not just the single-order case every other test here uses."""
+    _seed_pending_order("pending-good")
+    _seed_pending_order("pending-bad")
+    executor = _PerOrderStatusExecutor(
+        raise_for="pending-bad",
+        status=ExecutionResult(accepted=True, status=OrderStatus.FILLED, exchange_order_id="999"),
+    )
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+
+    report = asyncio.run(reconcile_live(_FakeClient({}), engine, _stub_strategy_engine()))
+
+    assert report.resolved_orders == ["pending-good"]
+    assert any("pending-bad" in note for note in report.notes)
+    assert set(executor.get_status_calls) == {"pending-good", "pending-bad"}
+    with session_scope() as session:
+        assert OrderRepository(session).get_by_client_id("pending-good").status == OrderStatus.FILLED
+        assert OrderRepository(session).get_by_client_id("pending-bad").status == OrderStatus.NEW  # untouched
 
 
 def test_reconcile_paper_rebuilds_balance_and_holdings_from_fill_ledger(db_engine, settings, filters_provider):

@@ -197,7 +197,7 @@ def test_full_buy_dca_take_profit_lifecycle(strategy_setup):
 
     # 2. Price drops 3% -> DCA fires
     executor.price = Decimal("97")
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book, trading_balance_usdt=Decimal("10000")))
 
     with session_scope() as session:
         position = PositionRepository(session).get(position_id)
@@ -208,7 +208,7 @@ def test_full_buy_dca_take_profit_lifecycle(strategy_setup):
 
     # 3. Price recovers past target -> take-profit close
     executor.price = target + Decimal("0.5")
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=executor.price, order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=executor.price, order_book=book, trading_balance_usdt=Decimal("10000")))
 
     with session_scope() as session:
         position = PositionRepository(session).get(position_id)
@@ -240,7 +240,7 @@ def test_manage_position_does_not_resubmit_while_an_order_is_still_resting(strat
     executor.resting = True
     submits_before = executor.submit_calls
 
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book, trading_balance_usdt=Decimal("10000")))
     assert executor.submit_calls == submits_before + 1  # the DCA buy was submitted once and now rests
 
     with session_scope() as session:
@@ -249,7 +249,7 @@ def test_manage_position_does_not_resubmit_while_an_order_is_still_resting(strat
 
     # Same triggering price/condition on the next poll tick - must not
     # submit a second DCA order while the first is still resting.
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("97"), order_book=book, trading_balance_usdt=Decimal("10000")))
     assert executor.submit_calls == submits_before + 1
 
 
@@ -278,7 +278,7 @@ def test_hard_profit_ceiling_force_closes_even_with_a_resting_order_present(stra
         )
 
     executor.price = Decimal("115")  # +15% price move, net profit well past the 12% ceiling after fees/slippage
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=executor.price, order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=executor.price, order_book=book, trading_balance_usdt=Decimal("10000")))
 
     with session_scope() as session:
         position = PositionRepository(session).get(position_id)
@@ -301,17 +301,17 @@ def test_manage_position_sends_drawdown_warnings_once_at_20_and_30_percent(strat
         position_id = PositionRepository(session).get_open_position_for_symbol("SOLUSDT").id
 
     # -25% - crosses the 20% threshold but not 30%
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("75"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("75"), order_book=book, trading_balance_usdt=Decimal("10000")))
     warnings = [e for e in notifier.events if e[0] == "drawdown_warning"]
     assert warnings == [("drawdown_warning", Decimal("25"))]
 
     # still -25% on the next tick - must not re-alert the same threshold
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("75"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("75"), order_book=book, trading_balance_usdt=Decimal("10000")))
     warnings = [e for e in notifier.events if e[0] == "drawdown_warning"]
     assert warnings == [("drawdown_warning", Decimal("25"))]
 
     # -35% - now also crosses 30%
-    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("65"), order_book=book))
+    asyncio.run(strategy.manage_position(position_id, btc_regime=neutral, current_price=Decimal("65"), order_book=book, trading_balance_usdt=Decimal("10000")))
     warnings = [e for e in notifier.events if e[0] == "drawdown_warning"]
     assert warnings == [("drawdown_warning", Decimal("25")), ("drawdown_warning", Decimal("35"))]
 
@@ -319,6 +319,27 @@ def test_manage_position_sends_drawdown_warnings_once_at_20_and_30_percent(strat
         position = PositionRepository(session).get(position_id)
         assert position.drawdown_alert_20_sent is True
         assert position.drawdown_alert_30_sent is True
+
+
+def test_emergency_liquidate_all_closes_positions_and_reports_failures(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    neutral = RegimeAssessment(level=RegimeLevel.NEUTRAL, score=0, reasons=[], crash=False)
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=neutral, trading_balance_usdt=Decimal("10000"), order_book=book
+    ))
+    assert decision.action == "BUY"
+
+    failed = asyncio.run(strategy.emergency_liquidate_all(
+        order_books={"SOLUSDT": book}, btc_regime=neutral,
+    ))
+
+    assert failed == []
+    with session_scope() as session:
+        position = PositionRepository(session).get_open_position_for_symbol("SOLUSDT")
+        assert position is None  # fully closed
+        closed = PositionRepository(session).recent_closed(limit=1)[0]
+        assert closed.close_reason == "EMERGENCY_SELL"
 
 
 def test_crash_regime_blocks_new_entry(strategy_setup):

@@ -30,16 +30,33 @@ def test_basic_buy_allowed(risk_manager):
 
 def test_crash_regime_blocks_buys_and_dca(risk_manager):
     buy = risk_manager.can_open_new_position(requested_usdt=Decimal("100"), trading_balance_usdt=Decimal("1000"), regime=CRASH)
-    dca = risk_manager.can_dca(regime=CRASH)
+    dca = risk_manager.can_dca(regime=CRASH, requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"))
     assert not buy.allowed
     assert not dca.allowed
 
 
 def test_strong_bear_blocks_buys_but_not_dca(risk_manager):
     buy = risk_manager.can_open_new_position(requested_usdt=Decimal("100"), trading_balance_usdt=Decimal("1000"), regime=STRONG_BEAR)
-    dca = risk_manager.can_dca(regime=STRONG_BEAR)
+    dca = risk_manager.can_dca(regime=STRONG_BEAR, requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"))
     assert not buy.allowed
     assert dca.allowed
+
+
+def test_daily_new_capital_cap_blocks_dca_too(risk_manager):
+    """MAX_DAILY_NEW_CAPITAL_USDT must bound DCA fills the same way it
+    bounds fresh entries - both call record_new_capital_deployed(), so a
+    DCA that ignored this cap could deploy unbounded capital past it."""
+    risk_manager.record_new_capital_deployed(Decimal("200"))  # fixture caps the day at 250
+    decision = risk_manager.can_dca(regime=NEUTRAL, requested_usdt=Decimal("100"), trading_balance_usdt=Decimal("10000"))
+    assert not decision.allowed
+    assert any("MAX_DAILY_NEW_CAPITAL" in r for r in decision.reasons)
+
+
+def test_exposure_limit_blocks_oversized_dca(risk_manager):
+    # fixture caps total exposure at 30% of trading balance
+    decision = risk_manager.can_dca(regime=NEUTRAL, requested_usdt=Decimal("350"), trading_balance_usdt=Decimal("1000"))
+    assert not decision.allowed
+    assert any("exposure" in r for r in decision.reasons)
 
 
 def test_exposure_limit_blocks_oversized_request(risk_manager):
@@ -75,7 +92,7 @@ def test_consecutive_losses_auto_pause_and_reset_on_win(risk_manager):
 def test_emergency_stop_blocks_everything_until_cleared(risk_manager):
     risk_manager.trigger_emergency_stop()
     assert not risk_manager.can_open_new_position(requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"), regime=NEUTRAL).allowed
-    assert not risk_manager.can_dca(regime=NEUTRAL).allowed
+    assert not risk_manager.can_dca(regime=NEUTRAL, requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000")).allowed
     risk_manager.clear_emergency_stop()
     risk_manager.resume_buys()
     assert risk_manager.can_open_new_position(requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"), regime=NEUTRAL).allowed
@@ -83,6 +100,6 @@ def test_emergency_stop_blocks_everything_until_cleared(risk_manager):
 
 def test_dca_pause_and_resume(risk_manager):
     risk_manager.stop_dca()
-    assert not risk_manager.can_dca(regime=NEUTRAL).allowed
+    assert not risk_manager.can_dca(regime=NEUTRAL, requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000")).allowed
     risk_manager.start_dca()
-    assert risk_manager.can_dca(regime=NEUTRAL).allowed
+    assert risk_manager.can_dca(regime=NEUTRAL, requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000")).allowed

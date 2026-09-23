@@ -204,11 +204,23 @@ class _BacktestPortfolio:
             reasons.append("insufficient simulated cash")
         return not reasons, reasons
 
-    def can_dca(self, regime: RegimeAssessment) -> tuple[bool, list[str]]:
+    def can_dca(self, requested_usdt: Decimal, regime: RegimeAssessment, day: str) -> tuple[bool, list[str]]:
+        """Mirrors `risk.risk_manager.RiskManager.can_dca`: a DCA fill
+        deploys new capital just like a fresh entry does (both call
+        register_deployed), so MAX_TOTAL_EXPOSURE_PERCENT/
+        MAX_DAILY_NEW_CAPITAL_USDT must bound it too, not only can_open."""
+        reasons: list[str] = []
         crash_policy = apply_crash_policy(regime, self.settings)
         if crash_policy.dca_paused:
-            return False, [crash_policy.reason or "market crash policy blocks DCA"]
-        return True, []
+            reasons.append(crash_policy.reason or "market crash policy blocks DCA")
+        total_open_cost = sum((p.total_cost_usdt for p in self.open_positions.values()), Decimal("0"))
+        projected_pct = (total_open_cost + requested_usdt) / self.cash * 100 if self.cash > 0 else Decimal("100")
+        if projected_pct > self.settings.max_total_exposure_percent:
+            reasons.append("exceeds MAX_TOTAL_EXPOSURE_PERCENT")
+        deployed_today = self.daily_new_capital.get(day, Decimal("0"))
+        if deployed_today + requested_usdt > self.settings.max_daily_new_capital_usdt:
+            reasons.append("exceeds MAX_DAILY_NEW_CAPITAL_USDT")
+        return not reasons, reasons
 
     def register_deployed(self, day: str, amount: Decimal) -> None:
         self.daily_new_capital[day] = self.daily_new_capital.get(day, Decimal("0")) + amount
@@ -541,7 +553,7 @@ class BacktestEngine:
             return
 
         breakdown = self._evaluate_breakdown(symbol, row, ts, regime, symbol_merged)
-        dca_risk_ok, dca_risk_reasons = portfolio.can_dca(regime)
+        dca_risk_ok, dca_risk_reasons = portfolio.can_dca(level.size_usdt, regime, ts.date().isoformat())
         crash_policy = apply_crash_policy(regime, self.settings)
         dca_decision = evaluate_dca(
             current_price=current_price, avg_entry_price=pos.avg_entry_price, dca_count_done=pos.dca_count,
