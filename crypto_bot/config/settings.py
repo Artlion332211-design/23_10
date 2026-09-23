@@ -189,6 +189,12 @@ class Settings(BaseSettings):
     def _validate_consistency(self) -> Settings:
         if not (0 <= self.max_dca_count <= 3):
             raise ValueError("MAX_DCA_COUNT must be between 0 and 3 (controlled DCA, not martingale)")
+        if not (Decimal("0") < self.trailing_partial_close_fraction <= Decimal("1")):
+            raise ValueError(
+                f"TRAILING_PARTIAL_CLOSE_FRACTION must be between 0 (exclusive) and 1 (inclusive), "
+                f"got {self.trailing_partial_close_fraction} - it is a fraction of the position "
+                "(e.g. 0.6 = sell 60%), not a percent, and a value above 1 would sell more than is held"
+            )
         if self.dca_level_1 <= self.dca_level_2 or self.dca_level_2 <= self.dca_level_3:
             raise ValueError(
                 "DCA levels must get progressively deeper: DCA_LEVEL_1 > DCA_LEVEL_2 > DCA_LEVEL_3 "
