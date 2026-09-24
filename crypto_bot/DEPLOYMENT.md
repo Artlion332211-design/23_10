@@ -197,7 +197,53 @@ The bot also proactively pushes a status summary to Telegram three times a
 day (`STATUS_PING_HOUR_*_UTC` in `.env`) specifically so you don't have to
 watch logs to know it's alive - `/status` works on demand too.
 
-## 8. Updating the bot
+## 8. Letting a remote Claude session check on the bot
+
+A Claude Code session running in the cloud (like the one that built this
+bot) has no direct access to this machine - there's no supported way to
+bridge an arbitrary local machine into a cloud conversation. But it *does*
+already have read/write access to this repository's git remote, which is
+enough to answer "what is the bot doing right now" without ever touching
+this machine: a scheduled export writes the bot's current state to a JSON
+file and pushes it to a dedicated branch; the cloud session reads that
+branch whenever you ask it to check.
+
+`tools/export_status.py` is read-only against the bot's own database (it
+never places, cancels, or modifies anything) and writes a snapshot -
+open positions (entry, quantity, target, DCA/trailing state, and current
+unrealized PnL% if a live price is reachable), the last 10 closed trades,
+current risk flags (paused/emergency), and the last 20 warning/error
+events - to `status/latest.json`.
+
+Schedule it to run every 15-30 minutes and push the result to a dedicated
+`bot-status` branch (never the code branch - this is data, not code, and
+would otherwise bury real commits under automated noise):
+
+1. Create a small script, e.g. `C:\crypto_bot_deploy\crypto_bot\push_status.ps1`:
+
+   ```powershell
+   Set-Location C:\crypto_bot_deploy\crypto_bot
+   .venv\Scripts\python.exe tools\export_status.py
+   git add status\latest.json
+   git -c user.email="bot@localhost" -c user.name="crypto_bot" commit -m "status: automated update" --quiet
+   git push origin HEAD:bot-status --quiet
+   ```
+
+2. In Task Scheduler, create a second task (same pattern as [§5, Option B](#option-b---task-scheduler-no-extra-download)):
+   Action = `powershell.exe` with arguments
+   `-ExecutionPolicy Bypass -File C:\crypto_bot_deploy\crypto_bot\push_status.ps1`,
+   Trigger = **Daily, repeat every 15 minutes** (instead of "At startup").
+
+3. First run will fail to push if the `bot-status` branch doesn't exist yet
+   remotely - that's fine, `git push origin HEAD:bot-status` creates it.
+
+From then on, just tell the Claude session watching this project "check
+the bot" / "перевір бота" and it can pull the latest snapshot from that
+branch and answer from real (if up to 15-30 minutes old) data - not live,
+but current enough for a status check, and it costs nothing extra to run
+alongside the DB backup task in [§10](#10-backing-up-the-database).
+
+## 9. Updating the bot
 
 ```powershell
 cd C:\crypto_bot_deploy\crypto_bot
@@ -212,7 +258,7 @@ Back up `data\crypto_bot.db` (see below) before pulling an update you
 haven't reviewed, in case a schema migration needs to be rolled back
 manually.
 
-## 9. Backing up the database
+## 10. Backing up the database
 
 All position/order/PnL history lives in one SQLite file:
 `data\crypto_bot.db`. It's excluded from git on purpose (it's runtime
@@ -226,7 +272,7 @@ Copy-Item C:\crypto_bot_deploy\crypto_bot\data\crypto_bot.db `
 Consider a scheduled daily copy via the same Task Scheduler, independent of
 whether you chose NSSM or Task Scheduler to run the bot itself.
 
-## 10. Before you flip this to real money
+## 11. Before you flip this to real money
 
 This document is only about *keeping the process running*. Read the
 README's **"Before enabling LIVE"** checklist in full before ever setting
