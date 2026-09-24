@@ -111,6 +111,11 @@ flagged - never auto-corrected or auto-sold); in PAPER mode the in-memory
 paper balance is rebuilt from the durable local fill ledger, so restarting
 with open paper positions doesn't lose track of them.
 
+To run this unattended long-term (auto-start on boot, auto-restart on
+crash, log capture) rather than in a foreground terminal, see
+[DEPLOYMENT.md](DEPLOYMENT.md) - it covers running as a persistent Windows
+service.
+
 ## Telegram commands
 
 `TELEGRAM_ALLOWED_USER_ID` is the only user who can issue commands - every
