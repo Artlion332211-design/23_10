@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from risk.correlation import check_correlation_limit
+from risk.correlation import check_correlation_limit, compute_correlation
 
 
 def test_correlation_blocks_when_cluster_limit_reached(rules):
@@ -22,6 +22,21 @@ def test_correlation_blocks_when_cluster_limit_reached(rules):
     )
     assert not check_two_open.passed
     assert check_two_open.max_correlation >= cfg.correlation_threshold
+
+
+def test_correlation_aligns_series_by_bar_time_not_position():
+    """Two series of the same asset, one missing its first 5 bars (backfilled
+    later) - aligning by position shifts them 5 bars apart and hides the
+    near-perfect correlation."""
+    n = 120
+    rng = np.random.default_rng(3)
+    times = pd.date_range("2026-09-01", periods=n, freq="h", tz="UTC")
+    closes = pd.Series(100 * np.cumprod(1 + rng.normal(0, 0.01, n)), index=times)
+    late_backfill = closes.iloc[5:]
+
+    corr = compute_correlation(closes, late_backfill, lookback_bars=90)
+
+    assert corr is not None and corr > 0.99
 
 
 def test_correlation_passes_for_independent_series(rules):

@@ -56,14 +56,25 @@ class UniverseScanner:
         self._settings = settings
         self._universe = universe_config
 
-    def _exclusion_reason(self, symbol: str, base_asset: str, quote_asset: str, status: str) -> str | None:
+    def _is_leveraged_token(self, base_asset: str, known_bases: set[str]) -> bool:
+        """Binance leveraged tokens are an existing asset plus a suffix
+        (BTCUP, ETHDOWN, BNBBULL). A bare `endswith("UP")` also rejects
+        ordinary coins like JUP, so require the remainder to be a real asset."""
+        return any(
+            base_asset.endswith(suffix) and base_asset[: -len(suffix)] in known_bases
+            for suffix in self._universe.leveraged_token_suffixes
+        )
+
+    def _exclusion_reason(
+        self, symbol: str, base_asset: str, quote_asset: str, status: str, known_bases: set[str] | None = None
+    ) -> str | None:
         if quote_asset != self._universe.quote_asset:
             return "wrong quote asset"
         if status != "TRADING":
             return "not TRADING"
         if base_asset in self._universe.stablecoin_assets:
             return "stablecoin pair"
-        if any(base_asset.endswith(suffix) for suffix in self._universe.leveraged_token_suffixes):
+        if self._is_leveraged_token(base_asset, known_bases or set()):
             return "leveraged token"
         if symbol in self._universe.blacklist_symbols:
             return "blacklisted"
@@ -81,9 +92,10 @@ class UniverseScanner:
         tickers = await self._client.get_ticker_24h()
         ticker_by_symbol = {t["symbol"]: t for t in tickers}
 
+        known_bases = {filters.base_asset for filters in exchange_info.values()}
         stage1: list[ScanCandidate] = []
         for symbol, filters in exchange_info.items():
-            if self._exclusion_reason(symbol, filters.base_asset, filters.quote_asset, filters.status):
+            if self._exclusion_reason(symbol, filters.base_asset, filters.quote_asset, filters.status, known_bases):
                 continue
             ticker = ticker_by_symbol.get(symbol)
             if ticker is None:

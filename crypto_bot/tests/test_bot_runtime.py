@@ -170,6 +170,34 @@ def test_entry_worker_skips_symbols_dropped_from_the_universe_while_queued(setti
     runtime._evaluate_entry.assert_not_called()
 
 
+def test_entry_worker_survives_an_evaluation_exception(settings, rules):
+    """_evaluate_entry's DB pre-checks sit outside its own try - an error
+    there (e.g. sqlite "database is locked") must not kill the worker and
+    burn one of the watchdog's lifetime restarts."""
+    runtime = _make_runtime(settings, rules)
+    runtime._candidate_symbols = {"BADUSDT", "SOLUSDT"}
+    calls: list[str] = []
+
+    async def flaky_evaluate(symbol):
+        calls.append(symbol)
+        if symbol == "BADUSDT":
+            raise RuntimeError("database is locked")
+
+    runtime._evaluate_entry = flaky_evaluate
+    runtime._enqueue_entry_evaluation("BADUSDT")
+    runtime._enqueue_entry_evaluation("SOLUSDT")
+
+    async def scenario():
+        worker = asyncio.create_task(runtime.run_entry_evaluation_loop())
+        await asyncio.sleep(0.05)
+        assert not worker.done()
+        worker.cancel()
+
+    asyncio.run(scenario())
+
+    assert calls == ["BADUSDT", "SOLUSDT"]
+
+
 def test_get_balance_text_paper_mode_reports_holdings_and_equity(db_engine, settings, rules):
     paper_broker = MagicMock()
     paper_broker.account.usdt_balance = Decimal("9000")

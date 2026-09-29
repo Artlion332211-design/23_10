@@ -81,6 +81,39 @@ def test_apply_fill_and_recompute_weighted_average(db_engine):
         assert position.fees_paid_usdt == Decimal("0.1")
 
 
+def test_apply_sell_fill_closes_when_only_an_unsellable_lot_remainder_is_left(db_engine):
+    """Base-asset buy commission leaves 7.992 XRP; with a 0.1 lot step the
+    full exit sells 7.9. The 0.092 left is > 0.1% of the slice but can
+    never be sold, so it must not keep the position OPEN."""
+    with session_scope() as session:
+        repo = PositionRepository(session)
+        position = repo.create(
+            symbol="XRPUSDT", opened_at=utcnow(), avg_entry_price=Decimal("2.5"),
+            total_quantity=Decimal("7.992"), total_cost_usdt=Decimal("19.98"), target_price=Decimal("2.76"),
+        )
+        _pnl, fully_closed = repo.apply_sell_fill(
+            position, sold_quantity=Decimal("7.9"), proceeds_usdt=Decimal("21.7"), now=utcnow(),
+            close_reason="TAKE_PROFIT", unsellable_below=Decimal("0.1"),
+        )
+        assert fully_closed
+        assert position.total_quantity == Decimal("0")
+
+
+def test_apply_sell_fill_keeps_a_sellable_partial_remainder_open(db_engine):
+    with session_scope() as session:
+        repo = PositionRepository(session)
+        position = repo.create(
+            symbol="XRPUSDT", opened_at=utcnow(), avg_entry_price=Decimal("2.5"),
+            total_quantity=Decimal("10"), total_cost_usdt=Decimal("25"), target_price=Decimal("2.76"),
+        )
+        _pnl, fully_closed = repo.apply_sell_fill(
+            position, sold_quantity=Decimal("6"), proceeds_usdt=Decimal("16.5"), now=utcnow(),
+            close_reason="TAKE_PROFIT", unsellable_below=Decimal("0.1"),
+        )
+        assert not fully_closed
+        assert position.total_quantity == Decimal("4")
+
+
 def test_settings_repository_typed_getters(db_engine):
     with session_scope() as session:
         repo = SettingsRepository(session)

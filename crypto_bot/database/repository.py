@@ -166,6 +166,7 @@ class PositionRepository:
         proceeds_usdt: Decimal,
         now: datetime,
         close_reason: str,
+        unsellable_below: Decimal = Decimal("0"),
     ) -> tuple[Decimal, bool]:
         """Reduces (or fully closes) a position by a sold quantity, using
         average-cost-basis accounting uniformly whether this is a full
@@ -214,9 +215,12 @@ class PositionRepository:
         # unsellable rounding dust looking like a still-open position
         # forever. Treat anything under 0.1% of *this slice* as dust too;
         # a genuine partial exit sells a materially larger fraction than
-        # that, so it never gets caught by this.
+        # that, so it never gets caught by this. `unsellable_below` (from the
+        # symbol's real exchange filters - see
+        # `ExecutionEngine.unsellable_quantity`) covers coarse lot steps,
+        # where the rounding remainder can be several percent of the slice.
         dust = max(Decimal("0.00000001"), sold_quantity * Decimal("0.001"))
-        fully_closed = position.total_quantity <= dust
+        fully_closed = position.total_quantity <= dust or position.total_quantity < unsellable_below
         if fully_closed:
             position.status = PositionStatus.CLOSED
             position.closed_at = now

@@ -24,9 +24,14 @@ class CorrelationCheck:
 
 
 def compute_correlation(candidate_closes: pd.Series, other_closes: pd.Series, *, lookback_bars: int) -> float | None:
-    a = candidate_closes.pct_change().tail(lookback_bars)
-    b = other_closes.pct_change().tail(lookback_bars)
-    aligned = pd.concat([a.reset_index(drop=True), b.reset_index(drop=True)], axis=1).dropna()
+    """Series must share an index that identifies the bar (candle open time
+    in live/backtest use). Returns are joined on that index, never by
+    position: two series backfilled at different times, or with a missed
+    candle, would otherwise be compared bar-shifted and understate the
+    correlation."""
+    a = candidate_closes.pct_change()
+    b = other_closes.pct_change()
+    aligned = pd.concat([a, b], axis=1, join="inner").dropna().tail(lookback_bars)
     if len(aligned) < max(10, lookback_bars // 3):
         return None
     corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])

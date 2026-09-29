@@ -52,7 +52,7 @@ from telegram_bot.bot import TelegramBotRunner, attach_context, create_applicati
 from telegram_bot.handlers import BotContext
 from telegram_bot.notifications import TelegramNotifier
 from utils.logging import register_secret, setup_logging
-from utils.time import Timeframe, utcnow
+from utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +107,13 @@ async def run_backtest_mode(config: AppConfig, args: argparse.Namespace) -> None
 
 def _build_paper_broker(settings: Settings, market_data: MarketDataStore, client: BinanceClient) -> PaperBroker:
     async def _price_source(symbol: str) -> Decimal:
-        snap = market_data.snapshot(symbol, Timeframe.M15)
-        if snap is not None:
-            return Decimal(str(snap.close))
+        # The live stream price, not the last *closed* 15m candle's close:
+        # paper fills (and resting-LIMIT marketability) must track the same
+        # current price the exit/entry decisions were made on, or a
+        # TAKE_PROFIT decided at the live mid can fill up to 15 minutes stale.
+        live = market_data.live_price(symbol)
+        if live is not None:
+            return Decimal(str(live))
         ticker = await client.get_symbol_ticker(symbol)
         return Decimal(str(ticker["price"]))
 

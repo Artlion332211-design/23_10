@@ -163,6 +163,47 @@ def test_cancel_falls_back_to_get_status_when_the_cancel_call_itself_fails(sol_f
     assert result.fill_data_incomplete is False
 
 
+def _api_exception(status_code: int, code: int):
+    from binance.exceptions import BinanceAPIException
+    return BinanceAPIException(None, status_code, f'{{"code": {code}, "msg": "simulated"}}')
+
+
+def test_get_status_resolves_an_order_binance_has_no_record_of_as_rejected(sol_filters):
+    """An order whose placement response was lost before it reached Binance
+    must not stay NEW forever - that row would keep has_resting_order()
+    true and freeze the position's exit management."""
+    client = FakeBinanceClient(sol_filters)
+
+    async def no_such_order(*args, **kwargs):
+        raise _api_exception(400, -2013)
+
+    client.get_order_status = no_such_order  # type: ignore[method-assign]
+    adapter = BinanceExecutionAdapter(client)  # type: ignore[arg-type]
+
+    result = asyncio.run(adapter.get_status("SOLUSDT", client_order_id="bot-exit-abc"))
+
+    assert result.status == OrderStatus.REJECTED
+
+
+def test_submit_treats_a_binance_5xx_as_unknown_outcome_not_rejected(sol_filters):
+    from database.models import OrderSide, OrderType
+    from exchange.execution_engine import OrderRequest
+
+    client = FakeBinanceClient(sol_filters)
+
+    async def server_error(**kwargs):
+        raise _api_exception(503, -1001)
+
+    client.create_order = server_error  # type: ignore[attr-defined]
+    adapter = BinanceExecutionAdapter(client)  # type: ignore[arg-type]
+    request = OrderRequest(symbol="SOLUSDT", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                           client_order_id="bot-exit-abc", quantity=Decimal("1"))
+
+    result = asyncio.run(adapter.submit(request))
+
+    assert result.status == OrderStatus.NEW  # may have executed - reconciliation must find out
+
+
 def test_get_status_recovered_fill_is_not_marked_incomplete(sol_filters):
     """The successful-recovery case (the first test in this file) must NOT
     be flagged incomplete - only genuinely unresolved attempts are."""

@@ -29,9 +29,17 @@ def test_round_quantity_floors_to_lot_step(sol_filters):
     assert sol_filters.round_quantity(Decimal("1.2399999")) == Decimal("1.239")
 
 
-def test_round_quantity_market_uses_market_lot_step(sol_filters):
-    # market step is finer (0.00001) than the limit step (0.001)
-    assert sol_filters.round_quantity(Decimal("1.23456"), market=True) == Decimal("1.23456")
+def test_round_quantity_market_must_satisfy_lot_size_too(sol_filters):
+    # MARKET orders are checked against LOT_SIZE *and* MARKET_LOT_SIZE, so a
+    # finer market step (0.00001) can't loosen the LOT_SIZE step (0.001).
+    assert sol_filters.round_quantity(Decimal("1.23456"), market=True) == Decimal("1.234")
+
+
+def test_round_quantity_market_with_zero_market_step_still_uses_lot_size(sol_filters):
+    """Real spot exchangeInfo (e.g. BTCUSDT) publishes MARKET_LOT_SIZE with
+    stepSize 0.00000000 - that must not send MARKET orders unrounded."""
+    spot = sol_filters.__class__(**{**sol_filters.__dict__, "market_lot_step_size": Decimal("0")})
+    assert spot.round_quantity(Decimal("1.23456"), market=True) == Decimal("1.234")
 
 
 def test_quantity_for_notional_never_exceeds_requested_spend(sol_filters):

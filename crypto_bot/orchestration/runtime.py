@@ -105,6 +105,7 @@ class BotRuntime:
         self._latest_decisions: dict[str, TradeDecision] = {}
         self._candidate_symbols: set[str] = set()
         self._tracked_symbols: set[str] = set()
+        self._stream_pairs: list[tuple[str, str]] = []
         self._alerted_news_ids: set[int] = set()
         self._last_universe_scan_at: datetime | None = None
         self._last_news_refresh_at: datetime | None = None
@@ -165,9 +166,15 @@ class BotRuntime:
         self._tracked_symbols = required
         self._last_universe_scan_at = utcnow()
 
-        await self._ws_manager.stop_stream("klines")
-        pairs = [(symbol, tf.value) for symbol in required for tf in _TRACKED_TIMEFRAMES]
-        self._ws_manager.start_kline_stream(pairs, self._on_kline_message)
+        # Only reconnect when the tracked set actually changed: every
+        # reconnect is a window in which candle-close events are lost, and
+        # the rescan cadence drifts, so an unconditional restart eventually
+        # lands right on a :00/:15/:30/:45 close.
+        pairs = sorted((symbol, tf.value) for symbol in required for tf in _TRACKED_TIMEFRAMES)
+        if pairs != self._stream_pairs:
+            await self._ws_manager.stop_stream("klines")
+            self._ws_manager.start_kline_stream(pairs, self._on_kline_message)
+            self._stream_pairs = pairs
         logger.info(
             "Universe rescanned: tracking %s symbol(s) (%s candidates, %s open position(s))",
             len(required), len(new_candidates), len(open_symbols),
@@ -214,7 +221,14 @@ class BotRuntime:
             self._queued_entries.discard(symbol)
             # The universe may have been rescanned while this sat in the queue.
             if symbol in self._candidate_symbols:
-                await self._evaluate_entry(symbol)
+                try:
+                    await self._evaluate_entry(symbol)
+                except Exception as exc:  # noqa: BLE001 - one bad candidate must not kill the worker
+                    # _evaluate_entry guards the strategy call itself, but not its
+                    # DB pre-checks (e.g. sqlite "database is locked"). Letting
+                    # that escape would burn one of the watchdog's lifetime
+                    # restarts per incident and eventually stop entry evaluation.
+                    logger.exception("Entry evaluation failed for %s: %r", symbol, exc)
             self._watchdog.heartbeat("entry_evaluator")
 
     def _update_btc_regime(self) -> None:

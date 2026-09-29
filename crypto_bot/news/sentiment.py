@@ -43,6 +43,28 @@ POSITIVE_KEYWORDS: dict[str, int] = {
 
 CRITICAL_SCORE_CEILING = -80
 
+# Keywords are matched as whole words (plus common inflections), never as
+# raw substrings - otherwise "hackathon" reads as a critical "hack",
+# "banks" as "ban" and "refine" as "fine". These few are deliberate stems
+# ("integration", "collaborates", ...) and only need a word start.
+_STEM_KEYWORDS = frozenset({"integrat", "collaborat"})
+_INFLECTIONS = r"(?:s|es|d|ed|ing|er|ers)?"
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    if keyword in _STEM_KEYWORDS:
+        return re.compile(r"\b" + re.escape(keyword))
+    return re.compile(r"\b" + re.escape(keyword) + _INFLECTIONS + r"\b")
+
+
+def _compile(keywords: dict[str, int]) -> list[tuple[str, int, re.Pattern[str]]]:
+    return [(keyword, weight, _keyword_pattern(keyword)) for keyword, weight in keywords.items()]
+
+
+_CRITICAL_PATTERNS = _compile(CRITICAL_KEYWORDS)
+_NEGATIVE_PATTERNS = _compile(NEGATIVE_KEYWORDS)
+_POSITIVE_PATTERNS = _compile(POSITIVE_KEYWORDS)
+
 _ALIASES: dict[str, str] = {
     "bitcoin": "BTC", "ethereum": "ETH", "binance coin": "BNB", "solana": "SOL",
     "ripple": "XRP", "cardano": "ADA", "chainlink": "LINK", "avalanche": "AVAX",
@@ -72,19 +94,15 @@ def score_text(title: str, body: str = "") -> SentimentResult:
     score = 0
     critical = False
 
-    for keyword, weight in CRITICAL_KEYWORDS.items():
-        if keyword in text:
+    for keyword, weight, pattern in _CRITICAL_PATTERNS:
+        if pattern.search(text):
             matched.append(keyword)
             score = min(score, weight)
             critical = True
 
     if not critical:
-        for keyword, weight in NEGATIVE_KEYWORDS.items():
-            if keyword in text:
-                matched.append(keyword)
-                score += weight
-        for keyword, weight in POSITIVE_KEYWORDS.items():
-            if keyword in text:
+        for keyword, weight, pattern in _NEGATIVE_PATTERNS + _POSITIVE_PATTERNS:
+            if pattern.search(text):
                 matched.append(keyword)
                 score += weight
 

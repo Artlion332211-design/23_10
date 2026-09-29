@@ -204,6 +204,9 @@ def _build_execution_result(
     )
 
 
+_BINANCE_NO_SUCH_ORDER = -2013  # "Order does not exist."
+
+
 class BinanceExecutionAdapter:
     """Real (or Spot Testnet) order placement."""
 
@@ -234,10 +237,15 @@ class BinanceExecutionAdapter:
 
         try:
             raw = await self._client.create_order(**params)
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("Order rejected by Binance: %s %s", request, exc)
-            return ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message=str(exc))
-        except (TimeoutError, ConnectionError, OSError) as exc:
+        except BinanceAPIException as exc:
+            if exc.status_code < 500:
+                logger.error("Order rejected by Binance: %s %s", request, exc)
+                return ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message=str(exc))
+            # A 5xx means Binance's own execution status is UNKNOWN (its API
+            # docs say so explicitly) - same treatment as a lost response.
+            logger.error("Binance returned %s for order, outcome unknown: %s %s", exc.status_code, request, exc)
+            return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
+        except (BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
             # Unlike the rejection above, a raw network failure here means we
             # genuinely don't know whether Binance received and accepted this
             # order - the response, not necessarily the order, was lost.
@@ -245,9 +253,9 @@ class BinanceExecutionAdapter:
             # trust that nothing happened when it might have); reporting NEW
             # leaves the write-ahead Order row (already committed before this
             # call - see module docstring) exactly where a genuinely-still-
-            # pending order would be, for the startup reconciliation service
-            # (or, for a LIMIT order, the next check_pending_limit_orders
-            # poll - see ExecutionEngine.buy()/sell()) to resolve for real.
+            # pending order would be, for the next check_pending_limit_orders
+            # poll (every order type - see ExecutionEngine.buy()/sell()) or
+            # startup reconciliation to resolve for real.
             logger.error("Network error submitting order to Binance: %s %s", request, exc)
             return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
 
@@ -281,7 +289,18 @@ class BinanceExecutionAdapter:
         filters = await self._client.get_symbol_filters(symbol)
         try:
             raw = await self._client.get_order_status(symbol, orig_client_order_id=client_order_id)
-        except (BinanceAPIException, BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
+        except BinanceAPIException as exc:
+            if exc.code == _BINANCE_NO_SUCH_ORDER:
+                # Binance has no record of it: an order whose placement
+                # response was lost before it ever reached the matching
+                # engine. It will never fill - resolve it rather than let
+                # the NEW row block this symbol/position forever via
+                # has_resting_order().
+                logger.warning("Order %s/%s does not exist on Binance - resolving as REJECTED", symbol, client_order_id)
+                return ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message=str(exc))
+            logger.warning("get_status failed for %s/%s: %s", symbol, client_order_id, exc)
+            return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message=str(exc))
+        except (BinanceRequestException, TimeoutError, ConnectionError, OSError) as exc:
             # Treat "couldn't confirm status" as still-pending (like `cancel`'s
             # failure path below), never as resolved - `check_pending_limit_orders`
             # would otherwise have to interpret an unrelated exception as
@@ -368,6 +387,17 @@ class ExecutionEngine:
 
     async def _get_filters(self, symbol: str) -> SymbolFilters:
         return await self._filters_provider(symbol)
+
+    async def unsellable_quantity(self, symbol: str, price: Decimal) -> Decimal:
+        """Any remainder strictly below this can never be sold on this
+        symbol: less than one lot step (rounds to zero), below the minimum
+        quantity, or below the minimum notional at `price`. A position left
+        holding only that much is effectively closed."""
+        filters = await self._get_filters(symbol)
+        threshold = max(filters.lot_step_size, filters.lot_min_qty, filters.market_lot_min_qty)
+        if price > 0 and filters.min_notional > 0:
+            threshold = max(threshold, filters.min_notional / price)
+        return threshold
 
     def _dry_run_result(self, order: Order) -> ExecutionResult:
         logger.info("[DRY_RUN] Not sending order to Binance: %s %s %s", order.symbol, order.side, order.type)
@@ -482,9 +512,16 @@ class ExecutionEngine:
 
         result = await self._executor.submit(request)
         self._persist_result(order_id, result)
-        if order_type == OrderType.LIMIT and result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
-            self._pending_limit_orders[client_order_id] = (symbol, utcnow())
+        self._track_if_unresolved(client_order_id, symbol, result)
         return result
+
+    def _track_if_unresolved(self, client_order_id: str, symbol: str, result: ExecutionResult) -> None:
+        """A resting LIMIT order, and equally a MARKET order whose response
+        was lost (status NEW = outcome unknown), must be polled until it
+        resolves - otherwise its NEW row keeps has_resting_order() true
+        forever and freezes that position's TP/trailing/DCA management."""
+        if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+            self._pending_limit_orders[client_order_id] = (symbol, utcnow())
 
     async def sell(
         self,
@@ -542,8 +579,7 @@ class ExecutionEngine:
 
         result = await self._executor.submit(request)
         self._persist_result(order_id, result)
-        if order_type == OrderType.LIMIT and result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
-            self._pending_limit_orders[client_order_id] = (symbol, utcnow())
+        self._track_if_unresolved(client_order_id, symbol, result)
         return result
 
     def _should_keep_retrying_incomplete_result(

@@ -229,6 +229,12 @@ class MarketDataStore:
 
     async def backfill(self, symbol: str, timeframe: Timeframe, *, limit: int = 300) -> None:
         df = await self._client.get_klines(symbol, timeframe.value, limit=limit)
+        # REST klines end with the still-forming candle. Seeding it would
+        # freeze a partial bar in as the "latest closed" one until the next
+        # close replaces it - up to 4h on the 4h series - breaking the
+        # closed-candles-only rule every signal (and the backtest) relies on.
+        if not df.empty:
+            df = df[df["close_time"] < pd.Timestamp(utcnow())]
         self._get_or_create(symbol, timeframe).seed(df)
         logger.info("Backfilled %s %s with %s candles", symbol, timeframe.value, len(df))
 
@@ -249,6 +255,15 @@ class MarketDataStore:
     def snapshot(self, symbol: str, timeframe: Timeframe) -> IndicatorSnapshot | None:
         series = self._series.get((symbol, timeframe))
         return series.latest_snapshot() if series else None
+
+    def live_price(self, symbol: str) -> float | None:
+        """Latest traded price from the kline stream (the forming 15m
+        candle's close, updated every ~1-2s) - unlike `snapshot().close`,
+        which is the last *closed* candle and can be up to 15 minutes old."""
+        series = self._series.get((symbol, Timeframe.M15))
+        if series is None or series.forming_candle is None:
+            return None
+        return float(series.forming_candle["close"])
 
     def dataframe(self, symbol: str, timeframe: Timeframe) -> pd.DataFrame | None:
         series = self._series.get((symbol, timeframe))

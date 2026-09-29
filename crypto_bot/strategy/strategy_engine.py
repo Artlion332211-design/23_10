@@ -278,13 +278,15 @@ class StrategyEngine:
         if open_position_symbols:
             candidate_df = self._market_data.dataframe(symbol, Timeframe.H1)
             if candidate_df is not None and not candidate_df.empty:
+                # Indexed by candle open time so returns align by bar, not position.
                 closes_by_symbol = {}
                 for other_symbol in open_position_symbols:
                     other_df = self._market_data.dataframe(other_symbol, Timeframe.H1)
                     if other_df is not None and not other_df.empty:
-                        closes_by_symbol[other_symbol] = other_df["close"]
+                        closes_by_symbol[other_symbol] = other_df.set_index("open_time")["close"]
                 corr_check = check_correlation_limit(
-                    symbol, candidate_df["close"], open_position_symbols, closes_by_symbol, self._rules.correlation
+                    symbol, candidate_df.set_index("open_time")["close"], open_position_symbols, closes_by_symbol,
+                    self._rules.correlation,
                 )
                 if not corr_check.passed:
                     extra_vetoes.append(corr_check.reason or "correlation limit reached")
@@ -664,9 +666,20 @@ class StrategyEngine:
             position = PositionRepository(session).get(position_id)
             if position is None or position.status != PositionStatus.OPEN:
                 return None
-            symbol, avg_entry, opened_at = position.symbol, position.avg_entry_price, position.opened_at
+            symbol = position.symbol
+        # Buy-side commission is taken in the base asset, so a position is
+        # routinely off the lot grid (e.g. 7.992 XRP, step 0.1): the full
+        # exit sells 7.9 and leaves 0.092 that can never be sold. Without
+        # this, that remainder kept the position OPEN forever.
+        unsellable = await self._execution_engine.unsellable_quantity(symbol, result.avg_fill_price)
+        with session_scope() as session:
+            position = PositionRepository(session).get(position_id)
+            if position is None or position.status != PositionStatus.OPEN:
+                return None
+            avg_entry, opened_at = position.avg_entry_price, position.opened_at
             slice_pnl, fully_closed = PositionRepository(session).apply_sell_fill(
-                position, sold_quantity=result.filled_quantity, proceeds_usdt=proceeds, now=utcnow(), close_reason=reason,
+                position, sold_quantity=result.filled_quantity, proceeds_usdt=proceeds, now=utcnow(),
+                close_reason=reason, unsellable_below=unsellable,
             )
             cumulative_pnl = position.realized_pnl_usdt
             cumulative_pnl_pct = position.realized_pnl_pct

@@ -19,6 +19,7 @@ from difflib import SequenceMatcher
 import aiohttp
 
 from config.settings import Settings
+from database.models import News
 from database.repository import NewsRepository
 from database.session import session_scope
 from news.sentiment import extract_symbols, score_text
@@ -51,6 +52,13 @@ def _normalize_title(title: str) -> str:
 
 def _dedup_hash(title: str, url: str) -> str:
     return hashlib.sha256(f"{_normalize_title(title)}|{url}".encode()).hexdigest()
+
+
+def _blocks_symbol(item: News, base_asset: str) -> bool:
+    symbols = item.symbols or []
+    if base_asset in symbols:
+        return True
+    return "MARKET" in symbols and "binance" in item.title.lower()
 
 
 class NewsEngine:
@@ -141,8 +149,16 @@ class NewsEngine:
 
     async def get_symbol_news_score(self, symbol: str) -> NewsAssessment:
         """Implements `strategy.strategy_engine.NewsProvider`. The single
-        worst critical item dominates the result; otherwise scores over the
-        lookback window are averaged."""
+        worst blocking item dominates the result; otherwise scores over the
+        lookback window are averaged.
+
+        A critical item only hard-blocks when it's about this symbol, or is
+        market-wide news about Binance itself (the venue we trade on). Any
+        other market-wide critical item - a hack of some other exchange or
+        protocol - only feeds the averaged score: "MARKET" is simply what
+        every headline naming none of the current candidates gets tagged,
+        so letting those block would veto every symbol for the whole
+        lookback window whenever anything anywhere got hacked."""
         base_asset = symbol[:-4] if symbol.endswith("USDT") else symbol
         lookback = utcnow() - timedelta(hours=_NEWS_LOOKBACK_HOURS)
         with session_scope() as db_session:
@@ -151,7 +167,7 @@ class NewsEngine:
         if not items:
             return NewsAssessment(score=0, critical=False, headlines=[])
 
-        critical_items = [item for item in items if item.critical]
+        critical_items = [item for item in items if item.critical and _blocks_symbol(item, base_asset)]
         if critical_items:
             worst = min(critical_items, key=lambda item: item.sentiment_score)
             return NewsAssessment(

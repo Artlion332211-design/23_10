@@ -103,12 +103,20 @@ class RiskManager:
         bundled write. Kept as one DB commit (rather than three separate
         `resume_buys()`/`start_dca()`/`clear_emergency_stop()` calls, each
         its own transaction) so a failure partway through can never leave
-        the flags in a silently inconsistent, partially-resumed state."""
+        the flags in a silently inconsistent, partially-resumed state.
+
+        Also resets the consecutive-bad-trades counter: the losing-streak
+        auto-pause is lifted by exactly this operator decision, and
+        `can_open_new_position` checks the counter on its own - left as-is it
+        would keep vetoing every BUY after /resume, and since only a winning
+        close resets it, no BUY could ever happen again. The gate itself is
+        unchanged: the next streak of losses pauses buys again."""
         with session_scope() as session:
             repo = SettingsRepository(session)
             repo.set_bool(KEY_BUY_PAUSED, False)
             repo.set_bool(KEY_DCA_PAUSED, False)
             repo.set_bool(KEY_EMERGENCY_STOP, False)
+            repo.set(KEY_CONSECUTIVE_BAD_TRADES, "0")
 
     def register_trade_result(self, *, is_win: bool) -> int:
         """Call once per closed position. Returns the updated consecutive

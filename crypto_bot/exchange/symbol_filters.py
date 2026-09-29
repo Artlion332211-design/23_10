@@ -26,6 +26,12 @@ def to_decimal(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step == 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
 def format_decimal(value: Decimal) -> str:
     """Render a Decimal the way Binance expects: plain fixed-point notation.
 
@@ -97,15 +103,26 @@ class SymbolFilters:
         return steps * self.tick_size
 
     def round_quantity(self, quantity: Decimal | float | str, *, market: bool = False) -> Decimal:
-        """Floor to the LOT_SIZE / MARKET_LOT_SIZE step. Always rounds DOWN:
-        Binance rejects off-grid quantities, and rounding up could spend more
-        than the caller intended."""
-        quantity = to_decimal(quantity)
-        step = self.market_lot_step_size if market else self.lot_step_size
-        if step == 0:
-            return quantity
-        steps = (quantity / step).to_integral_value(rounding=ROUND_DOWN)
-        return steps * step
+        """Floor to the LOT_SIZE step (and, for MARKET orders, also the
+        MARKET_LOT_SIZE step). Always rounds DOWN: Binance rejects off-grid
+        quantities, and rounding up could spend more than the caller intended.
+
+        MARKET orders must satisfy *both* filters, and on spot Binance
+        publishes MARKET_LOT_SIZE with stepSize 0 ("no extra constraint") -
+        so using only the market step would send MARKET orders unrounded and
+        get them rejected with "Filter failure: LOT_SIZE"."""
+        quantity = _floor_to_step(to_decimal(quantity), self.lot_step_size)
+        if market:
+            quantity = _floor_to_step(quantity, self.market_lot_step_size)
+        return quantity
+
+    def _min_qty(self, market: bool) -> Decimal:
+        return max(self.lot_min_qty, self.market_lot_min_qty) if market else self.lot_min_qty
+
+    def _max_qty(self, market: bool) -> Decimal:
+        if market and self.market_lot_max_qty > 0:
+            return min(self.lot_max_qty, self.market_lot_max_qty)
+        return self.lot_max_qty
 
     def validate_notional(
         self, price: Decimal | float | str, quantity: Decimal | float | str, *, market: bool = False
@@ -132,8 +149,8 @@ class SymbolFilters:
         raw_qty = notional_usdt / price
         qty = self.round_quantity(raw_qty, market=market)
 
-        min_qty = self.market_lot_min_qty if market else self.lot_min_qty
-        max_qty = self.market_lot_max_qty if market else self.lot_max_qty
+        min_qty = self._min_qty(market)
+        max_qty = self._max_qty(market)
         if qty < min_qty:
             raise OrderWouldBeInvalid(
                 f"{self.symbol}: computed quantity {qty} below exchange minQty {min_qty} "

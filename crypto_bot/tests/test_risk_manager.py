@@ -89,6 +89,20 @@ def test_consecutive_losses_auto_pause_and_reset_on_win(risk_manager):
     assert reset_count == 0
 
 
+def test_resume_lifts_the_losing_streak_pause_but_the_gate_still_works(risk_manager):
+    """/resume used to clear buy_paused but not the loss counter, which
+    can_open_new_position checks on its own - BUYs stayed blocked forever
+    since only a winning close (impossible without BUYs) reset it."""
+    risk_manager.register_trade_result(is_win=False)
+    risk_manager.register_trade_result(is_win=False)  # fixture limit is 2 -> auto-paused
+    risk_manager.resume_trading()
+    assert risk_manager.can_open_new_position(requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"), regime=NEUTRAL).allowed
+
+    risk_manager.register_trade_result(is_win=False)
+    risk_manager.register_trade_result(is_win=False)  # a fresh streak pauses again
+    assert not risk_manager.can_open_new_position(requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"), regime=NEUTRAL).allowed
+
+
 def test_emergency_stop_blocks_everything_until_cleared(risk_manager):
     risk_manager.trigger_emergency_stop()
     assert not risk_manager.can_open_new_position(requested_usdt=Decimal("50"), trading_balance_usdt=Decimal("10000"), regime=NEUTRAL).allowed

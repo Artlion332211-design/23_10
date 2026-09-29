@@ -149,18 +149,30 @@ class BinanceClient:
             raise RuntimeError("BinanceClient not connected - call connect() first")
         return self._client
 
-    async def _call(self, fn_name: str, /, **kwargs: Any) -> Any:
+    async def _call(self, fn_name: str, /, *, retry_ambiguous: bool = True, **kwargs: Any) -> Any:
         """Call a python-binance AsyncClient method with throttling + bounded
         retry. Retries network errors and 5xx/429/418 responses; does not
         retry other 4xx client errors since repeating them changes nothing.
+
+        `retry_ambiguous=False` limits retries to 429/418, which Binance
+        rejects before processing. A timeout, dropped connection or 5xx has
+        an UNKNOWN outcome - the request may well have been executed - so a
+        non-idempotent call (placing an order) must not be blindly resent:
+        Binance accepts a reused newClientOrderId once the first order has
+        filled, so a resend could buy twice. The caller surfaces the
+        ambiguity instead and lets reconciliation ask Binance what happened.
         """
         method = getattr(self.raw, fn_name)
 
         def _is_retryable(exc: BaseException) -> bool:
+            if isinstance(exc, BinanceAPIException) and exc.status_code in RATE_LIMIT_STATUS_CODES:
+                return True
+            if not retry_ambiguous:
+                return False
             if isinstance(exc, BinanceRequestException):
                 return True
             if isinstance(exc, BinanceAPIException):
-                return exc.status_code in RATE_LIMIT_STATUS_CODES or exc.status_code >= 500
+                return exc.status_code >= 500
             # OSError, not just its more specific ConnectionError/TimeoutError
             # subclasses - a DNS failure (socket.gaierror) or "Network is
             # unreachable" surfaces as a bare OSError, and the except clause
@@ -276,7 +288,7 @@ class BinanceClient:
         return result.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
 
     async def get_ticker_24h(self, symbol: str | None = None) -> Any:
-        kwargs = {"symbol": symbol} if symbol else {}
+        kwargs: dict[str, Any] = {"symbol": symbol} if symbol else {}
         return await self._call("get_ticker", **kwargs)
 
     async def get_order_book(self, symbol: str, *, limit: int = 50) -> dict[str, Any]:
@@ -295,7 +307,7 @@ class BinanceClient:
         return balances
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        kwargs = {"symbol": symbol} if symbol else {}
+        kwargs: dict[str, Any] = {"symbol": symbol} if symbol else {}
         return await self._call("get_open_orders", **kwargs)
 
     async def get_order_status(self, symbol: str, *, order_id: str | None = None,
@@ -322,7 +334,7 @@ class BinanceClient:
     # ------------------------------------------------------------------
 
     async def create_order(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call("create_order", **kwargs)
+        return await self._call("create_order", retry_ambiguous=False, **kwargs)
 
     async def cancel_order(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call("cancel_order", **kwargs)
