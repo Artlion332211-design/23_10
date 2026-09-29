@@ -34,9 +34,21 @@ _BACKOFF_STEPS = (2, 5, 10, 30, 60)
 # closes the connection. Headroom for a brief stall, not a license for slow
 # callbacks.
 _MAX_QUEUE_SIZE = 2000
-# ~25 symbols x 3 timeframes push updates every 1-2s; 90s of silence is a
-# dead or half-open connection, not a quiet market.
-_KLINE_INACTIVITY_SECONDS = 90.0
+# Last-resort only: the websockets keepalive already detects a dead/half-open
+# connection within ~40s, and python-binance then reconnects on its own (up
+# to 5 attempts). This fires only if the feed is still silent after that -
+# long enough not to cut in on the library's own reconnect attempts.
+_KLINE_INACTIVITY_SECONDS = 300.0
+# Error payloads after which python-binance keeps its read loop alive and
+# reconnects by itself (see ReconnectingWebsocket._read_loop). Tearing the
+# socket down on these instead races that reconnect: __aexit__ waits for a
+# read loop that a successful reconnect has just revived, nobody consumes
+# the queue, and the feed stays dead until the queue overflows - seen live
+# 19:53-19:55 on 2026-09-29. Any other error type means the read loop has
+# stopped, so tearing down (and reconnecting from scratch) is correct.
+_LIBRARY_RECONNECTS_ITSELF = frozenset(
+    {"IncompleteReadError", "gaierror", "ConnectionClosedError", "ConnectionClosedOK", "BinanceWebsocketClosed"}
+)
 
 
 class ReconnectingStream:
@@ -97,8 +109,17 @@ class ReconnectingStream:
                         # An error payload is not market data - it must not
                         # make a dead feed look fresh.
                         if isinstance(msg, dict) and msg.get("e") == "error":
+                            if msg.get("type") in _LIBRARY_RECONNECTS_ITSELF:
+                                logger.warning(
+                                    "WebSocket %s interrupted (%s); library is reconnecting", self._name, msg.get("type")
+                                )
+                                self._mark_disconnected()
+                                continue
                             raise RuntimeError(f"Stream error payload on {self._name}: {msg}")
                         self.last_message_at = time.monotonic()
+                        if not self.connected:
+                            self.connected = True
+                            logger.info("WebSocket %s receiving data again", self._name)
                         await self._on_message(msg)
             except asyncio.CancelledError:
                 raise
