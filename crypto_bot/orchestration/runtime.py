@@ -5,7 +5,7 @@ WebSocket manager, market data store, strategy/risk/news engines, execution
 engine, optional paper broker) and exposes:
 
 * the long-running scheduler loops `app.py` registers with the `Watchdog`
-  (`run_position_monitor_loop`, `run_universe_scanner_loop`,
+  (`run_position_monitor_loop`, `run_entry_evaluation_loop`, `run_universe_scanner_loop`,
   `run_news_refresh_loop`, `run_daily_report_loop`, `run_status_ping_loop`);
 * the read-only callables `telegram_bot.handlers.BotContext` needs
   (`get_balance_text`, `get_current_regime`, `get_latest_signals`,
@@ -109,6 +109,16 @@ class BotRuntime:
         self._last_universe_scan_at: datetime | None = None
         self._last_news_refresh_at: datetime | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Candle-close entry evaluations are handed off to a single worker
+        # (run_entry_evaluation_loop) instead of running inline in the kline
+        # read loop: evaluating ~25 symbols back-to-back (REST order-book
+        # fetch + DB + indicators each) blocks the socket long enough to
+        # overflow python-binance's 100-message queue, which drops the
+        # connection and loses the remaining symbols' candle closes. One
+        # worker (not a task per symbol) keeps evaluations serialized, so
+        # two entries can never race past the open-position/exposure caps.
+        self._entry_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queued_entries: set[str] = set()
 
     # ------------------------------------------------------------------
     # Startup
@@ -125,6 +135,7 @@ class BotRuntime:
 
     def register_tasks(self) -> None:
         self._watchdog.register("position_monitor", self.run_position_monitor_loop)
+        self._watchdog.register("entry_evaluator", self.run_entry_evaluation_loop)
         self._watchdog.register("universe_scanner", self.run_universe_scanner_loop)
         if self._settings.news_enabled:
             self._watchdog.register("news_refresh", self.run_news_refresh_loop)
@@ -189,7 +200,22 @@ class BotRuntime:
         if symbol == "BTCUSDT":
             self._update_btc_regime()
         if timeframe == Timeframe.M15 and symbol in self._candidate_symbols:
-            await self._evaluate_entry(symbol)
+            self._enqueue_entry_evaluation(symbol)
+
+    def _enqueue_entry_evaluation(self, symbol: str) -> None:
+        if symbol in self._queued_entries:
+            return
+        self._queued_entries.add(symbol)
+        self._entry_queue.put_nowait(symbol)
+
+    async def run_entry_evaluation_loop(self) -> None:
+        while True:
+            symbol = await self._entry_queue.get()
+            self._queued_entries.discard(symbol)
+            # The universe may have been rescanned while this sat in the queue.
+            if symbol in self._candidate_symbols:
+                await self._evaluate_entry(symbol)
+            self._watchdog.heartbeat("entry_evaluator")
 
     def _update_btc_regime(self) -> None:
         snapshots = {tf: self._market_data.snapshot("BTCUSDT", tf) for tf in _TRACKED_TIMEFRAMES}

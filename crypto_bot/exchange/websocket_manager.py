@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
 _BACKOFF_STEPS = (2, 5, 10, 30, 60)
+# python-binance's default of 100 is roughly one second of traffic for a
+# multiplexed kline stream over ~25 symbols x 3 timeframes; overflowing it
+# closes the connection. Headroom for a brief stall, not a license for slow
+# callbacks.
+_MAX_QUEUE_SIZE = 2000
 
 
 class ReconnectingStream:
@@ -89,7 +94,7 @@ class ReconnectingStream:
 class WebSocketManager:
     def __init__(self, binance_client: BinanceClient) -> None:
         self._client = binance_client
-        self._bsm = BinanceSocketManager(binance_client.raw)
+        self._bsm = BinanceSocketManager(binance_client.raw, max_queue_size=_MAX_QUEUE_SIZE)
         self._streams: dict[str, ReconnectingStream] = {}
 
     def start_kline_stream(self, symbols_intervals: list[tuple[str, str]], on_message: MessageHandler) -> None:

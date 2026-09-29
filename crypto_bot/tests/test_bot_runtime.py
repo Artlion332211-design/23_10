@@ -9,7 +9,7 @@ from database.repository import OrderRepository, PositionRepository
 from database.session import session_scope
 from orchestration.runtime import BotRuntime
 from risk.risk_manager import RiskManager
-from utils.time import utcnow
+from utils.time import Timeframe, utcnow
 
 
 def _make_runtime(settings, rules, **overrides):
@@ -125,6 +125,49 @@ def test_evaluate_entry_respects_max_open_positions(db_engine, settings, rules):
     asyncio.run(runtime._evaluate_entry("SOLUSDT"))  # a different symbol, but the cap is already full
 
     strategy_engine.try_open_position.assert_not_called()
+
+
+def test_candle_close_enqueues_entry_evaluation_instead_of_running_it_inline(settings, rules):
+    """A candle close must not await the (slow) entry evaluation inside the
+    kline read loop - doing so for ~25 symbols overflowed python-binance's
+    message queue on a real run and dropped most symbols' candle closes."""
+    market_data = MagicMock()
+    market_data.apply_kline_message.side_effect = [
+        ("SOLUSDT", Timeframe.M15, True), ("ETHUSDT", Timeframe.M15, True), ("SOLUSDT", Timeframe.M15, True),
+    ]
+    runtime = _make_runtime(settings, rules, market_data=market_data)
+    runtime._candidate_symbols = {"SOLUSDT", "ETHUSDT"}
+    runtime._evaluate_entry = AsyncMock()
+
+    async def scenario():
+        for _ in range(3):
+            await runtime._on_kline_message({})
+        runtime._evaluate_entry.assert_not_called()
+        worker = asyncio.create_task(runtime.run_entry_evaluation_loop())
+        await asyncio.sleep(0.05)
+        worker.cancel()
+
+    asyncio.run(scenario())
+
+    evaluated = [call.args[0] for call in runtime._evaluate_entry.call_args_list]
+    assert evaluated == ["SOLUSDT", "ETHUSDT"]  # in order, and a duplicate close isn't queued twice
+
+
+def test_entry_worker_skips_symbols_dropped_from_the_universe_while_queued(settings, rules):
+    runtime = _make_runtime(settings, rules)
+    runtime._candidate_symbols = {"SOLUSDT"}
+    runtime._evaluate_entry = AsyncMock()
+    runtime._enqueue_entry_evaluation("SOLUSDT")
+    runtime._candidate_symbols = set()  # rescan dropped it before the worker got to it
+
+    async def scenario():
+        worker = asyncio.create_task(runtime.run_entry_evaluation_loop())
+        await asyncio.sleep(0.05)
+        worker.cancel()
+
+    asyncio.run(scenario())
+
+    runtime._evaluate_entry.assert_not_called()
 
 
 def test_get_balance_text_paper_mode_reports_holdings_and_equity(db_engine, settings, rules):
