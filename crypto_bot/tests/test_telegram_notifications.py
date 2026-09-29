@@ -113,7 +113,7 @@ def _status_snapshot(**overrides: object) -> StatusSnapshot:
         mode="PAPER", dry_run=False, uptime_seconds=3725, btc_regime="BULL",
         buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
         open_positions_count=2, max_open_positions=3, total_unrealized_pnl_usdt=Decimal("15.5"),
-        health={"tracked_symbols": 12},
+        max_consecutive_bad_trades=3, watched_symbols=25, market_allows_buys=True, starting=False, problems=(),
     )
     defaults.update(overrides)
     return StatusSnapshot(**defaults)  # type: ignore[arg-type]
@@ -122,10 +122,39 @@ def _status_snapshot(**overrides: object) -> StatusSnapshot:
 def test_format_status_shows_open_positions_and_pnl_state():
     text = format_status(_status_snapshot())
     assert "СТАТУС" in text
-    assert "Відкритих позицій: 2/3" in text
+    assert "Відкриті позиції: 2 з 3" in text
     assert "+15.50 USDT" in text
     assert "у плюсі" in text
-    assert "ЗРОСТАННЯ" in text
+    assert "ЗРОСТАННЯ, ринок дозволяє купівлі" in text
+    assert "Монет під наглядом: 25" in text
+    assert "Стан: все працює нормально" in text
+    assert "Обмеження: немає" in text
+
+
+def test_format_status_is_free_of_raw_diagnostics():
+    text = format_status(_status_snapshot())
+    for raw in ("tracked_symbols", "websocket", "tasks", "heartbeat", "{"):
+        assert raw not in text
+
+
+def test_format_status_surfaces_problems_and_restrictions_in_plain_language():
+    text = format_status(_status_snapshot(
+        problems=("немає зв'язку з біржею, ціни не надходять",), buy_paused=True, emergency_stop=True,
+        btc_regime="CRASH", market_allows_buys=False,
+    ))
+    assert "Стан: ПРОБЛЕМА - немає зв'язку з біржею" in text
+    assert "перевір бота" in text
+    assert "Обмеження: АВАРІЙНА ЗУПИНКА, купівлі на паузі" in text
+    assert "ОБВАЛ, ринок забороняє нові купівлі" in text
+
+
+def test_format_status_while_starting_is_not_a_problem():
+    """/status answered during startup (before market data is loaded) must
+    not tell the user something is broken - that false alarm was reported
+    on the very first restart with the new status."""
+    text = format_status(_status_snapshot(starting=True, btc_regime=None, watched_symbols=0))
+    assert "Стан: запускається" in text
+    assert "ПРОБЛЕМА" not in text
 
 
 def test_format_status_shows_minus_state_for_negative_pnl():
@@ -137,7 +166,7 @@ def test_format_status_shows_minus_state_for_negative_pnl():
 def test_format_status_handles_no_regime_and_no_positions_yet():
     text = format_status(_status_snapshot(btc_regime=None, open_positions_count=0, total_unrealized_pnl_usdt=None))
     assert "ще не розраховано" in text
-    assert "Відкритих позицій: 0/3" in text
+    assert "Відкриті позиції: 0 з 3" in text
 
 
 class _RecordingSender:

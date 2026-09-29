@@ -194,6 +194,16 @@ _EXIT_CLOSE_REASON = {
 }
 
 
+def _still_resting(result: ExecutionResult) -> bool:
+    """True for an accepted order that hasn't finished: nothing filled yet,
+    or PARTIALLY_FILLED and still in the book. A partial fill must NOT be
+    applied at submit time - the order stays tracked, and when it resolves
+    Binance reports its *cumulative* fills (myTrades for the whole order),
+    which the resolution path applies. Applying both would count the early
+    slice twice (double DCA / double-reduced position / untracked coins)."""
+    return result.net_base_quantity <= 0 or result.status == OrderStatus.PARTIALLY_FILLED
+
+
 class StrategyEngine:
     def __init__(
         self,
@@ -222,7 +232,7 @@ class StrategyEngine:
         delta = policy.min_score_delta if policy else 0.0
         return float(self._settings.min_buy_score) + delta
 
-    def _regime_allows_buy(self, level: RegimeLevel) -> bool:
+    def regime_allows_buy(self, level: RegimeLevel) -> bool:
         policy = self._rules.regime_policy.get(level.value)
         return policy.allow_buy if policy else True
 
@@ -262,7 +272,7 @@ class StrategyEngine:
         extra_vetoes: list[str] = []
         if news.critical:
             extra_vetoes.append("critical news block: " + "; ".join(news.headlines[:2]))
-        if not self._regime_allows_buy(btc_regime.level):
+        if not self.regime_allows_buy(btc_regime.level):
             extra_vetoes.append(f"BTC market regime is {btc_regime.level.value} - new positions blocked")
 
         change_1h_pct = (h1.close - h1.open) / h1.open * 100 if h1.open else 0.0
@@ -378,12 +388,12 @@ class StrategyEngine:
         if not result.accepted:
             await self._notifier.on_error(f"BUY order for {symbol} failed: {result.error_message}")
             return replace(decision, action="BLOCKED", reasons=[result.error_message or "order failed"])
-        if result.net_base_quantity <= 0:
-            # Accepted but not yet filled - a LIMIT order resting in the
-            # book, not a failure. ExecutionEngine already tracks it in
+        if _still_resting(result):
+            # Accepted but not (fully) filled yet - a LIMIT order resting in
+            # the book, not a failure. ExecutionEngine already tracks it in
             # _pending_limit_orders; process_resolved_orders() creates the
-            # Position once it actually fills, or does nothing if it times
-            # out unfilled.
+            # Position once it resolves, or does nothing if it times out
+            # unfilled.
             return replace(decision, action="BLOCKED", reasons=["order accepted, resting in book - awaiting fill or timeout"])
 
         position_id, target_price = await self._apply_entry_fill(
@@ -575,7 +585,7 @@ class StrategyEngine:
         if not result.accepted:
             await self._notifier.on_error(f"DCA order for {symbol} failed: {result.error_message}")
             return
-        if result.net_base_quantity <= 0:
+        if _still_resting(result):
             # Resting LIMIT order - process_resolved_orders() applies the
             # fill once it resolves, or does nothing if it times out unfilled.
             return
@@ -725,6 +735,8 @@ class StrategyEngine:
         if not result.accepted:
             await self._notifier.on_error(f"{error_context} for {symbol} failed: {result.error_message}")
             return None
+        if _still_resting(result):
+            return None  # applied once, in full, when process_resolved_orders() sees it resolve
         return await self._apply_sell_result(position_id, result=result, reason=reason)
 
     async def _cancel_resting_orders_for_position(

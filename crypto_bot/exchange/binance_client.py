@@ -81,6 +81,13 @@ def _extract_retry_after(exc: BinanceAPIException) -> float | None:
         return None
 
 
+_BINANCE_TIMESTAMP_OUTSIDE_RECV_WINDOW = -1021
+
+
+def _is_clock_skew(exc: BaseException) -> bool:
+    return isinstance(exc, BinanceAPIException) and exc.code == _BINANCE_TIMESTAMP_OUTSIDE_RECV_WINDOW
+
+
 def _interval_to_ms(interval: str) -> int:
     multipliers = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
     return int(interval[:-1]) * multipliers[interval[-1]]
@@ -167,6 +174,8 @@ class BinanceClient:
         def _is_retryable(exc: BaseException) -> bool:
             if isinstance(exc, BinanceAPIException) and exc.status_code in RATE_LIMIT_STATUS_CODES:
                 return True
+            if _is_clock_skew(exc):
+                return True  # rejected before processing - safe even for orders
             if not retry_ambiguous:
                 return False
             if isinstance(exc, BinanceRequestException):
@@ -192,6 +201,9 @@ class BinanceClient:
                 last_exc = exc
                 if not _is_retryable(exc) or attempt >= max_attempts:
                     raise
+                if _is_clock_skew(exc):
+                    await self._resync_server_time()
+                    continue
                 delay = min(2**attempt, 30)
                 if isinstance(exc, BinanceAPIException) and exc.status_code in RATE_LIMIT_STATUS_CODES:
                     delay = max(delay, _extract_retry_after(exc) or 0)
@@ -205,6 +217,21 @@ class BinanceClient:
                 await asyncio.sleep(delay)
         assert last_exc is not None  # pragma: no cover - loop always returns or raises
         raise last_exc
+
+    async def _resync_server_time(self) -> None:
+        """Recompute python-binance's local-vs-Binance clock offset. It is
+        only measured once, in AsyncClient.create(); when Windows later
+        corrects the system clock (a routine time sync), that stale offset
+        pushes every signed request outside recvWindow (-1021) - which, in
+        LIVE, means no balance, no orders and no exits until a restart."""
+        async with self._throttle:
+            res = await self.raw.get_server_time()
+        old = self.raw.timestamp_offset
+        self.raw.timestamp_offset = res["serverTime"] - int(time.time() * 1000)
+        logger.warning(
+            "Binance rejected a request's timestamp (-1021); clock offset resynced %+d ms -> %+d ms",
+            old, self.raw.timestamp_offset,
+        )
 
     # ------------------------------------------------------------------
     # Read-only market data (safe for any module to call)

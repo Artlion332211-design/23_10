@@ -253,3 +253,51 @@ def test_execution_engine_cancel_persists_and_clears_pending_tracking(db_engine,
     with session_scope() as session:
         stored = OrderRepository(session).get_by_client_id("bot-cancel-1")
         assert stored.status == OrderStatus.CANCELED
+
+def _fill(trade_id: str) -> ExecutionFill:
+    return ExecutionFill(
+        price=Decimal("100"), quantity=Decimal("1"), commission=Decimal("0.001"), commission_asset="SOL",
+        commission_usdt_equivalent=Decimal("0.1"), trade_id=trade_id, timestamp=utcnow(),
+    )
+
+
+def test_resolving_a_partially_filled_order_does_not_duplicate_fill_rows(db_engine, settings, filters_provider, sol_filters):
+    """A LIMIT order that partially fills on submit persists that trade; when
+    it resolves, Binance reports its cumulative fills (the same trade again
+    plus the rest) - the ledger must end up with each trade exactly once."""
+    from database.repository import FillRepository
+
+    engine = ExecutionEngine(executor=FakeExecutor(sol_filters), filters_provider=filters_provider, settings=settings, dry_run=False)
+    with session_scope() as session:
+        order = OrderRepository(session).create(
+            position_id=None, symbol="SOLUSDT", client_order_id="bot-dca-partial", side=OrderSide.BUY,
+            type=OrderType.LIMIT, purpose=OrderPurpose.DCA_1, requested_price=Decimal("100"),
+            requested_qty=Decimal("2"), requested_usdt=Decimal("200"),
+        )
+        order_id = order.id
+
+    engine._persist_result(order_id, ExecutionResult(accepted=True, status=OrderStatus.PARTIALLY_FILLED, fills=[_fill("t1")]))
+    engine._persist_result(order_id, ExecutionResult(accepted=True, status=OrderStatus.FILLED, fills=[_fill("t1"), _fill("t2")]))
+
+    with session_scope() as session:
+        trade_ids = sorted(f.trade_id for f in FillRepository(session).for_order(order_id))
+    assert trade_ids == ["t1", "t2"]
+
+
+def test_market_order_with_unknown_outcome_is_tracked_for_resolution(db_engine, settings, filters_provider, sol_filters):
+    """A MARKET order whose response was lost comes back NEW; it must be
+    polled like a resting LIMIT order or its NEW row blocks the symbol forever."""
+
+    class LostResponseExecutor(FakeExecutor):
+        async def submit(self, request):
+            return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timed out")
+
+    engine = ExecutionEngine(
+        executor=LostResponseExecutor(sol_filters), filters_provider=filters_provider, settings=settings, dry_run=False
+    )
+    asyncio.run(engine.buy(
+        symbol="SOLUSDT", usdt_amount=Decimal("100"), reference_price=Decimal("142.53"),
+        spread_percent=Decimal("0.01"), purpose=OrderPurpose.ENTRY, position_id=None,
+    ))
+
+    assert len(engine._pending_limit_orders) == 1

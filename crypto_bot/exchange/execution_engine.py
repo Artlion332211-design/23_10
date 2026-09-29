@@ -438,7 +438,13 @@ class ExecutionEngine:
             assert order is not None
             order_repo.update_status(order, result.status, binance_order_id=result.exchange_order_id)
             fill_repo = FillRepository(session)
+            # A resolved order reports its cumulative fills, including any
+            # already persisted from the submit response of a partially-
+            # filled LIMIT order - don't record the same trade twice.
+            known_trades = {f.trade_id for f in fill_repo.for_order(order.id) if f.trade_id is not None}
             for f in result.fills:
+                if f.trade_id is not None and f.trade_id in known_trades:
+                    continue
                 fill_repo.add(
                     order_id=order.id,
                     price=f.price,

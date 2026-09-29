@@ -60,6 +60,24 @@ logger = logging.getLogger(__name__)
 
 _TRACKED_TIMEFRAMES = (Timeframe.M15, Timeframe.H1, Timeframe.H4)
 _BACKFILL_BARS = 300
+# A multiplexed kline stream over ~25 symbols ticks every second or two;
+# this long without a single message means the feed is effectively down.
+_STALE_FEED_SECONDS = 120
+# Longer than a planned stream swap on universe rescan (1-3s) plus the
+# reconnect backoff's first steps, so only a real outage is reported.
+_FEED_DOWN_GRACE_SECONDS = 60
+
+
+def _minutes(seconds: float) -> int:
+    return max(1, int(seconds // 60))
+_TASK_LABELS = {
+    "position_monitor": "супровід позицій",
+    "entry_evaluator": "пошук входів",
+    "universe_scanner": "вибір монет",
+    "news_refresh": "новини",
+    "daily_report": "щоденний звіт",
+    "status_ping": "статус-повідомлення",
+}
 
 
 def _default_neutral_regime() -> RegimeAssessment:
@@ -120,6 +138,10 @@ class BotRuntime:
         # two entries can never race past the open-position/exposure caps.
         self._entry_queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued_entries: set[str] = set()
+        # Telegram starts answering before initialize() finishes (backfilling
+        # ~25 symbols x 3 timeframes takes ~30-40s); /status must say
+        # "starting" then, not report the not-yet-started feed as an outage.
+        self._initialized = False
 
     # ------------------------------------------------------------------
     # Startup
@@ -133,6 +155,7 @@ class BotRuntime:
             await self._news_engine.refresh()
             self._last_news_refresh_at = utcnow()
         self._update_btc_regime()
+        self._initialized = True
 
     def register_tasks(self) -> None:
         self._watchdog.register("position_monitor", self.run_position_monitor_loop)
@@ -473,8 +496,15 @@ class BotRuntime:
     # ------------------------------------------------------------------
 
     def get_mark_prices(self) -> dict[str, Decimal]:
+        """Live stream price per tracked symbol (what paper fills and exits
+        use), falling back to the last closed 15m candle before the first
+        stream tick arrives."""
         prices: dict[str, Decimal] = {}
         for symbol in self._tracked_symbols:
+            live = self._market_data.live_price(symbol)
+            if live is not None:
+                prices[symbol] = Decimal(str(live))
+                continue
             snap = self._market_data.snapshot(symbol, Timeframe.M15)
             if snap is not None:
                 prices[symbol] = Decimal(str(snap.close))
@@ -537,8 +567,46 @@ class BotRuntime:
             consecutive_bad_trades=flags.consecutive_bad_trades,
             open_positions_count=open_count, max_open_positions=self._settings.max_open_positions,
             total_unrealized_pnl_usdt=total_unrealized if priced_any else None,
-            health=self.get_health_snapshot(),
+            max_consecutive_bad_trades=self._settings.max_consecutive_bad_trades,
+            watched_symbols=len(self._candidate_symbols),
+            market_allows_buys=(
+                self._strategy_engine.regime_allows_buy(self._btc_regime.level) if self._btc_regime else None
+            ),
+            starting=not self._initialized,
+            problems=tuple(self._status_problems()) if self._initialized else (),
         )
+
+    def _status_problems(self) -> list[str]:
+        """Plain-language operational problems for the status message; the
+        raw diagnostics behind them stay in get_health_snapshot()/the logs.
+
+        Only conditions that need attention: a brief planned reconnect
+        (universe rescan swaps the stream) is within the grace period, and a
+        task the watchdog already restarted successfully is not a problem -
+        restart history is in the logs, and a lifetime counter here would
+        keep crying wolf for days after a single recovered hiccup."""
+        problems: list[str] = []
+        down_for = self._ws_manager.seconds_disconnected("klines")
+        kline_age = self._ws_manager.last_message_age_seconds("klines")
+        if down_for is not None and down_for > _FEED_DOWN_GRACE_SECONDS:
+            problems.append(f"немає зв'язку з біржею вже {_minutes(down_for)} хв, ціни не надходять")
+        # Not gated on being connected right now: a connection that keeps
+        # flapping (connect, close, retry) would otherwise hide hours without data.
+        elif kline_age is not None and kline_age > _STALE_FEED_SECONDS:
+            problems.append(f"ціни не оновлювались {_minutes(kline_age)} хв")
+
+        monitor_limit = max(300, 5 * self._rules.scheduler.position_monitor_interval_seconds)
+        for name, state in self._watchdog.snapshot().items():
+            label = _TASK_LABELS.get(name, name)
+            if state["gave_up"]:
+                problems.append(f"зупинилась задача \"{label}\"")
+            elif name == "position_monitor" and state["running"]:
+                heartbeat_age = float(state["seconds_since_heartbeat"])  # type: ignore[arg-type]
+                if heartbeat_age > monitor_limit:
+                    # The one loop with a fixed short cadence: a stale heartbeat
+                    # there means it's hung and open positions aren't managed.
+                    problems.append(f"задача \"{label}\" не відповідає {_minutes(heartbeat_age)} хв")
+        return problems
 
     def get_current_regime(self) -> RegimeAssessment | None:
         return self._btc_regime

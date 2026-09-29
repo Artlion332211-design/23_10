@@ -242,6 +242,7 @@ def test_get_balance_text_live_mode_shows_total_usdt_value(settings, rules):
     })
     market_data = MagicMock()
     market_data.snapshot.side_effect = lambda symbol, tf: _mock_snapshot_with_close(100.0) if symbol == "SOLUSDT" else None
+    market_data.live_price.return_value = None  # no stream tick yet -> falls back to the closed candle
     runtime = _make_runtime(settings, rules, client=client, market_data=market_data, paper_broker=None)
     runtime._tracked_symbols = {"SOLUSDT"}
 
@@ -260,11 +261,78 @@ def test_build_status_snapshot_reports_unrealized_pnl(db_engine, settings, rules
         )
     market_data = MagicMock()
     market_data.snapshot.side_effect = lambda symbol, tf: _mock_snapshot_with_close(106.0)
-    runtime = _make_runtime(settings, rules, market_data=market_data)
+    market_data.live_price.return_value = None
+    ws_manager = MagicMock()
+    ws_manager.seconds_disconnected.return_value = None
+    ws_manager.last_message_age_seconds.return_value = 1.0
+    watchdog = MagicMock()
+    watchdog.snapshot.return_value = {"position_monitor": _task()}
+    runtime = _make_runtime(settings, rules, market_data=market_data, ws_manager=ws_manager, watchdog=watchdog)
     runtime._tracked_symbols = {"SOLUSDT"}
+    runtime._initialized = True
 
     snapshot = runtime.build_status_snapshot()
 
     assert snapshot.open_positions_count == 1
     assert snapshot.total_unrealized_pnl_usdt == Decimal("6")
     assert snapshot.max_open_positions == settings.max_open_positions
+    assert snapshot.problems == ()
+
+
+def _task(*, running=True, restarts=0, gave_up=False, heartbeat=5.0):
+    return {"running": running, "restart_count": restarts, "gave_up": gave_up, "seconds_since_heartbeat": heartbeat}
+
+
+def _health_runtime(settings, rules, *, down_for=None, kline_age=1.0, tasks=None):
+    ws_manager = MagicMock()
+    ws_manager.seconds_disconnected.return_value = down_for
+    ws_manager.last_message_age_seconds.return_value = kline_age
+    watchdog = MagicMock()
+    watchdog.snapshot.return_value = tasks or {}
+    return _make_runtime(settings, rules, ws_manager=ws_manager, watchdog=watchdog)
+
+
+def test_status_problems_report_a_real_feed_outage_and_a_task_given_up(settings, rules):
+    runtime = _health_runtime(settings, rules, down_for=185.0, tasks={
+        "entry_evaluator": _task(running=False, restarts=3, gave_up=True),
+    })
+
+    assert runtime._status_problems() == [
+        "немає зв'язку з біржею вже 3 хв, ціни не надходять",
+        "зупинилась задача \"пошук входів\"",
+    ]
+
+
+def test_status_problems_ignore_a_brief_planned_reconnect(settings, rules):
+    """A universe rescan swaps the kline stream (1-3s disconnected) - a
+    status landing in that gap must not report an outage."""
+    assert _health_runtime(settings, rules, down_for=2.0)._status_problems() == []
+
+
+def test_status_problems_ignore_a_task_that_already_recovered(settings, rules):
+    """restart_count is lifetime; one recovered crash used to make every
+    later status say ПРОБЛЕМА until the next process restart."""
+    runtime = _health_runtime(settings, rules, tasks={"news_refresh": _task(restarts=1)})
+    assert runtime._status_problems() == []
+
+
+def test_status_problems_report_a_stale_feed_and_a_hung_position_monitor(settings, rules):
+    runtime = _health_runtime(settings, rules, kline_age=250.0, tasks={
+        "position_monitor": _task(heartbeat=900.0),
+        "daily_report": _task(heartbeat=40_000.0),  # legitimately sleeps for hours
+    })
+
+    assert runtime._status_problems() == [
+        "ціни не оновлювались 4 хв",
+        "задача \"супровід позицій\" не відповідає 15 хв",
+    ]
+
+
+def test_status_snapshot_says_starting_until_initialize_finishes(db_engine, settings, rules):
+    runtime = _health_runtime(settings, rules, down_for=None, kline_age=None)
+    runtime._ws_manager.is_connected.return_value = False
+
+    snapshot = runtime.build_status_snapshot()
+
+    assert snapshot.starting
+    assert snapshot.problems == ()

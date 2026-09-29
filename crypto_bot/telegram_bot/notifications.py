@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Protocol
 
 from database.models import DailyStat
 from strategy.strategy_engine import (
@@ -193,7 +193,7 @@ def format_drawdown_warning(event: DrawdownWarningEvent) -> str:
 
 
 def format_startup(mode: str, dry_run: bool, open_positions: int) -> str:
-    return f"ЗАПУСК\nРежим: {mode}{' (DRY_RUN)' if dry_run else ''}\nВідновлено відкритих позицій: {open_positions}"
+    return f"ЗАПУСК\nРежим: {_mode_text(mode, dry_run)}\nВідновлено відкритих позицій: {open_positions}"
 
 
 def format_shutdown(reason: str = "") -> str:
@@ -281,30 +281,64 @@ class StatusSnapshot:
     open_positions_count: int
     max_open_positions: int
     total_unrealized_pnl_usdt: Decimal | None
-    health: dict[str, Any]
+    max_consecutive_bad_trades: int
+    watched_symbols: int
+    # The BTC regime's verdict alone (pauses/limits are listed separately).
+    market_allows_buys: bool | None
+    # Still loading market data after a (re)start - not an outage.
+    starting: bool
+    # Human-readable operational problems (no exchange feed, a hung
+    # internal loop, ...) - empty means everything is healthy. Raw health
+    # diagnostics stay out of the message; they're in the logs.
+    problems: tuple[str, ...]
+
+
+def _mode_text(mode: str, dry_run: bool) -> str:
+    if mode == "PAPER":
+        return "PAPER (віртуальні кошти)"
+    if mode == "LIVE":
+        return "LIVE (DRY_RUN: ордери не надсилаються)" if dry_run else "LIVE (реальні кошти)"
+    return mode
 
 
 def format_status(snap: StatusSnapshot) -> str:
-    regime_text = regime_label(snap.btc_regime) if snap.btc_regime else "ще не розраховано"
+    if snap.starting:
+        health_text = "запускається, завантажую ринкові дані (до хвилини)"
+    elif snap.problems:
+        health_text = "ПРОБЛЕМА - " + "; ".join(snap.problems) + ". Напишіть Claude \"перевір бота\""
+    else:
+        health_text = "все працює нормально"
+
+    if snap.btc_regime is None:
+        market_text = "ще не розраховано"
+    else:
+        market_text = regime_label(snap.btc_regime)
+        if snap.market_allows_buys is not None:
+            market_text += ", ринок дозволяє купівлі" if snap.market_allows_buys else ", ринок забороняє нові купівлі"
+
     lines = [
         "СТАТУС",
-        f"Режим: {snap.mode}{' (DRY_RUN)' if snap.dry_run else ''}",
-        f"Час роботи: {format_uptime(snap.uptime_seconds)}",
-        f"Режим BTC: {regime_text}",
-        f"Відкритих позицій: {snap.open_positions_count}/{snap.max_open_positions}",
+        f"Режим: {_mode_text(snap.mode, snap.dry_run)}",
+        f"Працює: {format_uptime(snap.uptime_seconds)}",
+        f"Стан: {health_text}",
+        f"Ринок (BTC): {market_text}",
+        f"Монет під наглядом: {snap.watched_symbols}",
+        f"Відкриті позиції: {snap.open_positions_count} з {snap.max_open_positions}",
     ]
     if snap.total_unrealized_pnl_usdt is not None:
         pnl = snap.total_unrealized_pnl_usdt
         state = "у плюсі" if pnl > 0 else ("у мінусі" if pnl < 0 else "у нулі")
-        lines.append(f"Нереалізований PnL: {pnl:+.2f} USDT ({state})")
-    lines.append(
-        f"Купівлі призупинені: {'так' if snap.buy_paused else 'ні'}  "
-        f"DCA призупинено: {'так' if snap.dca_paused else 'ні'}  "
-        f"Аварійна зупинка: {'так' if snap.emergency_stop else 'ні'}"
-    )
-    lines.append(f"Збиткових угод поспіль: {snap.consecutive_bad_trades}")
-    for key, value in snap.health.items():
-        lines.append(f"{key}: {value}")
+        lines.append(f"Прибуток/збиток відкритих позицій: {pnl:+.2f} USDT ({state})")
+    lines.append(f"Збиткових угод поспіль: {snap.consecutive_bad_trades} з {snap.max_consecutive_bad_trades}")
+
+    limits = []
+    if snap.emergency_stop:
+        limits.append("АВАРІЙНА ЗУПИНКА")
+    if snap.buy_paused:
+        limits.append("купівлі на паузі")
+    if snap.dca_paused:
+        limits.append("докупівлі (DCA) на паузі")
+    lines.append(f"Обмеження: {', '.join(limits) if limits else 'немає'}")
     return "\n".join(lines)
 
 

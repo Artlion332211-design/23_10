@@ -352,3 +352,19 @@ def test_crash_regime_blocks_new_entry(strategy_setup):
     assert decision.action == "BLOCKED"
     with session_scope() as session:
         assert PositionRepository(session).get_open_position_for_symbol("SOLUSDT") is None
+
+def test_partially_filled_order_is_not_applied_at_submit_time():
+    """Its cumulative fills are applied once when it resolves; applying the
+    early slice at submit too would double-count it (double DCA, a sell
+    reducing the position twice)."""
+    from database.models import OrderStatus
+    from exchange.execution_engine import ExecutionResult
+    from strategy.strategy_engine import _still_resting
+
+    partial = ExecutionResult(accepted=True, status=OrderStatus.PARTIALLY_FILLED, net_base_quantity=Decimal("0.4"))
+    filled = ExecutionResult(accepted=True, status=OrderStatus.FILLED, net_base_quantity=Decimal("1"))
+    resting = ExecutionResult(accepted=True, status=OrderStatus.NEW)
+
+    assert _still_resting(partial)
+    assert _still_resting(resting)
+    assert not _still_resting(filled)

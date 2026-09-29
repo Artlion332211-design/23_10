@@ -41,7 +41,8 @@ def _default_status_snapshot() -> StatusSnapshot:
     return StatusSnapshot(
         mode="PAPER", dry_run=False, uptime_seconds=0, btc_regime=None,
         buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
-        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None, health={"last_scan": "n/a"},
+        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None,
+        max_consecutive_bad_trades=3, watched_symbols=0, market_allows_buys=None, starting=False, problems=(),
     )
 
 
@@ -79,7 +80,8 @@ def test_authorized_user_gets_a_reply(db_engine, settings, rules):
     ctx.get_status_snapshot = lambda: StatusSnapshot(
         mode=ctx.settings.mode.value, dry_run=False, uptime_seconds=0, btc_regime=None,
         buy_paused=False, dca_paused=False, emergency_stop=False, consecutive_bad_trades=0,
-        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None, health={},
+        open_positions_count=0, max_open_positions=3, total_unrealized_pnl_usdt=None,
+        max_consecutive_bad_trades=3, watched_symbols=0, market_allows_buys=None, starting=False, problems=(),
     )
     update = _make_update(user_id=42)
     context = _make_context(ctx)

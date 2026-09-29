@@ -34,20 +34,38 @@ _BACKOFF_STEPS = (2, 5, 10, 30, 60)
 # closes the connection. Headroom for a brief stall, not a license for slow
 # callbacks.
 _MAX_QUEUE_SIZE = 2000
+# ~25 symbols x 3 timeframes push updates every 1-2s; 90s of silence is a
+# dead or half-open connection, not a quiet market.
+_KLINE_INACTIVITY_SECONDS = 90.0
 
 
 class ReconnectingStream:
     """Runs one socket-manager stream forever, reconnecting with backoff on
     any drop, until `.stop()` is called."""
 
-    def __init__(self, name: str, socket_factory: Callable[[], Any], on_message: MessageHandler) -> None:
+    def __init__(
+        self,
+        name: str,
+        socket_factory: Callable[[], Any],
+        on_message: MessageHandler,
+        *,
+        inactivity_timeout: float | None = None,
+    ) -> None:
         self._name = name
         self._socket_factory = socket_factory
         self._on_message = on_message
+        # Force a reconnect after this long without a single message. Only for
+        # streams that tick constantly (klines): a half-open socket otherwise
+        # never errors, and the bot would stay blind to prices indefinitely.
+        # Never for the user-data stream, which is legitimately silent.
+        self._inactivity_timeout = inactivity_timeout
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.last_message_at: float = 0.0
         self.connected: bool = False
+        # When the stream last went from connected to not (or was created) -
+        # lets callers tell a brief planned reconnect from a real outage.
+        self.disconnected_since: float = time.monotonic()
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"ws:{self._name}")
@@ -70,24 +88,48 @@ class ReconnectingStream:
                     logger.info("WebSocket connected: %s", self._name)
                     self.connected = True
                     attempt = 0
+                    connected_at = time.monotonic()
                     while not self._stop_event.is_set():
-                        msg = await stream.recv()
-                        self.last_message_at = time.monotonic()
+                        msg = await self._recv(stream)
                         if msg is None:
+                            self._check_inactivity(connected_at)
                             continue
+                        # An error payload is not market data - it must not
+                        # make a dead feed look fresh.
                         if isinstance(msg, dict) and msg.get("e") == "error":
                             raise RuntimeError(f"Stream error payload on {self._name}: {msg}")
+                        self.last_message_at = time.monotonic()
                         await self._on_message(msg)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.connected = False
+                self._mark_disconnected()
                 if self._stop_event.is_set():
                     break
                 delay = _BACKOFF_STEPS[min(attempt, len(_BACKOFF_STEPS) - 1)]
                 logger.warning("WebSocket %s dropped (%r); reconnecting in %ss", self._name, exc, delay)
                 attempt += 1
                 await asyncio.sleep(delay)
+        self._mark_disconnected()
+
+    async def _recv(self, stream: Any) -> Any:
+        if self._inactivity_timeout is None:
+            return await stream.recv()
+        try:
+            return await asyncio.wait_for(stream.recv(), timeout=self._inactivity_timeout)
+        except TimeoutError:
+            return None
+
+    def _check_inactivity(self, connected_at: float) -> None:
+        if self._inactivity_timeout is None:
+            return
+        silent_for = time.monotonic() - max(self.last_message_at, connected_at)
+        if silent_for > self._inactivity_timeout:
+            raise TimeoutError(f"no messages on {self._name} for {silent_for:.0f}s - forcing reconnect")
+
+    def _mark_disconnected(self) -> None:
+        if self.connected:
+            self.disconnected_since = time.monotonic()
         self.connected = False
 
 
@@ -106,7 +148,9 @@ class WebSocketManager:
         async def _handle(msg: dict[str, Any]) -> None:
             await on_message(msg.get("data", msg))
 
-        stream = ReconnectingStream("klines", lambda: self._bsm.multiplex_socket(names), _handle)
+        stream = ReconnectingStream(
+            "klines", lambda: self._bsm.multiplex_socket(names), _handle, inactivity_timeout=_KLINE_INACTIVITY_SECONDS
+        )
         self._streams["klines"] = stream
         stream.start()
 
@@ -118,6 +162,14 @@ class WebSocketManager:
     def is_connected(self, name: str) -> bool:
         stream = self._streams.get(name)
         return bool(stream and stream.connected)
+
+    def seconds_disconnected(self, name: str) -> float | None:
+        """How long the named stream has been without a connection; None if
+        it's connected or not started (e.g. mid-rescan swap)."""
+        stream = self._streams.get(name)
+        if stream is None or stream.connected:
+            return None
+        return time.monotonic() - stream.disconnected_since
 
     def last_message_age_seconds(self, name: str) -> float | None:
         stream = self._streams.get(name)
