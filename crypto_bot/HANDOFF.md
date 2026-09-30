@@ -12,11 +12,14 @@ Read this once, fully, before changing strategy logic. `README.md` is the
 quick reference (setup, commands, architecture map); `DEPLOYMENT.md` is the
 Windows-server operations guide. This document is the "why" behind both.
 
-**This bot has never traded with real money.** Everything below - including
-the 3-day validation run - was PAPER mode against real market prices. Nothing
-in this document authorizes flipping `MODE=LIVE`/`DRY_RUN=false`; that
-decision belongs to the project owner alone, gated by the checklist in
-§9 of the README.
+**Status (2026-09-30): LIVE with real money.** After a few hours of PAPER
+against live Binance data on 2026-09-29, the project owner chose to switch to
+`MODE=LIVE`/`DRY_RUN=false` at 18:26 that day. Since 2026-09-30 10:06 it runs
+on a DigitalOcean droplet (§11). That was the owner's decision alone; nothing
+in this document authorizes changing the mode, sizing or risk limits without
+the owner explicitly asking. The first two days of real operation produced a
+long list of fixes (§8.11) and an incident log (`INCIDENTS.md`) - read both.
+`CLAUDE.md` holds the working rules for any Claude session on this project.
 
 ---
 
@@ -105,12 +108,21 @@ five variants of the same idea. Weights from `config/config.yaml`:
 | Signal | Category | Points | Fires when (1h timeframe unless noted) |
 |---|---|---|---|
 | `rsi_reversal` | momentum | 15 | 1h RSI(14) was oversold (<30) within the last 5 bars and is now turning up, OR 15m RSI reversal with 1h RSI < 55 |
-| `macd_bullish` | momentum | 15 | 1h MACD histogram is positive |
+| `macd_bullish` | momentum | 15 | 1h MACD bullish crossover on this bar, OR a still-negative histogram shrinking 2+ bars with accelerating momentum (`market/indicators.py::macd_bullish_signal`). NOT "histogram positive" - an earlier version of this doc said so; that was wrong |
 | `ema_trend` | trend | 20 | 1h close above EMA20 and EMA20 above EMA50 (the `ema_trend_ok` composite) |
 | `bollinger_recovery` | volatility | 12 | 1h close recovering off the lower Bollinger Band (20, 2σ) |
 | `volume_confirmation` | volume | 18 | 1h volume ≥ 1.2× its 20-bar moving average |
 | `vwap_recovery` | structure | 10 | 1h VWAP recovery, or 15m VWAP recovery |
 | `market_structure` | structure | 10 | 1h higher-low swing structure, bullish candle pattern, RSI bullish divergence, or price near a support level |
+
+**This is a pullback-reversal strategy.** Three of the seven signals
+(`rsi_reversal`, `bollinger_recovery`, `macd_bullish`) only fire when price
+turns up *after a dip*. In a steady uptrend they stay silent, so the bot
+waits: on the first live day (255 evaluations, BTC in STRONG_BULL) RSI
+reversal fired 0 times, Bollinger 0, MACD 1, and the best score was 46. A
+30-day backtest over 20 of the current candidates gave ~16 entries (about one
+every two days). "No trades for a day" is normally the strategy, not a bug -
+check per-signal fire rates and a backtest before calling it one.
 
 **Confirmation rule** (both must hold, not just the point total):
 `final_score >= MIN_BUY_SCORE` (default 75, adjusted by regime - see 3.2)
@@ -157,9 +169,14 @@ faster than the slow composite would otherwise reach it).
 ### 3.3 Everything else that can block a BUY
 
 - **News** (`news/`): only ever a *risk filter*, never a buy trigger. A
-  critical-negative news item hard-blocks; otherwise sentiment nudges the
-  score by −15..+5 (`news_adjustment`, capped small on the positive side
-  deliberately).
+  critical item (hack, exploit, delisting, ...) hard-blocks only when it
+  names *this* symbol, or is market-wide news about Binance itself; a
+  critical headline naming none of the candidates (tagged `MARKET`, e.g. a
+  hack of another exchange) only weighs on the averaged score - letting it
+  veto everything blocked 105/105 evaluations on the first live run.
+  Keywords match whole words plus inflections ("hackathon" is not "hack").
+  Otherwise sentiment nudges the score by −15..+5 (`news_adjustment`, capped
+  small on the positive side deliberately).
 - **AntiFOMO filter**: blocks if 1h change > 8%, 4h change > 15%, price is
   too far from EMA20 (in ATR units), RSI > 80, or an abnormal volume spike -
   don't chase a candle that already ran.
@@ -570,6 +587,66 @@ not overlooked:
   async SQLAlchemy - large, invasive, high-risk change with no live traffic
   yet to justify the risk. Revisit only if profiling ever shows this is a
   real bottleneck under live load.
+- **`BTC_MARKET_FILTER` and `NEWS_BLOCK_SCORE_THRESHOLD` are ignored by the
+  live/paper runtime** (only the backtest honours `BTC_MARKET_FILTER`; the
+  threshold is read nowhere). Both defaults are the safe ones; wiring them up
+  changes live behaviour, so it waits for an explicit owner decision.
+
+### 8.11 First live days (2026-09-29/30): what real operation found
+
+Running against the real exchange - first PAPER, then LIVE - surfaced
+problems no unit test had. Each fix shipped with a regression test (198
+tests now). Chronological detail, with symptoms and root causes, is in
+`INCIDENTS.md`; the short version:
+
+- **Market-data pipeline**
+  - Entry evaluation ran inline in the kline WebSocket read loop; ~25
+    evaluations at a candle close overflowed python-binance's 100-message
+    queue and dropped most closes. Now: queue + one serialized worker
+    (`BotRuntime.run_entry_evaluation_loop`), queue size 2000.
+  - Backfill seeded the still-forming REST kline as the latest *closed* bar
+    (up to 4h on the 4h series) - now dropped.
+  - Universe rescans restarted the kline stream even when unchanged - now
+    only on change.
+  - python-binance reconnects by itself after transient errors
+    (ConnectionClosedError, gaierror, ...) and reports them as queue
+    payloads. Tearing the socket down on those raced the library's own
+    reconnect and left the feed dead until the queue overflowed. Now only
+    fatal error types tear down; a 300s inactivity timeout is a last resort.
+- **Exchange access**
+  - python-binance measures the local-vs-Binance clock offset only once at
+    startup; after the OS corrected its clock every signed call failed
+    with -1021. `BinanceClient` now resyncs the offset on -1021 and retries
+    (safe even for orders - rejected before matching).
+  - `create_order` is never blindly retried on a timeout/5xx (outcome
+    unknown; Binance accepts a reused client id once filled -> double buy);
+    only 429/418 are retried, a 5xx reports NEW.
+  - An order whose outcome is unknown (NEW) is polled like a resting LIMIT
+    order; one Binance says doesn't exist (-2013) resolves as REJECTED -
+    otherwise its NEW row froze the position's exit management forever.
+  - MARKET quantities are rounded to LOT_SIZE too (spot MARKET_LOT_SIZE
+    step is 0, so they went out unrounded and would be rejected).
+- **Position accounting**
+  - A LIMIT order partially filled on submit is applied once, on
+    resolution (Binance reports cumulative fills) - it used to be applied
+    twice. Resolved orders skip fill trade ids already recorded.
+  - Base-asset buy commission leaves positions off the lot grid (7.992
+    XRP, step 0.1); the unsellable remainder kept positions OPEN forever.
+    Remainders below the symbol's real sellable minimum now close them.
+  - Paper fills use the live stream price, not the last closed 15m close.
+- **Risk / strategy plumbing**
+  - `/resume` also resets the consecutive-loss counter (the gate itself is
+    unchanged); correlation aligns returns by bar time; the leveraged-token
+    filter no longer rejects ordinary coins ending in "UP" (JUP); news
+    filter as described in §3.3.
+- **Operator experience**
+  - `/status` and the 3x/day ping are plain language: one "Стан" health
+    line that ignores startup and brief planned reconnects, reports real
+    feed outages / hung position monitor / given-up tasks.
+  - Error alerts are classified (API key, clock, rate limit, network),
+    explained in plain Ukrainian, sent once per problem per hour with a
+    repeat count, closed by a single "ВІДНОВЛЕНО"; an API-key rejection
+    includes the machine's current public IP (the key is IP-whitelisted).
 
 ---
 
@@ -577,8 +654,9 @@ not overlooked:
 
 ```bash
 cd crypto_bot
-pytest tests/ -q     # 154 tests as of this writing, all passing
-mypy .                # 0 issues across 55 source files
+pytest tests/ -q     # 198 tests as of 2026-09-30, all passing (Windows and Linux)
+mypy . --exclude '\.venv' --python-version 3.12   # 0 issues across 55 source files
+                      # (plain `mypy .` trips over numpy stubs inside a local .venv)
 ruff check .           # 0 issues
 ```
 
@@ -625,44 +703,45 @@ did.
 
 ## 11. Operational status - what's live, what's next
 
-- **Code**: pushed to `claude/binance-spot-trading-bot-sa4jfa` on
-  `artlion332211-design/23_10`. Full test suite, mypy, ruff all green as of
-  the latest commit.
-- **Not yet deployed anywhere persistent.** The 3-day validation ran in a
-  scratch environment inside this cloud session, not on any long-running
-  infrastructure - that scratch DB and its 2 positions are not the
-  project's real state going forward.
-- **Deployment target**: the project owner's own Windows machine, run as an
-  always-on local server (`DEPLOYMENT.md`), via NSSM or Task Scheduler -
-  chosen over Docker for simplicity on a single dedicated machine.
-- **Remote status bridge**: `tools/export_status.py`, scheduled to push a
-  read-only snapshot of open positions/recent trades/risk flags/recent
-  errors to a dedicated `bot-status` git branch every 15-30 minutes
-  (`DEPLOYMENT.md` §8) - this is how a cloud Claude session (with no direct
-  access to the deployment machine - see §12) can answer "what's the bot
-  doing" on request, from real (if slightly delayed) data.
-- **Still `MODE=PAPER`, `DRY_RUN=true`** in the repo's `.env`. Flipping this
-  is the project owner's call alone, after the README's "Before enabling
-  LIVE" checklist is satisfied on the actual deployment machine (fresh
-  PAPER run there, backtest over real history for the intended symbols,
-  Binance key scoped to Spot-only with withdrawals disabled, position
-  sizing reviewed for capital the owner can actually afford to lose).
+- **Code**: branch `claude/binance-spot-trading-bot-sa4jfa` on
+  `Artlion332211-design/23_10` (a **public** repository - never commit
+  secrets, IPs of the deployment or account data). Tests, mypy, ruff green.
+- **Mode: LIVE with real money** (`MODE=LIVE`, `DRY_RUN=false`) since
+  2026-09-29 18:26 - the owner's explicit choice, straight to real orders.
+  Sizing unchanged from defaults: $20 entry, DCA $50/$75/$75, max 3
+  positions, 35% exposure cap, $500/day new capital.
+- **Where it runs**: since 2026-09-30 10:06 on a DigitalOcean droplet
+  (Frankfurt, Ubuntu 24.04, 2 GB RAM, $12/mo) as the systemd service
+  `cryptobot` - see `DEPLOYMENT.md` "Linux server". Its static public IPv4
+  is the one whitelisted on the Binance API key. The first ~20 hours ran on
+  the owner's Windows laptop (NSSM service); it was retired because its
+  home ISP hands out a dynamic IP (the IP-whitelisted key stopped working
+  overnight), Wi-Fi dropped repeatedly, the clock was corrected under the
+  bot and RAM was short. The laptop's service is stopped and its `.env`
+  removed; **never run two instances** (duplicate orders + a Telegram
+  getUpdates conflict).
+- **Binance key**: Spot trading + reading only, withdrawals disabled, IP
+  restricted. The owner declined to rotate it even though it was once
+  pasted into a chat; suggest rotating it (and removing old home IPs from
+  the whitelist) when convenient, don't insist.
+- **Remote status bridge** (`tools/export_status.py`, `DEPLOYMENT.md` §8):
+  built but not scheduled - with a manager session that can SSH into the
+  server it hasn't been needed.
 
 ---
 
 ## 12. On "full access" and what's actually possible for a session working on this
 
-This project has been developed across a cloud Claude Code session with no
-direct access to the deployment machine. That's a structural fact, not a
-permissions setting - confirmed directly against Claude Code's own
-documentation (self-hosted environments require a Team/Enterprise plan and
-don't support Windows as a runner host; Remote Control lets a user steer
-their *own* local session remotely but doesn't bridge a *different* session
-into that machine). **If you are the local session this document was
-handed to, you likely DO have real terminal access to the deployment
-machine** - which is exactly why this handoff exists: use that access
-directly (per `DEPLOYMENT.md`), and don't assume you need to coordinate
-with or wait for a cloud session that structurally cannot reach you.
+History: built in a cloud Claude Code session with no access to any
+deployment machine; then operated by a local Claude Code session on the
+owner's Windows laptop (which deployed it, took it LIVE and migrated it to
+the droplet). That laptop session manages the droplet over SSH (key-only,
+user `bot`). A Claude Code session may also run on the droplet itself so the
+owner can reach a manager via Remote Control with the laptop off - it is
+started by the owner, not by another agent. Whichever session you are:
+check `systemctl status cryptobot` for a recent restart by another session
+before restarting or updating anything, and record what you did (commit
+messages, `INCIDENTS.md`).
 
 **On stopping the bot**: the bot's own `/emergency_stop` Telegram command
 (§7.1) is the real, instant, already-built kill switch - it doesn't depend
@@ -687,3 +766,39 @@ slower substitute for this unless explicitly asked to.
   without the project owner explicitly asking for that specific change -
   these exist because "capital preservation" is priority one, not
   priority four.
+- Every new production error gets an `INCIDENTS.md` entry (symptom, root
+  cause, fix, lesson) - the owner explicitly asked that mistakes be
+  recorded and learned from. Read it before diagnosing anything.
+
+---
+
+## 14. Roadmap - how this bot should evolve
+
+The owner wants the bot to keep improving. Candidates, roughly by value; each
+needs the usual tests, and anything touching strategy or risk needs the
+owner's explicit go-ahead plus a backtest comparison before it goes live:
+
+1. **Off-server backup of the SQLite DB** (open positions' average entry,
+   DCA count and targets live only there). E.g. a daily job that sends the
+   DB file to the owner's Telegram chat, or copies it off the droplet.
+   DigitalOcean's own weekly backups are an optional +20%.
+2. **Push alert when the price feed or exchange access is down for longer
+   than a few minutes** (today problems show only in `/status`, the 3x/day
+   ping, and the error alerts of failing calls).
+3. **Trade frequency vs. market regime.** The strategy only buys pullback
+   reversals (§3.1), so it can sit idle through a whole uptrend. If the
+   owner wants more activity, evaluate - in the backtest first - a
+   trend-continuation entry path with its own, stricter risk budget. Never
+   by simply lowering `MIN_BUY_SCORE`.
+4. **Wire up `BTC_MARKET_FILTER` / `NEWS_BLOCK_SCORE_THRESHOLD` in the live
+   runtime** (§8.10) - owner decision.
+5. **Housekeeping from §8.10**: concurrent position monitoring, shared
+   fee/slippage helper for paper + backtest, dust threshold from the real
+   lot step everywhere, WebSocket handshake timeout, `SymbolFilters`
+   PRICE_FILTER bounds.
+6. **Operational hygiene the owner may choose**: make the GitHub repo
+   private, rotate the Binance key, drop old home IPs from its whitelist,
+   ignore `data/*.db-wal`/`*.db-shm` in `.gitignore`.
+7. **Performance reporting**: weekly summary of closed trades (win rate,
+   avg win/loss, fees, time in trade) vs. the backtest's expectations, so
+   drift between live and backtest is noticed early.

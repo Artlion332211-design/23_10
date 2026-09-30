@@ -12,6 +12,83 @@ Windows-specific part is *how the OS keeps it running* - Windows has no
 out or the machine reboots. This guide wraps it in a proper background
 service instead.
 
+> **Current production (since 2026-09-30) is a Linux VPS, not Windows** -
+> see "Linux server" right below. A home Windows machine turned out to be a
+> weak host for an IP-whitelisted LIVE key (dynamic ISP IP, Wi-Fi drops,
+> clock corrections, shared RAM - `INCIDENTS.md` #3, #7, #9, #10). The
+> Windows sections (1-11) remain as a documented fallback.
+
+## Linux server (current production)
+
+A small VPS with a **static public IPv4** in a location Binance serves (not
+the US - it answers HTTP 451 there). Production: DigitalOcean Basic Regular
+droplet, 2 GB RAM / 1 vCPU ($12/mo, enough for the bot ~250 MB plus a
+Claude Code session), Frankfurt, Ubuntu 24.04. The droplet's own IPv4 stays
+the same until the droplet is destroyed; a DigitalOcean *Reserved IP* does
+NOT change the outbound address, so whitelist the droplet's own IP on the
+Binance key.
+
+**One-time setup** (as root, then everything as user `bot`):
+
+1. Hardening: user `bot` with your SSH key and sudo; `PermitRootLogin no`,
+   `PasswordAuthentication no`; `ufw` allow OpenSSH only (the bot needs no
+   inbound ports); unattended security upgrades with
+   `Unattended-Upgrade::Automatic-Reboot "false"` (reboot only when planned);
+   2 GB swap; timezone Europe/Kyiv; check `timedatectl` shows NTP synced.
+2. `git clone -b claude/binance-spot-trading-bot-sa4jfa <repo> ~/crypto_bot_deploy`,
+   `python3 -m venv .venv`, `pip install -r requirements.txt` (dev
+   requirements too if you run tests there - do run them once).
+3. Check Binance from the server: `curl -s -o /dev/null -w '%{http_code}'
+   https://api.binance.com/api/v3/ping` must be `200` (451 = blocked
+   location). Add the server IP to the API key's trusted IPs, then verify a
+   signed read-only call works.
+4. Copy `.env` over SSH (`scp`), `chmod 600`. Never through chat or git.
+5. systemd unit `/etc/systemd/system/cryptobot.service`:
+
+   ```ini
+   [Unit]
+   Description=crypto_bot - Binance Spot trading bot
+   Wants=network-online.target
+   After=network-online.target time-sync.target
+
+   [Service]
+   User=bot
+   WorkingDirectory=/home/bot/crypto_bot_deploy/crypto_bot
+   ExecStart=/home/bot/crypto_bot_deploy/crypto_bot/.venv/bin/python app.py
+   Environment=PYTHONUNBUFFERED=1 PYTHONUTF8=1
+   KillSignal=SIGINT
+   TimeoutStopSec=30
+   Restart=always
+   RestartSec=15
+   StartLimitIntervalSec=0
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   `KillSignal=SIGINT` gives the same clean shutdown as Ctrl+C (Telegram
+   gets ЗУПИНКА).
+
+**Moving from another machine**: confirm no open positions / unresolved
+orders, stop the old instance and remove or rename its `.env` *before*
+starting the new one (two instances = duplicate orders and a Telegram
+getUpdates conflict), copy `data/crypto_bot.db` with the SQLite backup API
+(consistent even with WAL), start with `sudo systemctl enable --now
+cryptobot`, then watch the startup lines and the next candle close (25/25
+evaluated, no errors).
+
+**Day-to-day**:
+
+```bash
+sudo systemctl status cryptobot            # or restart / stop
+journalctl -u cryptobot -n 100             # service-level output
+tail -f ~/crypto_bot_deploy/crypto_bot/logs/app.log
+cd ~/crypto_bot_deploy && git pull && sudo systemctl restart cryptobot   # update
+```
+
+Restart outside the minute around a 15-minute candle close, and back up
+`data/crypto_bot.db` before pulling an update you haven't reviewed.
+
 ## 1. Prerequisites
 
 - **Windows 10/11** (or Windows Server), with the machine set to stay
