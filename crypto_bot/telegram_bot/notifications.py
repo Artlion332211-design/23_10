@@ -15,6 +15,9 @@ error on unescaped special characters - plain text can never fail to send.
 from __future__ import annotations
 
 import logging
+import re
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
@@ -30,6 +33,9 @@ from strategy.strategy_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A repeat of the same error inside this window is counted, not re-sent.
+ERROR_REPEAT_WINDOW_SECONDS = 3600
 
 # Public: also used by telegram_bot/handlers.py (/signals, /market, /history)
 # to translate the same internal identifiers consistently everywhere they
@@ -200,8 +206,90 @@ def format_shutdown(reason: str = "") -> str:
     return "ЗУПИНКА" + (f"\nПричина: {reason}" if reason else "")
 
 
-def format_error(message: str) -> str:
-    return f"ПОМИЛКА\n{message}"
+@dataclass(frozen=True)
+class ErrorCategory:
+    key: str
+    label: str
+    explanation: str
+    exchange_related: bool  # cleared by the next successful exchange call
+
+
+# Known failure classes, matched against the raw error text. Each gets one
+# plain-language explanation instead of a raw exception dump, and repeats
+# collapse into a single alert however many symbols hit it (both a stale
+# clock offset and a changed IP hit every symbol at every candle close).
+_ERROR_CATEGORIES: list[tuple[re.Pattern[str], ErrorCategory]] = [
+    (re.compile(r"-2015|Invalid API-key|401 Unauthorized|'status': 401"), ErrorCategory(
+        "binance_auth", "ключ API",
+        "Binance не приймає ключ API. Найімовірніше, провайдер змінив IP-адресу ноутбука, а ключ прив'язаний до IP. "
+        "Додайте поточну IP на Binance: Управление API -> ключ -> Редактировать ограничения. "
+        "Поки це не виправлено, бот не бачить баланс, не купує і НЕ МОЖЕ ПРОДАТИ відкриті позиції.",
+        True,
+    )),
+    (re.compile(r"-1021|outside of the recvWindow"), ErrorCategory(
+        "binance_clock", "годинник",
+        "Годинник ноутбука розійшовся з годинником Binance. Бот сам звіряє час і повторює запит; "
+        "якщо це повідомлення повторюється, напишіть Claude \"перевір бота\".",
+        True,
+    )),
+    (re.compile(r"-1003|\b(418|429)\b|Too many requests|banned until"), ErrorCategory(
+        "binance_rate_limit", "ліміт запитів",
+        "Binance тимчасово обмежив кількість запитів. Бот зачекає й продовжить сам.",
+        True,
+    )),
+    (re.compile(r"getaddrinfo|ClientConnector|Cannot connect to host|Network is unreachable|TimeoutError|timed out"),
+     ErrorCategory(
+        "network", "інтернет",
+        "Немає зв'язку з інтернетом або з Binance. Бот сам повторить спроби, коли зв'язок повернеться.",
+        True,
+    )),
+]
+_BINANCE_ERROR_BODY = re.compile(r'"code":\s*(-?\d+),\s*"msg":\s*"([^"]*)"')
+_SYMBOL = re.compile(r"\b[A-Z0-9]{2,20}USDT\b")
+_MAX_DETAIL_CHARS = 300
+
+
+def classify_error(message: str) -> ErrorCategory | None:
+    for pattern, category in _ERROR_CATEGORIES:
+        if pattern.search(message):
+            return category
+    return None
+
+
+def error_key(message: str, category: ErrorCategory | None) -> str:
+    """What counts as "the same error" for de-duplication: the category for
+    known failure classes; otherwise the text with symbol names and numbers
+    blanked out - except order failures, which stay per symbol so a second
+    coin's failed order is never hidden behind the first."""
+    if category is not None:
+        return category.key
+    text = message if "order" in message.lower() else _SYMBOL.sub("*", message)
+    return re.sub(r"\d+", "#", text)[:160]
+
+
+def _error_detail(message: str) -> str:
+    body = _BINANCE_ERROR_BODY.search(message)
+    if body:
+        return f"{message.split(':', 1)[0]} - Binance {body.group(1)}: {body.group(2)}"
+    return message if len(message) <= _MAX_DETAIL_CHARS else message[:_MAX_DETAIL_CHARS] + "..."
+
+
+def format_error(
+    message: str, *, category: ErrorCategory | None = None, repeats: int = 0, current_ip: str | None = None
+) -> str:
+    lines = ["ПОМИЛКА"]
+    if category is not None:
+        lines.append(category.explanation)
+    if current_ip:
+        lines.append(f"Поточна IP-адреса ноутбука: {current_ip} - додайте саме її (старі адреси можна залишити).")
+    lines.append(f"Деталі: {_error_detail(message)}" if category is not None else _error_detail(message))
+    if repeats:
+        lines.append(f"(така сама помилка повторилась ще {repeats} раз(и) з попереднього повідомлення)")
+    return "\n".join(lines)
+
+
+def format_recovered(labels: list[str]) -> str:
+    return "ВІДНОВЛЕНО\nЗв'язок з Binance знову працює (" + ", ".join(labels) + "). Бот продовжує роботу."
 
 
 def format_api_error(message: str) -> str:
@@ -346,6 +434,9 @@ class TelegramSender(Protocol):
     async def send_message(self, chat_id: int, text: str) -> object: ...
 
 
+PublicIpProvider = Callable[[], Awaitable[str | None]]
+
+
 class TelegramNotifier:
     """Implements `strategy.strategy_engine.StrategyNotifier` plus the
     additional event types from the spec's Telegram section (startup,
@@ -359,9 +450,15 @@ class TelegramNotifier:
     the spec's explicit notification list.
     """
 
-    def __init__(self, sender: TelegramSender, chat_id: int) -> None:
+    def __init__(
+        self, sender: TelegramSender, chat_id: int, *, public_ip_provider: PublicIpProvider | None = None
+    ) -> None:
         self._sender = sender
         self._chat_id = chat_id
+        self._public_ip_provider = public_ip_provider
+        # error key -> (monotonic time last sent, repeats suppressed since)
+        self._active_errors: dict[str, tuple[float, int]] = {}
+        self._error_categories: dict[str, ErrorCategory] = {}
 
     async def _send(self, text: str) -> None:
         try:
@@ -394,7 +491,41 @@ class TelegramNotifier:
         await self._send(format_drawdown_warning(event))
 
     async def on_error(self, message: str) -> None:
-        await self._send(format_error(message))
+        """One alert per distinct problem: repeats of the same error within
+        ERROR_REPEAT_WINDOW_SECONDS are counted, not sent, and the count is
+        reported with the next alert once the window has passed."""
+        category = classify_error(message)
+        key = error_key(message, category)
+        now = time.monotonic()
+        last = self._active_errors.get(key)
+        if last is not None and now - last[0] < ERROR_REPEAT_WINDOW_SECONDS:
+            self._active_errors[key] = (last[0], last[1] + 1)
+            return
+        self._active_errors[key] = (now, 0)
+        if category is not None:
+            self._error_categories[key] = category
+        current_ip = await self._current_ip() if category is not None and category.key == "binance_auth" else None
+        await self._send(format_error(message, category=category, repeats=last[1] if last else 0, current_ip=current_ip))
+
+    async def _current_ip(self) -> str | None:
+        if self._public_ip_provider is None:
+            return None
+        try:
+            return await self._public_ip_provider()
+        except Exception as exc:  # noqa: BLE001 - the alert must go out even without the IP
+            logger.warning("Could not determine public IP for the API-key alert: %r", exc)
+            return None
+
+    async def mark_exchange_ok(self) -> None:
+        """Call after a successful exchange round trip: closes out any active
+        exchange/network alert with a single "recovered" message."""
+        recovered = [key for key, cat in self._error_categories.items() if cat.exchange_related]
+        if not recovered:
+            return
+        labels = [self._error_categories.pop(key).label for key in recovered]
+        for key in recovered:
+            self._active_errors.pop(key, None)
+        await self._send(format_recovered(labels))
 
     async def startup(self, mode: str, dry_run: bool, open_positions: int) -> None:
         await self._send(format_startup(mode, dry_run, open_positions))

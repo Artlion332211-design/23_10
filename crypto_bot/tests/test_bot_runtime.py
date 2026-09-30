@@ -91,6 +91,7 @@ def test_monitor_open_positions_isolates_one_bad_symbol_from_the_rest(db_engine,
     paper_broker.account.usdt_balance = Decimal("10000")
     notifier = MagicMock()
     notifier.on_error = AsyncMock()
+    notifier.mark_exchange_ok = AsyncMock()
     runtime = _make_runtime(
         settings, rules, strategy_engine=strategy_engine, paper_broker=paper_broker, notifier=notifier
     )

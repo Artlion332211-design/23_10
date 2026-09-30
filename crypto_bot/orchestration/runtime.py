@@ -316,6 +316,7 @@ class BotRuntime:
             order_book, trading_balance = await asyncio.gather(
                 self._get_order_book(symbol), self._trading_balance_usdt()
             )
+            await self._notifier.mark_exchange_ok()
             decision = await self._strategy_engine.try_open_position(
                 symbol, btc_regime=regime, trading_balance_usdt=trading_balance,
                 order_book=order_book, open_position_symbols=open_symbols,
@@ -355,6 +356,7 @@ class BotRuntime:
         # needs it to gate DCA against MAX_TOTAL_EXPOSURE_PERCENT/
         # MAX_DAILY_NEW_CAPITAL_USDT the same way entry evaluation already does.
         trading_balance = await self._trading_balance_usdt()
+        await self._notifier.mark_exchange_ok()
         for position_id, symbol in open_positions:
             try:
                 order_book = await self._get_order_book(symbol)

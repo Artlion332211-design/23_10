@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import aiohttp
+
 from config.settings import AppConfig, Settings, TradingMode, get_config
 from database.migrations import run_migrations
 from database.repository import PositionRepository
@@ -105,6 +107,26 @@ async def run_backtest_mode(config: AppConfig, args: argparse.Namespace) -> None
     print(f"\nFull report written to {report_path.parent}/")
 
 
+_PUBLIC_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
+
+
+async def _fetch_public_ip() -> str | None:
+    """This machine's current public IP, for the "Binance rejects the API key"
+    alert: the key is IP-whitelisted and the home connection's ISP hands out
+    a dynamic address, so the owner needs the new one to add it on Binance."""
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in _PUBLIC_IP_SERVICES:
+            try:
+                async with session.get(url) as response:
+                    text = (await response.text()).strip()
+                    if response.status == 200 and text:
+                        return text
+            except (aiohttp.ClientError, TimeoutError):
+                continue
+    return None
+
+
 def _build_paper_broker(settings: Settings, market_data: MarketDataStore, client: BinanceClient) -> PaperBroker:
     async def _price_source(symbol: str) -> Decimal:
         # The live stream price, not the last *closed* 15m candle's close:
@@ -160,7 +182,9 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
     )
 
     application = create_application(settings.telegram_bot_token.get_secret_value())
-    notifier = TelegramNotifier(application.bot, chat_id=settings.telegram_allowed_user_id)
+    notifier = TelegramNotifier(
+        application.bot, chat_id=settings.telegram_allowed_user_id, public_ip_provider=_fetch_public_ip
+    )
 
     strategy_engine = StrategyEngine(
         settings=settings, rules=rules, signal_engine=signal_engine, risk_manager=risk_manager,

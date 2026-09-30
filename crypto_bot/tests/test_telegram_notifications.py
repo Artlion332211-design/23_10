@@ -205,3 +205,120 @@ def test_notifier_status_ping_sends_raw_text():
     notifier = TelegramNotifier(sender, chat_id=123)
     asyncio.run(notifier.status_ping("СТАТУС\nусе гаразд"))
     assert sender.sent == [(123, "СТАТУС\nусе гаразд")]
+
+_AUTH_ERROR = (
+    "Entry evaluation error for {sym}: BinanceAPIException(<ClientResponse(https://api.binance.com/api/v3/account"
+    "?recvWindow=10000&timestamp=1790739899955&signature=abc) [401 Unauthorized]>, 401, "
+    "'{{\"code\":-2015,\"msg\":\"Invalid API-key, IP, or permissions for action.\"}}')"
+)
+
+
+def test_same_exchange_error_across_many_symbols_is_sent_once_in_plain_language():
+    """A changed IP (-2015) hit all 25 symbols at every candle close and sent
+    25 raw exception dumps each time. It must be one readable alert."""
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+
+    async def scenario():
+        for sym in ("BNBUSDT", "UUSDT", "SEIUSDT", "BTCUSDT", "ETHUSDT"):
+            await notifier.on_error(_AUTH_ERROR.format(sym=sym))
+
+    asyncio.run(scenario())
+
+    assert len(sender.sent) == 1
+    text = sender.sent[0][1]
+    assert "IP-адресу" in text
+    assert "Binance -2015: Invalid API-key, IP, or permissions for action." in text
+    assert "ClientResponse" not in text and "signature" not in text
+
+
+def test_repeats_are_counted_and_reported_after_the_window(monkeypatch):
+    import telegram_bot.notifications as n
+
+    clock = [1000.0]
+    monkeypatch.setattr(n.time, "monotonic", lambda: clock[0])
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+
+    async def scenario():
+        await notifier.on_error(_AUTH_ERROR.format(sym="BNBUSDT"))
+        await notifier.on_error(_AUTH_ERROR.format(sym="UUSDT"))
+        await notifier.on_error(_AUTH_ERROR.format(sym="SEIUSDT"))
+        clock[0] += n.ERROR_REPEAT_WINDOW_SECONDS + 1
+        await notifier.on_error(_AUTH_ERROR.format(sym="BTCUSDT"))
+
+    asyncio.run(scenario())
+
+    assert len(sender.sent) == 2
+    assert "повторилась ще 2 раз" in sender.sent[1][1]
+
+
+def test_recovery_is_announced_once_after_an_exchange_error():
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+
+    async def scenario():
+        await notifier.mark_exchange_ok()  # nothing active -> silent
+        await notifier.on_error(_AUTH_ERROR.format(sym="BNBUSDT"))
+        await notifier.mark_exchange_ok()
+        await notifier.mark_exchange_ok()  # already recovered -> silent
+        await notifier.on_error(_AUTH_ERROR.format(sym="BNBUSDT"))  # a new outage alerts again
+
+    asyncio.run(scenario())
+
+    texts = [t for _, t in sender.sent]
+    assert len(texts) == 3
+    assert texts[1].startswith("ВІДНОВЛЕНО")
+    assert "ключ API" in texts[1]
+
+
+def test_distinct_order_failures_on_different_symbols_are_not_merged():
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+
+    async def scenario():
+        await notifier.on_error("BUY order for SOLUSDT failed: insufficient balance")
+        await notifier.on_error("BUY order for ETHUSDT failed: insufficient balance")
+
+    asyncio.run(scenario())
+
+    assert len(sender.sent) == 2
+
+def test_api_key_alert_includes_the_current_public_ip():
+    """The home ISP hands out a dynamic IP and the key is IP-whitelisted -
+    the alert should say exactly which address to add on Binance."""
+    sender = _RecordingSender()
+
+    async def fake_ip():
+        return "176.107.62.119"
+
+    notifier = TelegramNotifier(sender, chat_id=123, public_ip_provider=fake_ip)
+    asyncio.run(notifier.on_error(_AUTH_ERROR.format(sym="BNBUSDT")))
+
+    assert "Поточна IP-адреса ноутбука: 176.107.62.119" in sender.sent[0][1]
+
+
+def test_api_key_alert_still_goes_out_when_the_ip_lookup_fails():
+    sender = _RecordingSender()
+
+    async def broken_ip():
+        raise OSError("no internet")
+
+    notifier = TelegramNotifier(sender, chat_id=123, public_ip_provider=broken_ip)
+    asyncio.run(notifier.on_error(_AUTH_ERROR.format(sym="BNBUSDT")))
+
+    assert len(sender.sent) == 1
+    assert "Поточна IP-адреса" not in sender.sent[0][1]
+
+
+def test_ip_lookup_is_only_done_for_api_key_errors():
+    calls = []
+
+    async def fake_ip():
+        calls.append(1)
+        return "1.2.3.4"
+
+    notifier = TelegramNotifier(_RecordingSender(), chat_id=123, public_ip_provider=fake_ip)
+    asyncio.run(notifier.on_error("Daily report failed: ValueError('x')"))
+
+    assert calls == []
