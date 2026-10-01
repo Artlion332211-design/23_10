@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
@@ -378,6 +378,7 @@ class ExecutionEngine:
         self._settings = settings
         self._dry_run = dry_run
         self._pending_limit_orders: dict[str, tuple[str, datetime]] = {}  # client_order_id -> (symbol, placed_at)
+        self._stuck_reported: set[str] = set()  # orders already reported as stuck (log once, not every poll)
 
     def _choose_order_type(self, spread_percent: Decimal) -> OrderType:
         """Tight spread -> MARKET (minimal slippage risk, instant fill).
@@ -624,7 +625,53 @@ class ExecutionEngine:
         caller (StrategyEngine) can react (retry as MARKET, finalize a
         position, etc). One order's exception is logged and skipped rather
         than aborting the poll for every other pending order this cycle.
-        """
+
+        Shorthand for `poll_pending_limit_orders` + `commit_resolution` on
+        each result. StrategyEngine calls the two halves itself so that its
+        resolution lock covers only the commit and apply, not this poll's
+        network calls."""
+        resolved: list[tuple[str, str, ExecutionResult]] = []
+        for symbol, client_order_id, result in await self.poll_pending_limit_orders():
+            try:
+                if self.commit_resolution(client_order_id, result):
+                    resolved.append((symbol, client_order_id, result))
+            except Exception as exc:  # noqa: BLE001 - still tracked, so the next poll retries it
+                logger.exception("Failed to persist resolved LIMIT order %s/%s: %r", symbol, client_order_id, exc)
+        return resolved
+
+    def commit_resolution(self, client_order_id: str, result: ExecutionResult) -> bool:
+        """Untracks and persists one final result from
+        `poll_pending_limit_orders`. Returns False, persisting nothing, if
+        another path (`cancel()` from a force-close) already resolved the row
+        while the poll was waiting on the network: that path has applied the
+        fills, so the caller must not apply them again. Synchronous on
+        purpose - no await between the row check and the write, so the two
+        paths cannot both claim the same resolution. Untracks only after the
+        write succeeds: if it raises (e.g. sqlite "database is locked"), the
+        order stays tracked and the next poll retries it, instead of leaving
+        a NEW row that nothing polls."""
+        with session_scope() as session:
+            order = OrderRepository(session).get_by_client_id(client_order_id)
+            if order is None:
+                self._pending_limit_orders.pop(client_order_id, None)
+                return True  # nothing to persist; the caller skips it as before
+            if order.status not in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+                self._pending_limit_orders.pop(client_order_id, None)
+                logger.info(
+                    "Order %s/%s was already resolved by another path - poll result dropped",
+                    order.symbol, client_order_id,
+                )
+                return False
+            order_id = order.id
+        self._persist_result(order_id, result)
+        self._pending_limit_orders.pop(client_order_id, None)
+        return True
+
+    async def poll_pending_limit_orders(self) -> list[tuple[str, str, ExecutionResult]]:
+        """The network half of `check_pending_limit_orders`: asks the
+        exchange about every tracked order and cancels the ones past the
+        timeout. Returns the final results without persisting or untracking
+        them - pass each to `commit_resolution` before applying it."""
         timeout = self._settings.limit_order_timeout_seconds
         now = utcnow()
         resolved: list[tuple[str, str, ExecutionResult]] = []
@@ -637,8 +684,6 @@ class ExecutionEngine:
                 ):
                     continue
                 if status.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
-                    del self._pending_limit_orders[client_order_id]
-                    self._persist_result_by_client_id(client_order_id, status)
                     resolved.append((symbol, client_order_id, status))
                     continue
                 if age >= timeout:
@@ -648,12 +693,34 @@ class ExecutionEngine:
                         cancel_result, symbol=symbol, client_order_id=client_order_id, age=age, timeout=timeout
                     ):
                         continue
-                    del self._pending_limit_orders[client_order_id]
-                    self._persist_result_by_client_id(client_order_id, cancel_result)
+                    if cancel_result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+                        # The cancel couldn't be confirmed (network blip, key/IP
+                        # rejection) and the fallback status says it may still be
+                        # live: keep polling it - same rule as cancel() below.
+                        # Untracking + persisting NEW here left a row nothing
+                        # polled, so has_resting_order() froze the position's
+                        # exits and DCA until a restart, silently.
+                        self._log_stuck_order(client_order_id, symbol, cancel_result.status, age, timeout)
+                        continue
                     resolved.append((symbol, client_order_id, cancel_result))
             except Exception as exc:  # noqa: BLE001 - one bad order must never block polling every other one
                 logger.exception("Failed to poll pending LIMIT order %s/%s: %r", symbol, client_order_id, exc)
         return resolved
+
+    def _log_stuck_order(
+        self, client_order_id: str, symbol: str, status: OrderStatus, age: float, timeout: float
+    ) -> None:
+        if age >= timeout * _FILL_DATA_GIVEUP_MULTIPLIER and client_order_id not in self._stuck_reported:
+            self._stuck_reported.add(client_order_id)
+            logger.error(
+                "Order %s/%s still unconfirmed (%s) %.0fs after placement - cancel keeps failing; "
+                "check it on Binance manually", symbol, client_order_id, status.value, age,
+            )
+        else:
+            logger.warning(
+                "Timeout cancel of %s/%s not confirmed (%s), will retry (age=%.0fs)",
+                symbol, client_order_id, status.value, age,
+            )
 
     def restore_pending_limit_order(self, order: Order) -> None:
         """Resumes `LIMIT_ORDER_TIMEOUT_SECONDS` tracking for a still-open
@@ -668,10 +735,48 @@ class ExecutionEngine:
         """Public cancel for callers outside the timeout-polling loop above
         (e.g. a forced position close that must not leave a resting order
         stale behind it - see `StrategyEngine._cancel_resting_orders_for_position`).
-        Mirrors exactly what `check_pending_limit_orders`'s own timeout-
-        cancel branch does, so both paths agree on how a cancel result is
-        persisted and how `_pending_limit_orders` tracking is cleared."""
+        Uses the same "is this resolved yet?" rule as
+        `check_pending_limit_orders`/`reconcile_pending_order`: only a
+        complete terminal result is persisted and untracked. Anything else
+        stays with the regular poll, which persists it and hands it to
+        `process_resolved_orders` once it really resolves.
+
+        The caller applies whatever fills come back, so a result that is
+        not final is returned with its fills stripped (status, error and
+        `fill_data_incomplete` are kept). The poll later reports the order's
+        cumulative fills. If this call also returned the partial fills, they
+        would be applied to the position twice."""
         result = await self._executor.cancel(symbol, client_order_id=client_order_id)
+        # Read the row only after the await: /emergency_stop runs in a
+        # Telegram task and can interleave with the position-monitor poll,
+        # which may have resolved this same order while the cancel was in
+        # flight.
+        with session_scope() as session:
+            order = OrderRepository(session).get_by_client_id(client_order_id)
+            already_resolved = order is not None and order.status not in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
+            placed_at = order.created_at if order is not None else utcnow()
+        if already_resolved:
+            # The poll already persisted this order and passed it on to be
+            # applied. Persisting again could overwrite FILLED with a
+            # network-blip NEW. Returning its fills would apply them a
+            # second time. Tracking it again would make the next poll
+            # resolve and apply it once more.
+            self._pending_limit_orders.pop(client_order_id, None)
+            return _without_fills(result)
+        if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED) or result.fill_data_incomplete:
+            # BinanceExecutionAdapter.cancel falls back to get_status, and
+            # get_status reports NEW whenever the real status can't be
+            # determined, for example after a network blip. Untracking and
+            # persisting that result used to leave a NEW row that nothing
+            # polled, so has_resting_order() froze the position's
+            # management until a restart. A terminal result whose fill
+            # breakdown is missing would also have been saved as a zero-fill
+            # CANCELED, losing a real partial fill. setdefault keeps the
+            # original placed_at, so a retry never restarts the timeout or
+            # give-up window. An order that isn't tracked is added back
+            # with its real placement time.
+            self._pending_limit_orders.setdefault(client_order_id, (symbol, placed_at))
+            return _without_fills(result)
         self._pending_limit_orders.pop(client_order_id, None)
         self._persist_result_by_client_id(client_order_id, result)
         return result
@@ -683,3 +788,16 @@ class ExecutionEngine:
                 return
             order_id = order.id
         self._persist_result(order_id, result)
+
+
+def _without_fills(result: ExecutionResult) -> ExecutionResult:
+    """`result` with every fill amount zeroed, for returning an order that
+    isn't final (or that another path already resolved) to a caller that
+    applies whatever fills it gets. Status, error_message and
+    `fill_data_incomplete` are kept so the caller can still tell what
+    happened. The real fills reach the position once, through whichever
+    path resolves the order."""
+    return replace(
+        result, fills=[], avg_fill_price=Decimal("0"), filled_quantity=Decimal("0"), net_base_quantity=Decimal("0"),
+        filled_quote=Decimal("0"), commission_total_usdt_equivalent=Decimal("0"),
+    )

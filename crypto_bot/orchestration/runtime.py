@@ -355,8 +355,18 @@ class BotRuntime:
         # Fetched once per cycle, not once per position - manage_position
         # needs it to gate DCA against MAX_TOTAL_EXPOSURE_PERCENT/
         # MAX_DAILY_NEW_CAPITAL_USDT the same way entry evaluation already does.
-        trading_balance = await self._trading_balance_usdt()
-        await self._notifier.mark_exchange_ok()
+        # A failed fetch must not skip the whole cycle: the hard ceiling,
+        # trailing and take-profit don't need the balance, so every position
+        # is still managed with None, which skips only DCA.
+        trading_balance: Decimal | None
+        try:
+            trading_balance = await self._trading_balance_usdt()
+        except Exception as exc:  # noqa: BLE001 - exits must still be managed without a balance
+            logger.exception("Trading balance fetch failed - managing positions without DCA this cycle: %r", exc)
+            await self._notifier.on_error(f"Balance fetch failed, DCA skipped this cycle (exits still managed): {exc!r}")
+            trading_balance = None
+        else:
+            await self._notifier.mark_exchange_ok()
         for position_id, symbol in open_positions:
             try:
                 order_book = await self._get_order_book(symbol)

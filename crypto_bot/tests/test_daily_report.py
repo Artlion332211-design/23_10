@@ -10,7 +10,9 @@ from utils.time import Timeframe, floor_to_timeframe, utcnow
 
 
 def test_build_daily_stat_aggregates_todays_closed_positions(db_engine, settings):
-    now = utcnow()
+    # Midday, not the wall clock: between 00:00 and 01:00 UTC "an hour ago"
+    # is yesterday, and the test failed every night.
+    now = floor_to_timeframe(utcnow(), Timeframe.D1) + timedelta(hours=12)
     day_start = floor_to_timeframe(now, Timeframe.D1)
     day_end = day_start + timedelta(days=1)
 

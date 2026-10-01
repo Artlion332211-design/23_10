@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import enum
+from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
-from database.models import OrderPurpose, OrderSide, OrderStatus, OrderType
-from database.repository import OrderRepository, PositionRepository
+from database.models import (
+    OrderPurpose,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionStatus,
+    SignalDecision,
+)
+from database.repository import OrderRepository, PositionRepository, SignalRepository
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
@@ -52,9 +63,14 @@ class FakeExecutor:
         self.price = Decimal("100")
         self.resting = False  # when True, submit() leaves the order resting (accepted, zero fill) instead of filling
         self.submit_calls = 0
+        self.sides: list[str] = []
+        self.delay = 0.0  # seconds each submit() stays in flight (lets a test interleave another task)
 
     async def submit(self, request):
         self.submit_calls += 1
+        self.sides.append(request.side.value)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.resting:
             return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id="resting")
         price = self.price
@@ -368,3 +384,659 @@ def test_partially_filled_order_is_not_applied_at_submit_time():
     assert _still_resting(partial)
     assert _still_resting(resting)
     assert not _still_resting(filled)
+
+
+NEUTRAL = RegimeAssessment(level=RegimeLevel.NEUTRAL, score=0, reasons=[], crash=False)
+BALANCE = Decimal("10000")
+
+
+def _open_position(strategy, book) -> int:
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book
+    ))
+    assert decision.action == "BUY"
+    with session_scope() as session:
+        return PositionRepository(session).get_open_position_for_symbol("SOLUSDT").id
+
+
+def _arm_trailing(position_id, *, peak, is_early=False):
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        PositionRepository(session).set_trailing(p, active=True, peak_price=peak, is_early=is_early)
+
+
+def _order(position_id, purpose, client_order_id, *, side=OrderSide.SELL):
+    with session_scope() as session:
+        return OrderRepository(session).create(
+            position_id=position_id, symbol="SOLUSDT", client_order_id=client_order_id,
+            side=side, type=OrderType.LIMIT, purpose=purpose,
+            requested_price=Decimal("108"), requested_qty=Decimal("0.4"), requested_usdt=Decimal("43.2"),
+        )
+
+
+def _fill(*, price=Decimal("108"), qty=Decimal("0.4"), status=OrderStatus.CANCELED):
+    """A resolved order's fill; CANCELED by default = a LIMIT that timed out partially filled."""
+    return ExecutionResult(
+        accepted=True, status=status, avg_fill_price=price, filled_quantity=qty, net_base_quantity=qty,
+        filled_quote=price * qty, commission_total_usdt_equivalent=Decimal("0.04"),
+    )
+
+
+def _errors(notifier):
+    return [e[1] for e in notifier.events if e[0] == "error"]
+
+
+def test_trailing_stop_exit_is_forced_to_market_even_on_a_wide_spread(strategy_setup):
+    """A trailing-stop exit fires into a falling price; on the book's own
+    wide spread ExecutionEngine used to place a passive LIMIT at mid that
+    can sit unfilled while the price keeps dropping."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _arm_trailing(position_id, peak=Decimal("110"))
+    wide = OrderBookSnapshot(
+        symbol="SOLUSDT", best_bid=Decimal("98"), best_ask=Decimal("102"),  # ~4% spread -> LIMIT if not forced
+        bid_depth_usdt=Decimal("50000"), ask_depth_usdt=Decimal("50000"),
+    )
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("100"), order_book=wide, trading_balance_usdt=BALANCE,
+    ))
+
+    with session_scope() as session:
+        exits = [o for o in OrderRepository(session).for_position(position_id) if o.purpose == OrderPurpose.TRAILING_STOP]
+        assert [o.type for o in exits] == [OrderType.MARKET]
+        assert PositionRepository(session).get(position_id).close_reason == "TRAILING_STOP"
+
+
+def test_partial_trailing_stop_fill_leaves_the_armed_trail_untouched(strategy_setup):
+    """Re-arming after a partial TRAILING_STOP fill reset trailing_is_early
+    and dropped the peak to the fill price - an early 1% trail silently
+    became a 2.5% trail from a lower price."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _arm_trailing(position_id, peak=Decimal("110"), is_early=True)
+    order = _order(position_id, OrderPurpose.TRAILING_STOP, "bot-trail-partial")
+
+    asyncio.run(strategy.apply_resolved_order(order, _fill(), btc_regime=NEUTRAL))
+
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        assert p.status == PositionStatus.OPEN
+        assert p.total_quantity < Decimal("0.999")  # the partial fill itself was applied
+        assert (p.trailing_active, p.trailing_peak_price, p.trailing_is_early) == (True, Decimal("110"), True)
+    assert [e[0] for e in notifier.events].count("delayed_fill") == 1
+
+
+@pytest.mark.parametrize("purpose", [OrderPurpose.EMERGENCY_SELL, OrderPurpose.HARD_CEILING])
+def test_partial_forced_close_fill_does_not_arm_trailing(strategy_setup, purpose):
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    order = _order(position_id, purpose, f"bot-{purpose.value}-partial")
+
+    asyncio.run(strategy.apply_resolved_order(order, _fill(), btc_regime=NEUTRAL))
+
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        assert p.status == PositionStatus.OPEN
+        assert p.trailing_active is False
+    assert [e[0] for e in notifier.events].count("delayed_fill") == 1
+
+
+@pytest.mark.parametrize("use_trailing_after_tp", [True, False])
+def test_partial_take_profit_fill_arms_trailing_only_with_trailing_after_tp(strategy_setup, use_trailing_after_tp):
+    strategy, executor, notifier, book = strategy_setup
+    strategy._settings = strategy._settings.model_copy(update={"use_trailing_after_tp": use_trailing_after_tp})
+    position_id = _open_position(strategy, book)
+    order = _order(position_id, OrderPurpose.TAKE_PROFIT, "bot-tp-partial")
+
+    asyncio.run(strategy.apply_resolved_order(order, _fill(), btc_regime=NEUTRAL))
+
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        assert p.trailing_active is use_trailing_after_tp
+        if use_trailing_after_tp:
+            assert (p.trailing_peak_price, p.trailing_is_early) == (Decimal("108"), False)
+
+
+def test_emergency_liquidation_waits_for_a_running_manage_position_instead_of_selling_twice(strategy_setup):
+    """/emergency_stop runs in the Telegram handler's task; while the
+    monitor's trailing-exit SELL was in flight it read the same OPEN
+    quantity and sold it a second time."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _arm_trailing(position_id, peak=Decimal("110"))
+    executor.delay = 0.01
+
+    async def scenario():
+        monitor = asyncio.create_task(strategy.manage_position(
+            position_id, btc_regime=NEUTRAL, current_price=Decimal("100"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+        await asyncio.sleep(0)  # the monitor runs up to its in-flight SELL
+        failed = await strategy.emergency_liquidate_all(order_books={"SOLUSDT": book}, btc_regime=NEUTRAL)
+        await monitor
+        return failed
+
+    failed = asyncio.run(scenario())
+
+    assert executor.sides.count("SELL") == 1
+    assert failed == []
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "TRAILING_STOP"
+
+
+class _UnknownPurpose(str, enum.Enum):
+    MYSTERY = "MYSTERY"
+
+
+def test_resolved_order_with_an_unhandled_purpose_is_reported_not_ignored(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    order = SimpleNamespace(
+        id=1, purpose=_UnknownPurpose.MYSTERY, symbol="SOLUSDT", client_order_id="bot-mystery", position_id=None,
+    )
+
+    asyncio.run(strategy.apply_resolved_order(order, _fill(status=OrderStatus.FILLED), btc_regime=NEUTRAL))
+
+    errors = _errors(notifier)
+    assert len(errors) == 1
+    assert "bot-mystery" in errors[0] and "unhandled purpose (MYSTERY)" in errors[0]
+
+
+def test_manage_position_without_a_balance_skips_only_dca(strategy_setup):
+    """A failed balance fetch used to skip the whole monitor cycle; now the
+    runtime passes None, which must block DCA (its exposure cap needs the
+    balance) but never an exit."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    submits_before = executor.submit_calls
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("97"), order_book=book, trading_balance_usdt=None,
+    ))  # -3%: DCA level 1 reached
+
+    assert executor.submit_calls == submits_before
+    assert not [e for e in notifier.events if e[0] in ("no_trade", "dca_signal")]
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        assert p.dca_count == 0
+        target = p.target_price
+
+    executor.price = target + Decimal("0.5")
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=executor.price, order_book=book, trading_balance_usdt=None,
+    ))
+
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "TAKE_PROFIT"
+
+
+def _no_trade_signals() -> int:
+    with session_scope() as session:
+        rows = SignalRepository(session).recent(limit=100, symbol="SOLUSDT")
+        return sum(1 for s in rows if s.decision == SignalDecision.NO_TRADE)
+
+
+def test_dca_scoring_runs_once_per_candle_while_price_sits_below_an_unmet_level(strategy_setup, bullish_snapshots):
+    """Every 60s tick re-scored the candidate and wrote a NO_TRADE row
+    (~40 per candle instead of 25). The scoring is now reused within one
+    15m candle, while the cheap gates still run every tick."""
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+
+    def set_candle(hour, minute):
+        m15 = make_snapshot(
+            Timeframe.M15, rsi=35.0, rsi_reversal=True, open_time=datetime(2026, 9, 30, hour, minute, tzinfo=UTC)
+        )
+        strategy._market_data.set_snapshots("SOLUSDT", m15, h1, h4)
+
+    set_candle(12, 0)
+    position_id = _open_position(strategy, book)
+    evaluations: list[str] = []
+    original_evaluate = strategy.evaluate_candidate
+
+    async def counting_evaluate(symbol, **kwargs):
+        evaluations.append(symbol)
+        return await original_evaluate(symbol, **kwargs)
+
+    strategy.evaluate_candidate = counting_evaluate
+    strategy._risk_manager.stop_dca()  # DCA level reached, but blocked on every tick
+
+    def tick():
+        asyncio.run(strategy.manage_position(
+            position_id, btc_regime=NEUTRAL, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+
+    for _ in range(3):
+        tick()
+    assert len(evaluations) == 1
+    assert _no_trade_signals() == 1
+    assert [e[0] for e in notifier.events].count("no_trade") == 1
+
+    set_candle(12, 15)  # a new candle closed -> scored (and recorded) again
+    tick()
+    assert len(evaluations) == 2
+    assert _no_trade_signals() == 2
+
+    strategy._risk_manager.start_dca()  # the gate opens mid-candle: DCA on the cached score, no re-scoring
+    tick()
+    assert len(evaluations) == 2
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).dca_count == 1
+    assert position_id not in strategy._dca_decisions
+
+
+def test_dca_fill_for_a_position_closed_meanwhile_alerts_about_untracked_coins(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    order = _order(position_id, OrderPurpose.DCA_1, "bot-dca-late", side=OrderSide.BUY)
+    with session_scope() as session:  # e.g. force-closed by the hard ceiling while the DCA LIMIT rested
+        p = PositionRepository(session).get(position_id)
+        PositionRepository(session).close(
+            p, closed_at=utcnow(), realized_pnl_usdt=Decimal("0"), realized_pnl_pct=Decimal("0"),
+            close_reason="HARD_PROFIT_CEILING",
+        )
+
+    asyncio.run(strategy.apply_resolved_order(
+        order, _fill(price=Decimal("97"), qty=Decimal("0.5"), status=OrderStatus.FILLED), btc_regime=NEUTRAL,
+    ))
+
+    errors = _errors(notifier)
+    assert len(errors) == 1
+    assert "SOLUSDT" in errors[0] and "NOT tracked" in errors[0]
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        assert p.status == PositionStatus.CLOSED
+        assert p.dca_count == 0
+
+
+def test_late_entry_fill_with_a_position_already_open_alerts_about_untracked_coins(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    order = _order(None, OrderPurpose.ENTRY, "bot-entry-late", side=OrderSide.BUY)
+
+    asyncio.run(strategy.apply_resolved_order(
+        order, _fill(price=Decimal("100"), qty=Decimal("1"), status=OrderStatus.FILLED), btc_regime=NEUTRAL,
+    ))
+
+    errors = _errors(notifier)
+    assert len(errors) == 1
+    assert "bot-entry-late" in errors[0] and "NOT tracked" in errors[0]
+    with session_scope() as session:
+        open_positions = PositionRepository(session).get_open_positions()
+        assert [p.id for p in open_positions] == [position_id]
+        assert open_positions[0].total_quantity == Decimal("0.999")  # the late fill was not folded in
+
+
+def test_entry_fill_stores_the_entry_score_and_confirmed_signals(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book
+    ))
+    assert decision.action == "BUY"
+
+    with session_scope() as session:
+        p = PositionRepository(session).get_open_position_for_symbol("SOLUSDT")
+        assert p.entry_score == round(decision.breakdown.final_score)
+        expected = {s.name: s.points for s in decision.breakdown.signals if s.confirmed}
+        assert expected and p.entry_signals == expected
+
+class _UnconfirmedCancelExecutor(FakeExecutor):
+    """cancel() can't confirm the order's fate (network blip): Binance may still hold it."""
+
+    async def cancel(self, symbol, *, client_order_id):
+        return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timeout")
+
+
+def _sells(executor) -> int:
+    return executor.sides.count("SELL")
+
+
+def test_hard_ceiling_waits_when_a_resting_sell_cannot_be_confirmed_cancelled(strategy_setup):
+    """A resting SELL whose cancel isn't confirmed may still lock the coins on
+    Binance - a full-size MARKET sell on top would be rejected or oversell.
+    The ceiling close is postponed (and retried next tick) instead."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.TAKE_PROFIT, "bot-tp-resting", side=OrderSide.SELL)
+    strategy._execution_engine._executor = _UnconfirmedCancelExecutor()
+    unconfirmed = strategy._execution_engine._executor
+    unconfirmed.price = Decimal("115")
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("115"), order_book=book, trading_balance_usdt=BALANCE,
+    ))
+
+    assert _sells(unconfirmed) == 0
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).status.value == "OPEN"
+    assert any(e[0] == "error" and "postponed" in e[1] for e in notifier.events)
+
+
+def test_hard_ceiling_still_sells_when_only_a_resting_dca_buy_is_unconfirmed(strategy_setup):
+    """A resting DCA BUY locks USDT, not the coins - the protective sell goes ahead."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.DCA_1, "bot-dca-resting", side=OrderSide.BUY)
+    strategy._execution_engine._executor = _UnconfirmedCancelExecutor()
+    unconfirmed = strategy._execution_engine._executor
+    unconfirmed.price = Decimal("115")
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("115"), order_book=book, trading_balance_usdt=BALANCE,
+    ))
+
+    assert _sells(unconfirmed) == 1
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "HARD_PROFIT_CEILING"
+
+
+def test_reused_dca_decision_still_sees_critical_news_that_arrived_mid_candle(strategy_setup, bullish_snapshots):
+    """The DCA score is cached per candle, but a critical headline must block
+    the DCA straight away, not up to 15 minutes later."""
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+    m15 = make_snapshot(Timeframe.M15, rsi=35.0, rsi_reversal=True, open_time=datetime(2026, 9, 30, 12, 0, tzinfo=UTC))
+    strategy._market_data.set_snapshots("SOLUSDT", m15, h1, h4)
+    position_id = _open_position(strategy, book)
+    strategy._risk_manager.stop_dca()
+
+    def tick():
+        asyncio.run(strategy.manage_position(
+            position_id, btc_regime=NEUTRAL, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+
+    tick()  # scored and cached (no news yet), DCA blocked by the pause
+
+    class CriticalNews:
+        async def get_symbol_news_score(self, symbol):
+            return NewsAssessment(score=-100, critical=True, headlines=["SOL exploit"])
+
+    strategy._news_provider = CriticalNews()
+    strategy._risk_manager.start_dca()  # everything else now allows the DCA
+    tick()
+
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).dca_count == 0
+
+def test_cached_dca_decision_is_not_reused_once_the_feed_goes_stale(strategy_setup, bullish_snapshots):
+    """A dead kline feed freezes the candle id; reusing the cached score would
+    DCA on stale indicators, which evaluate_candidate's own veto blocks."""
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+    m15 = make_snapshot(Timeframe.M15, rsi=35.0, rsi_reversal=True, open_time=datetime(2026, 9, 30, 12, 0, tzinfo=UTC))
+    strategy._market_data.set_snapshots("SOLUSDT", m15, h1, h4)
+    position_id = _open_position(strategy, book)
+    strategy._risk_manager.stop_dca()
+
+    def tick(regime=NEUTRAL):
+        asyncio.run(strategy.manage_position(
+            position_id, btc_regime=regime, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+
+    tick()  # scored on fresh data and cached; DCA blocked by the pause
+    strategy._market_data.is_stale = lambda symbol, tf, max_age_seconds: True
+    strategy._risk_manager.start_dca()
+    tick()
+
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).dca_count == 0
+
+
+def test_cached_dca_decision_is_rescored_when_the_btc_regime_changes(strategy_setup, bullish_snapshots):
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+    m15 = make_snapshot(Timeframe.M15, rsi=35.0, rsi_reversal=True, open_time=datetime(2026, 9, 30, 12, 0, tzinfo=UTC))
+    strategy._market_data.set_snapshots("SOLUSDT", m15, h1, h4)
+    position_id = _open_position(strategy, book)
+    strategy._risk_manager.stop_dca()
+    scored: list[str] = []
+    original_evaluate = strategy.evaluate_candidate
+
+    async def counting_evaluate(symbol, **kwargs):
+        scored.append(kwargs["btc_regime"].level.value)
+        return await original_evaluate(symbol, **kwargs)
+
+    strategy.evaluate_candidate = counting_evaluate
+    strong_bear = RegimeAssessment(level=RegimeLevel.STRONG_BEAR, score=-60, reasons=[], crash=False)
+    for regime in (NEUTRAL, NEUTRAL, strong_bear):
+        asyncio.run(strategy.manage_position(
+            position_id, btc_regime=regime, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+
+    assert scored == ["NEUTRAL", "STRONG_BEAR"]
+
+
+def test_emergency_liquidation_waits_for_a_running_order_resolution_poll(strategy_setup):
+    """The poll persists a resolved order before applying its fill; the kill
+    switch must not read the position's quantity in between."""
+    strategy, executor, notifier, book = strategy_setup
+    _open_position(strategy, book)
+
+    async def scenario():
+        await strategy._resolution_lock.acquire()  # a resolution poll is mid-flight
+        task = asyncio.create_task(strategy.emergency_liquidate_all(order_books={"SOLUSDT": book}, btc_regime=NEUTRAL))
+        await asyncio.sleep(0.05)
+        sells_while_polling = _sells(executor)
+        strategy._resolution_lock.release()
+        await task
+        return sells_while_polling
+
+    assert asyncio.run(scenario()) == 0
+    assert _sells(executor) == 1
+
+
+def _count_scoring(strategy) -> list[str]:
+    scored: list[str] = []
+    original_evaluate = strategy.evaluate_candidate
+
+    async def counting_evaluate(symbol, **kwargs):
+        scored.append(symbol)
+        return await original_evaluate(symbol, **kwargs)
+
+    strategy.evaluate_candidate = counting_evaluate
+    return scored
+
+
+def _dca_setup(strategy_setup, bullish_snapshots):
+    """An open position with price at DCA level 1 and M15 candle ids set, so
+    the DCA scoring cache is active."""
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+    m15 = make_snapshot(Timeframe.M15, rsi=35.0, rsi_reversal=True, open_time=datetime(2026, 9, 30, 12, 0, tzinfo=UTC))
+    strategy._market_data.set_snapshots("SOLUSDT", m15, h1, h4)
+    position_id = _open_position(strategy, book)
+
+    def tick():
+        asyncio.run(strategy.manage_position(
+            position_id, btc_regime=NEUTRAL, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+        ))
+
+    return position_id, m15, tick
+
+
+def test_cached_dca_decision_is_rescored_when_an_h1_candle_closes(strategy_setup, bullish_snapshots):
+    """Most confirming signals come from H1/H4; an H1 close in the middle of
+    an M15 candle changes them, so the cached score must not outlive it."""
+    strategy, executor, notifier, book = strategy_setup
+    _m15, h1, h4 = bullish_snapshots
+    _position_id, m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+    strategy._risk_manager.stop_dca()
+    scored = _count_scoring(strategy)
+
+    tick()
+    tick()
+    assert len(scored) == 1
+    strategy._market_data.set_snapshots(
+        "SOLUSDT", m15, dataclasses.replace(h1, open_time=datetime(2026, 9, 30, 12, 0, tzinfo=UTC)), h4,
+    )
+    tick()
+
+    assert len(scored) == 2
+
+
+def test_cached_dca_decision_is_rescored_when_the_news_score_changes(strategy_setup, bullish_snapshots):
+    """Non-critical news still moves the score by up to -15/+5 points, enough
+    to cross the buy threshold either way."""
+    strategy, executor, notifier, book = strategy_setup
+    _position_id, _m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+    strategy._risk_manager.stop_dca()
+
+    class MutableNews:
+        score = 0
+
+        async def get_symbol_news_score(self, symbol):
+            return NewsAssessment(score=self.score, critical=False, headlines=[])
+
+    news = MutableNews()
+    strategy._news_provider = news
+    scored = _count_scoring(strategy)
+
+    tick()
+    tick()
+    assert len(scored) == 1
+    news.score = -60
+    tick()
+    tick()
+
+    assert len(scored) == 2
+
+
+def test_stale_data_block_is_not_cached_for_dca(strategy_setup, bullish_snapshots):
+    """A 'stale market data' block was cached for the rest of the candle, so
+    DCA stayed blocked after the feed recovered."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id, _m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+    scored = _count_scoring(strategy)
+
+    strategy._market_data.is_stale = lambda symbol, tf, max_age_seconds: True
+    tick()
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).dca_count == 0
+    strategy._market_data.is_stale = lambda symbol, tf, max_age_seconds: False
+    tick()
+
+    assert len(scored) == 2
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).dca_count == 1
+
+
+def test_force_close_leaves_an_unconfirmed_cancel_to_the_poll_without_a_false_alert(strategy_setup):
+    """A cancel that comes back without a complete fill breakdown isn't a final
+    answer. Applying it raised "Check Binance manually" for an order the
+    regular poll was still handling; now it stays tracked and unapplied."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.DCA_1, "bot-dca-incomplete", side=OrderSide.BUY)
+
+    class IncompleteCancel(FakeExecutor):
+        async def cancel(self, symbol, *, client_order_id):
+            return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, fill_data_incomplete=True)
+
+    incomplete = IncompleteCancel()
+    incomplete.price = Decimal("115")
+    strategy._execution_engine._executor = incomplete
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("115"), order_book=book, trading_balance_usdt=BALANCE,
+    ))
+
+    assert not [e for e in _errors(notifier) if "Check Binance manually" in e]
+    assert "bot-dca-incomplete" in strategy._execution_engine._pending_limit_orders
+    with session_scope() as session:
+        assert OrderRepository(session).get_by_client_id("bot-dca-incomplete").status == OrderStatus.NEW
+        assert PositionRepository(session).get(position_id).close_reason == "HARD_PROFIT_CEILING"
+
+
+def test_emergency_liquidation_reports_a_dca_buy_it_could_not_cancel(strategy_setup):
+    """The position is sold, but a DCA BUY that may still be live on Binance
+    can refill it; the kill switch must not report a clean liquidation."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.DCA_1, "bot-dca-unconfirmed", side=OrderSide.BUY)
+    unconfirmed = _UnconfirmedCancelExecutor()
+    strategy._execution_engine._executor = unconfirmed
+
+    failed = asyncio.run(strategy.emergency_liquidate_all(order_books={"SOLUSDT": book}, btc_regime=NEUTRAL))
+
+    assert failed == ["SOLUSDT"]
+    assert _sells(unconfirmed) == 1
+    assert any("bot-dca-unconfirmed" in e and "manually" in e for e in _errors(notifier))
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "EMERGENCY_SELL"
+
+
+def test_emergency_liquidation_is_not_held_up_by_a_slow_order_poll(strategy_setup):
+    """The resolution lock used to cover the poll's Binance calls, so
+    /emergency_stop could wait behind a slow network. The poll now waits
+    outside the lock. When it finally returns, the order it asked about has
+    already been cancelled and applied by the liquidation, so its result
+    must be dropped, not applied a second time."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.TAKE_PROFIT, "bot-tp-slow")
+    strategy._execution_engine._pending_limit_orders["bot-tp-slow"] = ("SOLUSDT", utcnow())
+    tp_filled = _fill(status=OrderStatus.FILLED)  # 0.4 of the position sold at 108
+
+    class SlowPoll(FakeExecutor):
+        release: asyncio.Event
+
+        async def get_status(self, symbol, *, client_order_id):
+            await self.release.wait()
+            return tp_filled
+
+        async def cancel(self, symbol, *, client_order_id):
+            return tp_filled
+
+    slow = SlowPoll()
+    strategy._execution_engine._executor = slow
+
+    async def scenario():
+        slow.release = asyncio.Event()
+        poll = asyncio.create_task(strategy.process_resolved_orders(btc_regime=NEUTRAL))
+        await asyncio.sleep(0)  # the poll is now waiting on Binance
+        failed = await asyncio.wait_for(
+            strategy.emergency_liquidate_all(order_books={"SOLUSDT": book}, btc_regime=NEUTRAL), timeout=1,
+        )
+        events_before_poll = list(notifier.events)
+        slow.release.set()
+        await poll
+        return failed, events_before_poll
+
+    failed, events_before_poll = asyncio.run(scenario())
+
+    assert failed == []
+    assert _sells(slow) == 1
+    assert notifier.events == events_before_poll  # the poll's late result changed nothing
+    assert not _errors(notifier)
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "EMERGENCY_SELL"
+        assert OrderRepository(session).get_by_client_id("bot-tp-slow").status == OrderStatus.FILLED
+
+
+def test_one_coin_failing_does_not_stop_emergency_liquidation_of_the_others(strategy_setup):
+    """An exception while liquidating one position escaped the loop, so
+    /emergency_stop never even tried to sell the remaining positions."""
+    strategy, executor, notifier, book = strategy_setup
+    sol_id = _open_position(strategy, book)
+    _order(sol_id, OrderPurpose.TAKE_PROFIT, "bot-tp-boom")
+    with session_scope() as session:
+        eth_id = PositionRepository(session).create(
+            symbol="ETHUSDT", opened_at=utcnow(), avg_entry_price=Decimal("100"), total_quantity=Decimal("0.5"),
+            total_cost_usdt=Decimal("50"), target_price=Decimal("110"),
+        ).id
+
+    class CancelBlowsUp(FakeExecutor):
+        async def cancel(self, symbol, *, client_order_id):
+            raise RuntimeError("boom")
+
+    exploding = CancelBlowsUp()
+    strategy._execution_engine._executor = exploding
+
+    failed = asyncio.run(strategy.emergency_liquidate_all(
+        order_books={"SOLUSDT": book, "ETHUSDT": book}, btc_regime=NEUTRAL,
+    ))
+
+    assert failed == ["SOLUSDT"]
+    assert any("SOLUSDT" in e and "failed" in e for e in _errors(notifier))
+    with session_scope() as session:
+        assert PositionRepository(session).get(sol_id).status == PositionStatus.OPEN
+        assert PositionRepository(session).get(eth_id).close_reason == "EMERGENCY_SELL"

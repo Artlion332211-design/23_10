@@ -9,9 +9,10 @@ exists to survive a restart and answer to Telegram commands, neither of
 which apply to a deterministic historical replay), so this module tracks
 the same limits - open positions, exposure, daily capital, consecutive
 losses, crash pause - with a lightweight in-memory `_BacktestPortfolio`
-instead. One behavioral difference from live is called out where it
-happens below (auto-clearing the consecutive-loss pause on a win, since a
-backtest has no operator to send `/resume`).
+instead. A backtest has no operator to send `/resume`, so the
+consecutive-loss pause is lifted automatically instead - by a win, or by
+`BACKTEST_RESUME_AFTER_HOURS` of simulated time standing in for the
+owner's `/resume` - both called out where they happen below.
 
 No look-ahead by construction: every timeframe's indicators are computed
 once, vectorized, over the whole causal series (`market.indicators`), and
@@ -28,7 +29,13 @@ from typing import Any, Protocol
 
 import pandas as pd
 
-from backtest.metrics import BacktestMetrics, EquityPoint, TradeRecord, compute_metrics
+from backtest.metrics import (
+    OPEN_AT_END_REASON,
+    BacktestMetrics,
+    EquityPoint,
+    TradeRecord,
+    compute_metrics,
+)
 from config.settings import RulesConfig, Settings
 from market.indicators import compute_all_indicators
 from market.market_data import IndicatorSnapshot
@@ -50,6 +57,14 @@ from utils.time import Timeframe
 logger = logging.getLogger(__name__)
 
 _PREV_COLUMNS = ("rsi", "macd_hist", "obv")
+
+# Models the owner's /resume: simulated hours after a consecutive-loss pause
+# starts until the backtest lifts it (and resets the loss counter, exactly as
+# `RiskManager.resume_trading` does). Live, the pause holds until the owner
+# reviews it; a replay has no owner, and with no position open no win can
+# ever arrive to clear it - one losing streak would otherwise end every new
+# entry for the rest of the run.
+BACKTEST_RESUME_AFTER_HOURS = 24
 
 
 class NewsProviderLike(Protocol):
@@ -168,6 +183,7 @@ class _BacktestPortfolio:
         self.open_positions: dict[str, _OpenPosition] = {}
         self.consecutive_bad_trades = 0
         self.buy_paused = False
+        self.buy_paused_since: pd.Timestamp | None = None
         self.daily_new_capital: dict[str, Decimal] = {}
         self.total_fees = Decimal("0")
 
@@ -225,7 +241,7 @@ class _BacktestPortfolio:
     def register_deployed(self, day: str, amount: Decimal) -> None:
         self.daily_new_capital[day] = self.daily_new_capital.get(day, Decimal("0")) + amount
 
-    def register_trade_result(self, is_win: bool) -> None:
+    def register_trade_result(self, is_win: bool, now: pd.Timestamp) -> None:
         if is_win:
             self.consecutive_bad_trades = 0
             # Diverges from live RiskManager (which needs an explicit
@@ -233,10 +249,29 @@ class _BacktestPortfolio:
             # auto-pause is what makes the circuit breaker mean anything
             # over a multi-month replay instead of ending the run early.
             self.buy_paused = False
+            self.buy_paused_since = None
         else:
             self.consecutive_bad_trades += 1
             if self.consecutive_bad_trades >= self.settings.max_consecutive_bad_trades:
+                # The resume clock starts when the pause does: more losses
+                # from positions still open during it don't push it back
+                # (live, one /resume lifts the pause however many followed).
+                if not self.buy_paused:
+                    self.buy_paused_since = now
                 self.buy_paused = True
+
+    def resume_if_due(self, now: pd.Timestamp) -> None:
+        """The backtest's stand-in for the owner's `/resume`: once
+        `BACKTEST_RESUME_AFTER_HOURS` of simulated time have passed since
+        the loss-streak pause began, lift it and reset the loss counter like
+        `RiskManager.resume_trading` does - leaving the counter at the limit
+        would make the very next loss re-pause immediately."""
+        if self.buy_paused_since is None:
+            return
+        if now - self.buy_paused_since >= pd.Timedelta(hours=BACKTEST_RESUME_AFTER_HOURS):
+            self.buy_paused = False
+            self.buy_paused_since = None
+            self.consecutive_bad_trades = 0
 
 
 @dataclass
@@ -322,6 +357,11 @@ class BacktestEngine:
             equity_curve.append(EquityPoint(timestamp=ts.to_pydatetime(), equity_usdt=portfolio.equity(mark_prices)))
             day_str = ts.date().isoformat()
 
+            # Checked every bar, before any close can register a new loss,
+            # so a loss arriving after the simulated /resume counts toward a
+            # fresh streak rather than the one already paused for.
+            portfolio.resume_if_due(ts)
+
             for symbol in list(portfolio.open_positions.keys()):
                 row = symbol_merged[symbol].loc[ts]
                 if pd.isna(row.get("rsi_h1")):
@@ -355,18 +395,19 @@ class BacktestEngine:
         trades: list[TradeRecord],
     ) -> None:
         """A position opened near the end of the backtested window is a real
-        outcome, not a non-event: without this, trade-level statistics
-        (num_trades, win_rate, avg holding time, ...) would silently
-        undercount whenever a symbol's average holding time approaches the
-        window length - most sharply felt by the walk-forward optimizer's
-        validation/test segments, which are short by design. This marks
-        each still-open position to the last available close price with a
-        distinct `close_reason="OPEN_AT_END"` so it's identifiable in
-        reports; no sell fee/slippage is simulated since nothing was
-        actually sold - this is a mark-to-market valuation, not a fill.
-        The equity curve already reflected this value throughout (its
-        per-bar mark-to-market includes open positions), so total
-        return/drawdown/Sharpe are unaffected either way.
+        outcome, not a non-event: dropping it would silently hide capital
+        still at risk whenever a symbol's average holding time approaches
+        the window length - most sharply felt by the walk-forward
+        optimizer's validation/test segments, which are short by design.
+        This marks each still-open position to the last available close
+        price with a distinct `close_reason=OPEN_AT_END_REASON` so it's
+        identifiable in reports; no sell fee/slippage is simulated since
+        nothing was actually sold - this is a mark-to-market valuation, not
+        a fill. For that reason `compute_metrics` reports these records
+        separately ("still open at end") instead of counting them as
+        finished trades. The equity curve already reflected this value
+        throughout (its per-bar mark-to-market includes open positions), so
+        total return/drawdown/Sharpe are unaffected either way.
         """
         for symbol in list(portfolio.open_positions.keys()):
             pos = portfolio.open_positions.pop(symbol)
@@ -385,7 +426,7 @@ class BacktestEngine:
                     symbol=symbol, opened_at=pos.opened_at, closed_at=final_ts.to_pydatetime(),
                     avg_entry_price=pos.avg_entry_price, exit_price=exit_price, quantity=pos.total_quantity,
                     cost_usdt=pos.total_cost_usdt, proceeds_usdt=proceeds, net_pnl_usdt=net_pnl,
-                    net_pnl_percent=net_pnl_pct, dca_count=pos.dca_count, close_reason="OPEN_AT_END",
+                    net_pnl_percent=net_pnl_pct, dca_count=pos.dca_count, close_reason=OPEN_AT_END_REASON,
                     worst_drawdown_percent=min(0.0, worst_dd),
                 )
             )
@@ -637,7 +678,7 @@ class BacktestEngine:
         fully_closed = pos.total_quantity <= dust
         if fully_closed:
             portfolio.open_positions.pop(symbol)
-            portfolio.register_trade_result(is_win=pos.realized_pnl_usdt > 0)
+            portfolio.register_trade_result(is_win=pos.realized_pnl_usdt > 0, now=ts)
         return fully_closed
 
     @staticmethod

@@ -72,6 +72,12 @@ class PaperBroker:
             usdt_balance=starting_balance if starting_balance is not None else settings.paper_starting_balance_usdt
         )
         self._resting: dict[str, OrderRequest] = {}
+        # Final results of resting orders that have since resolved. Binance
+        # still answers get_status/cancel for a filled order with its real
+        # result; answering "not found" instead let /emergency_stop save a
+        # REJECTED over a fill the order poll had just picked up, which then
+        # dropped that fill as already resolved.
+        self._resolved: dict[str, ExecutionResult] = {}
 
     def get_total_equity(self, mark_prices: dict[str, Decimal]) -> Decimal:
         return self.account.total_equity(mark_prices)
@@ -97,17 +103,33 @@ class PaperBroker:
         self._resting[request.client_order_id] = request
         return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id=f"paper-{request.client_order_id}")
 
+    def _not_resting(self, client_order_id: str) -> ExecutionResult:
+        """Mirrors live for an order that is no longer open: Binance's cancel
+        is rejected and BinanceExecutionAdapter falls back to get_status,
+        which reports the order's real final result. Only an order this
+        broker never saw comes back REJECTED - never a silent "cancelled"."""
+        resolved = self._resolved.get(client_order_id)
+        if resolved is not None:
+            return resolved
+        return ExecutionResult(
+            accepted=False, status=OrderStatus.REJECTED, error_message="paper order not found (already resolved)",
+        )
+
+    def _take_resting(self, client_order_id: str, result: ExecutionResult) -> ExecutionResult:
+        """Removes a resting order and records its final result. Called with
+        no await between the caller's re-check and this, so a concurrent
+        cancel and get_status can't both resolve (or both delete) it."""
+        del self._resting[client_order_id]
+        self._resolved[client_order_id] = result
+        return result
+
     async def cancel(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
-        request = self._resting.get(client_order_id)
-        if request is None:
-            # Mirrors live: cancelling an order Binance no longer considers
-            # open (already filled/cancelled/unknown) comes back rejected,
-            # never a silent, unconditional "cancelled".
-            return ExecutionResult(
-                accepted=False, status=OrderStatus.REJECTED,
-                error_message="paper order not found (already resolved)",
-            )
+        if client_order_id not in self._resting:
+            return self._not_resting(client_order_id)
         current_price = await self._price_source(symbol)
+        request = self._resting.get(client_order_id)
+        if request is None:  # a concurrent get_status/cancel resolved it during the await
+            return self._not_resting(client_order_id)
         if self._is_marketable(request, current_price):
             # Mirrors live: a cancel that loses the race against a matching
             # engine which already crossed the limit price comes back
@@ -121,23 +143,23 @@ class PaperBroker:
             # a phantom empty cancel and force-close the stale pre-fill
             # quantity instead of the true remainder - exactly the scenario
             # those callers exist to handle correctly.
-            del self._resting[client_order_id]
             assert request.limit_price is not None
-            return self._fill_at(request, request.limit_price)
-        del self._resting[client_order_id]
-        return ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id=f"paper-{client_order_id}")
+            return self._take_resting(client_order_id, self._fill_at(request, request.limit_price))
+        return self._take_resting(
+            client_order_id,
+            ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id=f"paper-{client_order_id}"),
+        )
 
     async def get_status(self, symbol: str, *, client_order_id: str) -> ExecutionResult:
-        request = self._resting.get(client_order_id)
-        if request is None:
-            return ExecutionResult(
-                accepted=False, status=OrderStatus.REJECTED, error_message="paper order not found (already resolved)"
-            )
+        if client_order_id not in self._resting:
+            return self._not_resting(client_order_id)
         current_price = await self._price_source(symbol)
+        request = self._resting.get(client_order_id)
+        if request is None:  # a concurrent get_status/cancel resolved it during the await
+            return self._not_resting(client_order_id)
         if self._is_marketable(request, current_price):
-            del self._resting[client_order_id]
             assert request.limit_price is not None
-            return self._fill_at(request, request.limit_price)
+            return self._take_resting(client_order_id, self._fill_at(request, request.limit_price))
         return ExecutionResult(accepted=True, status=OrderStatus.NEW, exchange_order_id=f"paper-{client_order_id}")
 
     @staticmethod

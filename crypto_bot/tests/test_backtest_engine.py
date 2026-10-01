@@ -6,9 +6,24 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest.engine import BacktestEngine, merge_aligned, prepare_symbol_frames
-from backtest.metrics import BacktestMetrics, EquityPoint, TradeRecord, compute_metrics
+import backtest.engine as engine_module
+from backtest.engine import (
+    BACKTEST_RESUME_AFTER_HOURS,
+    BacktestEngine,
+    _BacktestPortfolio,
+    merge_aligned,
+    prepare_symbol_frames,
+)
+from backtest.metrics import (
+    OPEN_AT_END_REASON,
+    BacktestMetrics,
+    EquityPoint,
+    TradeRecord,
+    compute_metrics,
+)
 from backtest.optimizer import default_objective, grid_search, split_chronologically
+from backtest.reports import format_summary
+from market.market_regime import RegimeAssessment, RegimeLevel
 
 
 def _synthetic_ohlcv(n: int, *, seed: int, regime: str = "trend_with_dip") -> pd.DataFrame:
@@ -92,9 +107,10 @@ def test_backtest_engine_runs_end_to_end_on_synthetic_data(settings, rules):
 def test_position_still_open_when_data_ends_is_marked_not_dropped(settings, rules):
     """A position opened near the end of the backtested window (and thus
     unable to reach take-profit/DCA-exit before the data runs out) must
-    still show up in result.trades - dropping it would silently undercount
-    trade statistics on any short window, which is exactly the walk-forward
-    optimizer's validation/test segments."""
+    still show up in result.trades and be reported as still open - dropping
+    it would silently hide capital at risk on any short window, which is
+    exactly the walk-forward optimizer's validation/test segments. It is a
+    mark, not a result, so it must not count as a closed trade."""
     n = 2000
     symbol_klines = {"AAAUSDT": _synthetic_ohlcv(n, seed=10, regime="trend_with_dip")}
     btc_klines = _synthetic_ohlcv(n, seed=12, regime="trend_with_dip")
@@ -124,6 +140,12 @@ def test_position_still_open_when_data_ends_is_marked_not_dropped(settings, rule
     # are exactly quantity x last close price.
     last_close = Decimal(str(truncated_symbol["AAAUSDT"]["close"].iloc[-1]))
     assert open_at_end[0].proceeds_usdt == open_at_end[0].quantity * last_close
+
+    assert truncated_result.metrics.open_at_end_count == 1
+    assert truncated_result.metrics.open_at_end_unrealized_pnl_usdt == open_at_end[0].net_pnl_usdt
+    still_open_keys = {(t.symbol, t.opened_at) for t in open_at_end}
+    closed_keys = {(t.symbol, t.opened_at) for t in truncated_result.trades} - still_open_keys
+    assert truncated_result.metrics.num_trades == len(closed_keys)
 
 
 def test_backtest_pauses_new_buys_during_simulated_crash(settings, rules):
@@ -177,6 +199,131 @@ def test_compute_metrics_basic_sanity():
     assert metrics.max_drawdown_percent < 0
     assert metrics.dca_frequency_percent == 50.0
     assert metrics.avg_dca_count == 0.5
+
+
+def _record(symbol, opened_at, closed_at, *, cost, pnl, reason, dca_count=0, worst_dd=0.0):
+    return TradeRecord(
+        symbol=symbol, opened_at=opened_at, closed_at=closed_at,
+        avg_entry_price=Decimal("100"), exit_price=Decimal("100"), quantity=Decimal(cost) / 100,
+        cost_usdt=Decimal(cost), proceeds_usdt=Decimal(cost) + Decimal(pnl), net_pnl_usdt=Decimal(pnl),
+        net_pnl_percent=Decimal(pnl) / Decimal(cost) * 100, dca_count=dca_count, close_reason=reason,
+        worst_drawdown_percent=worst_dd,
+    )
+
+
+def test_compute_metrics_counts_closed_positions_not_sell_slices_or_open_marks():
+    """Regression: every TradeRecord used to count as a trade, so a partial
+    take-profit position read as two trades (a win and, here, a loss) and
+    positions still open when the data ended counted as finished trades on
+    their mark-to-market alone. Trade stats are per closed position now;
+    still-open ones are reported separately, and balance/equity/exposure
+    figures still see every record."""
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    day = [(start + pd.Timedelta(days=i)).to_pydatetime() for i in range(6)]
+    equity_curve = [EquityPoint(timestamp=d, equity_usdt=Decimal(v)) for d, v in zip(day, [10000, 10005, 10002, 10002, 10008, 10000], strict=True)]
+    trades = [
+        # A: partial TP (+5) then its remainder trails out at -1 -> ONE +4 USDT winner over 100 USDT, 48h.
+        _record("AAAUSDT", day[0], day[1], cost=60, pnl=5, reason="TAKE_PROFIT_PARTIAL", dca_count=1),
+        _record("AAAUSDT", day[0], day[2], cost=40, pnl=-1, reason="TRAILING_STOP", dca_count=1),
+        # B: a plain -2 USDT loser, 24h.
+        _record("BBBUSDT", day[1], day[2], cost=100, pnl=-2, reason="TRAILING_STOP"),
+        # C: still open at the end, underwater.
+        _record("CCCUSDT", day[3], day[5], cost=100, pnl=-3, reason=OPEN_AT_END_REASON, dca_count=2, worst_dd=-12.0),
+        # D: partial TP taken, remainder still open -> the position isn't finished.
+        _record("AAAUSDT", day[3], day[4], cost=60, pnl=6, reason="TAKE_PROFIT_PARTIAL"),
+        _record("AAAUSDT", day[3], day[5], cost=40, pnl=1, reason=OPEN_AT_END_REASON),
+    ]
+
+    metrics = compute_metrics(trades, equity_curve, Decimal("10000"), Decimal("1"))
+
+    assert metrics.num_trades == 2
+    assert metrics.win_rate == 50.0
+    assert metrics.avg_profit_percent == pytest.approx(4.0)
+    assert metrics.avg_loss_percent == pytest.approx(-2.0)
+    assert metrics.profit_factor == pytest.approx(2.0)
+    assert metrics.avg_holding_time_hours == pytest.approx(36.0)
+    assert metrics.dca_frequency_percent == 50.0
+    assert metrics.avg_dca_count == 0.5
+    assert metrics.open_at_end_count == 2
+    assert metrics.open_at_end_unrealized_pnl_usdt == Decimal("-2")
+
+    # Unchanged, every record included: 580 USDT-days deployed over 5 days of a 10000 account.
+    assert metrics.exposure_percent == pytest.approx(580 / (10000 * 5) * 100)
+    assert metrics.worst_position_drawdown_percent == -12.0
+    assert metrics.ending_balance == Decimal("10000")
+
+    summary = format_summary(metrics, symbols=["AAAUSDT", "BBBUSDT", "CCCUSDT"])
+    assert "Trades: 2 " in summary
+    assert "Still open at end: 2 " in summary
+
+
+def test_loss_streak_pause_lifts_after_simulated_resume_window(settings):
+    """Regression: the consecutive-loss pause cleared only on a win, but
+    with no position open no win can happen, so one streak blocked every
+    new entry for the rest of the run. BACKTEST_RESUME_AFTER_HOURS of
+    simulated time now stands in for the owner's /resume, which also
+    resets the loss counter."""
+    tuned = settings.model_copy(update={"max_consecutive_bad_trades": 3})
+    portfolio = _BacktestPortfolio(tuned, Decimal("10000"))
+    neutral = RegimeAssessment(level=RegimeLevel.NEUTRAL, score=0.0, reasons=[], crash=False)
+    t0 = pd.Timestamp("2024-01-05 12:00", tz="UTC")
+    resume_at = t0 + pd.Timedelta(hours=BACKTEST_RESUME_AFTER_HOURS)
+
+    for _ in range(3):
+        portfolio.register_trade_result(is_win=False, now=t0)
+    assert portfolio.buy_paused
+    # A position still open during the pause closing at a loss must not push the resume back.
+    portfolio.register_trade_result(is_win=False, now=t0 + pd.Timedelta(hours=20))
+
+    portfolio.resume_if_due(resume_at - pd.Timedelta(minutes=15))
+    assert portfolio.buy_paused
+    assert "consecutive-losses pause active" in portfolio.can_open(tuned.initial_order_usdt, neutral, "2024-01-06")[1]
+
+    portfolio.resume_if_due(resume_at)
+    assert not portfolio.buy_paused
+    assert portfolio.consecutive_bad_trades == 0
+    assert "consecutive-losses pause active" not in portfolio.can_open(tuned.initial_order_usdt, neutral, "2024-01-06")[1]
+
+    # Counter reset like /resume: one more loss starts a fresh streak instead of re-pausing.
+    portfolio.register_trade_result(is_win=False, now=resume_at + pd.Timedelta(hours=1))
+    assert not portfolio.buy_paused
+
+
+def test_backtest_opens_positions_again_after_a_loss_streak_pause(settings, rules, monkeypatch):
+    """End-to-end half of the /resume regression: the run loop must
+    actually apply the simulated resume. The run starts paused just before
+    the baseline's first entry; that entry must be refused for the pause,
+    and entries must resume once the window has passed."""
+    n = 2000
+    symbol_klines = {"AAAUSDT": _synthetic_ohlcv(n, seed=10, regime="trend_with_dip")}
+    btc_klines = _synthetic_ohlcv(n, seed=12, regime="trend_with_dip")
+    tuned = settings.model_copy(update={
+        "min_listing_age_days": 0, "news_enabled": False, "max_consecutive_bad_trades": 3,
+    })
+
+    baseline = BacktestEngine(tuned, rules).run(symbol_klines, btc_klines, starting_balance=Decimal("10000"))
+    assert baseline.trades, "fixture must produce at least one trade to make this test meaningful"
+    first_entry = pd.Timestamp(min(t.opened_at for t in baseline.trades))
+    pause_start = first_entry - pd.Timedelta(minutes=15)
+    resume_at = pause_start + pd.Timedelta(hours=BACKTEST_RESUME_AFTER_HOURS)
+
+    class _PausedByLossStreak(_BacktestPortfolio):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            for _ in range(tuned.max_consecutive_bad_trades):
+                self.register_trade_result(is_win=False, now=pause_start)
+
+    monkeypatch.setattr(engine_module, "_BacktestPortfolio", _PausedByLossStreak)
+    result = BacktestEngine(tuned, rules).run(symbol_klines, btc_klines, starting_balance=Decimal("10000"))
+
+    paused_blocks = [
+        row for row in result.no_trade_log
+        if row["action"] == "BLOCKED" and "consecutive-losses pause active" in row["reasons"]
+    ]
+    assert any(row["timestamp"] == first_entry for row in paused_blocks)
+    assert all(row["timestamp"] < resume_at for row in paused_blocks)
+    assert result.trades, "entries must resume after the simulated /resume"
+    assert all(pd.Timestamp(t.opened_at) >= resume_at for t in result.trades)
 
 
 def test_walk_forward_split_is_chronological_and_non_overlapping(rules):

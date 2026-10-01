@@ -99,7 +99,8 @@ def test_cancel_removes_resting_order(settings):
     assert cancel_result.status == OrderStatus.CANCELED
 
     status = asyncio.run(broker.get_status("SOLUSDT", client_order_id="c5"))
-    assert not status.accepted  # order no longer tracked
+    assert status.status == OrderStatus.CANCELED  # like Binance: a resolved order reports its final result
+    assert "c5" not in broker._resting
 
 
 def test_cancel_fills_instead_when_price_already_crossed_the_limit(settings):
@@ -128,7 +129,63 @@ def test_cancel_fills_instead_when_price_already_crossed_the_limit(settings):
     assert cancel_result.avg_fill_price == Decimal("100")
     assert broker.account.holdings["SOL"] == cancel_result.net_base_quantity
     status = asyncio.run(broker.get_status("SOLUSDT", client_order_id="c6"))
-    assert not status.accepted  # order no longer tracked (filled and removed by cancel())
+    assert status.status == OrderStatus.FILLED  # filled and removed by cancel(); reports the same fill...
+    assert broker.account.holdings["SOL"] == cancel_result.net_base_quantity  # ...without filling it again
+
+
+def test_cancel_after_the_poll_filled_an_order_reports_that_fill_not_unknown(settings):
+    """Binance answers a cancel of an already-filled order with its real
+    result (the adapter falls back to get_status). The paper broker said
+    "not found" (REJECTED) instead, so /emergency_stop saved REJECTED over a
+    fill the order poll had just picked up, and that fill was dropped."""
+    prices = {"value": Decimal("110")}
+
+    async def moving_price(symbol: str) -> Decimal:
+        return prices["value"]
+
+    broker = PaperBroker(settings, moving_price, starting_balance=Decimal("1000"))
+    asyncio.run(broker.submit(OrderRequest(
+        symbol="SOLUSDT", side=OrderSide.BUY, order_type=OrderType.LIMIT, client_order_id="c7",
+        quantity=Decimal("1"), limit_price=Decimal("100"),
+    )))
+    prices["value"] = Decimal("99")
+    polled = asyncio.run(broker.get_status("SOLUSDT", client_order_id="c7"))
+    assert polled.status == OrderStatus.FILLED
+
+    cancelled = asyncio.run(broker.cancel("SOLUSDT", client_order_id="c7"))
+
+    assert cancelled.status == OrderStatus.FILLED
+    assert cancelled.fills == polled.fills
+    assert broker.account.usdt_balance == Decimal("900")  # paid once
+
+
+def test_concurrent_cancel_and_status_check_resolve_a_resting_order_once(settings):
+    """cancel() and get_status() both checked the order, awaited the price,
+    then deleted it. Interleaved (the order poll and /emergency_stop), the
+    second delete raised KeyError and aborted the emergency liquidation."""
+    prices = {"value": Decimal("110")}
+
+    async def yielding_price(symbol: str) -> Decimal:
+        await asyncio.sleep(0)  # lets the other call run up to its own await
+        return prices["value"]
+
+    broker = PaperBroker(settings, yielding_price, starting_balance=Decimal("1000"))
+    asyncio.run(broker.submit(OrderRequest(
+        symbol="SOLUSDT", side=OrderSide.BUY, order_type=OrderType.LIMIT, client_order_id="c8",
+        quantity=Decimal("1"), limit_price=Decimal("100"),
+    )))
+    prices["value"] = Decimal("99")
+
+    async def both():
+        return await asyncio.gather(
+            broker.get_status("SOLUSDT", client_order_id="c8"), broker.cancel("SOLUSDT", client_order_id="c8"),
+        )
+
+    polled, cancelled = asyncio.run(both())
+
+    assert polled.status == cancelled.status == OrderStatus.FILLED
+    assert cancelled.fills == polled.fills
+    assert broker.account.usdt_balance == Decimal("900")  # filled exactly once
 
 
 def test_paper_broker_integrates_with_real_execution_engine(db_engine, settings):

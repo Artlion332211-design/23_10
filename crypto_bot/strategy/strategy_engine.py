@@ -25,15 +25,18 @@ polling `ExecutionEngine.check_pending_limit_orders()`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from config.settings import RulesConfig, Settings
 from database.models import (
     Order,
     OrderPurpose,
+    OrderSide,
     OrderStatus,
     PositionStatus,
     SignalDecision,
@@ -62,6 +65,12 @@ from utils.time import Timeframe, utcnow
 logger = logging.getLogger(__name__)
 
 _MTF_TIMEFRAMES = (Timeframe.M15, Timeframe.H1, Timeframe.H4)
+# A cached DCA re-analysis is never reused longer than one candle's worth of
+# wall-clock time, even if the candle id somehow stops advancing.
+_DCA_DECISION_MAX_AGE_SECONDS = 15 * 60
+_STALE_DATA_VETO = "stale market data"
+_INSUFFICIENT_DATA_VETO = "insufficient market data"
+_MARKET_DATA_VETOES = (_STALE_DATA_VETO, _INSUFFICIENT_DATA_VETO)
 
 
 @dataclass(frozen=True)
@@ -226,6 +235,36 @@ class StrategyEngine:
         self._news_provider = news_provider
         self._notifier = notifier or NullNotifier()
         self._anti_fomo = AntiFOMOFilter(rules.anti_fomo)
+        # Per-position mutual exclusion between the position monitor
+        # (manage_position) and /emergency_stop (emergency_liquidate_all,
+        # run from the Telegram handler's own task): both read the same OPEN
+        # quantity and sell it, so interleaved they could sell it twice.
+        # Never removed - one tiny Lock per position opened this process.
+        self._position_locks: dict[int, asyncio.Lock] = {}
+        # Serializes the order-resolution poll's commit + apply of each
+        # resolved order (persisted first, fill applied after, with awaits
+        # in between) with /emergency_stop's liquidation, so the kill switch
+        # never reads a position's quantity in that window and sells a
+        # stale amount. The poll's exchange calls happen outside it.
+        # Lock order is always resolution -> position; nothing holding a
+        # position lock takes this one.
+        self._resolution_lock = asyncio.Lock()
+        # position_id -> ((DCA level index, M15/H1/H4 candle open_times,
+        # regime level), decision, monotonic scored-at, (news score,
+        # critical)): see _dca_candidate_decision.
+        self._dca_decisions: dict[
+            int, tuple[tuple[int, tuple[Any, ...], RegimeLevel], TradeDecision, float, tuple[int, bool]]
+        ] = {}
+
+    def _position_lock(self, position_id: int) -> asyncio.Lock:
+        """asyncio.Lock is not re-entrant: take it only at the two entry
+        points (manage_position, emergency_liquidate_all), never in a helper
+        they call (_force_close_ceiling, _cancel_resting_orders_for_position,
+        apply_resolved_order, ...) or the second acquire deadlocks."""
+        lock = self._position_locks.get(position_id)
+        if lock is None:
+            lock = self._position_locks[position_id] = asyncio.Lock()
+        return lock
 
     def _required_min_score(self, level: RegimeLevel) -> float:
         policy = self._rules.regime_policy.get(level.value)
@@ -253,7 +292,7 @@ class StrategyEngine:
             for tf in _MTF_TIMEFRAMES
         )
         if not (m15 and h1 and h4) or stale:
-            reason = "stale market data" if stale else "insufficient market data"
+            reason = _STALE_DATA_VETO if stale else _INSUFFICIENT_DATA_VETO
             empty = ScoreBreakdown(
                 symbol=symbol, technical_score=0, news_adjustment=0, regime_adjustment=0, final_score=0,
                 signals=[], confirmed_count=0, confirmed_categories=[],
@@ -397,7 +436,9 @@ class StrategyEngine:
             return replace(decision, action="BLOCKED", reasons=["order accepted, resting in book - awaiting fill or timeout"])
 
         position_id, target_price = await self._apply_entry_fill(
-            symbol, result=result, btc_regime=btc_regime, order_id=result.order_id
+            symbol, result=result, btc_regime=btc_regime, order_id=result.order_id,
+            entry_score=round(decision.breakdown.final_score),
+            entry_signals={s.name: s.points for s in decision.breakdown.signals if s.confirmed},
         )
         await self._notifier.on_buy_executed(
             BuyExecutedEvent(
@@ -410,12 +451,21 @@ class StrategyEngine:
         return replace(decision, action="BUY")
 
     async def _apply_entry_fill(
-        self, symbol: str, *, result: ExecutionResult, btc_regime: RegimeAssessment, order_id: int | None,
+        self,
+        symbol: str,
+        *,
+        result: ExecutionResult,
+        btc_regime: RegimeAssessment,
+        order_id: int | None,
+        entry_score: int | None,
+        entry_signals: dict[str, float] | None,
     ) -> tuple[int, Decimal]:
         """Creates the Position for a filled entry - shared by the
         immediate-fill path (`try_open_position`) and the delayed-fill path
         (`_resolve_entry_order`, once a resting LIMIT entry finally fills).
-        Returns (position_id, target_price)."""
+        `entry_score`/`entry_signals` (confirmed signal name -> points) record
+        why it was bought; the delayed path no longer has the decision and
+        passes None. Returns (position_id, target_price)."""
         target_price = compute_target_price(
             result.avg_fill_price, target_profit_percent=self._settings.target_profit_percent,
             taker_fee_rate=self._settings.taker_fee_rate, expected_slippage_percent=self._settings.expected_slippage_percent,
@@ -431,6 +481,7 @@ class StrategyEngine:
                 # net-based quantity and skews the recomputed average.
                 total_cost_usdt=result.avg_fill_price * result.net_base_quantity,
                 target_price=target_price, market_regime_at_entry=btc_regime.level.value,
+                entry_score=entry_score, entry_signals=entry_signals,
                 fees_paid_usdt=result.commission_total_usdt_equivalent,
             )
             position_id = position.id
@@ -454,11 +505,34 @@ class StrategyEngine:
         btc_regime: RegimeAssessment,
         current_price: Decimal,
         order_book: OrderBookSnapshot,
-        trading_balance_usdt: Decimal,
+        trading_balance_usdt: Decimal | None,
+    ) -> None:
+        """`trading_balance_usdt=None` means the caller could not fetch the
+        balance this cycle: only DCA (whose exposure cap needs it) is
+        skipped - drawdown alerts, the hard ceiling, trailing, early arm and
+        take-profit never depend on it and still run.
+
+        Holds the position's lock for the whole call, so an /emergency_stop
+        liquidation can't sell this position in the middle of it."""
+        async with self._position_lock(position_id):
+            await self._manage_position_locked(
+                position_id, btc_regime=btc_regime, current_price=current_price,
+                order_book=order_book, trading_balance_usdt=trading_balance_usdt,
+            )
+
+    async def _manage_position_locked(
+        self,
+        position_id: int,
+        *,
+        btc_regime: RegimeAssessment,
+        current_price: Decimal,
+        order_book: OrderBookSnapshot,
+        trading_balance_usdt: Decimal | None,
     ) -> None:
         with session_scope() as session:
             position = PositionRepository(session).get(position_id)
             if position is None or position.status != PositionStatus.OPEN:
+                self._dca_decisions.pop(position_id, None)
                 return
             symbol = position.symbol
             avg_entry = position.avg_entry_price
@@ -514,7 +588,9 @@ class StrategyEngine:
             if should_exit_trailing(current_price, new_peak, distance):
                 await self._submit_and_apply_sell(
                     position_id, symbol=symbol, quantity=total_qty, reference_price=current_price,
-                    spread_percent=order_book.spread_percent, purpose=OrderPurpose.TRAILING_STOP,
+                    # force MARKET: a protective exit fires into a falling price, where a
+                    # wide-spread LIMIT at mid can sit unfilled while the drop continues
+                    spread_percent=Decimal("0"), purpose=OrderPurpose.TRAILING_STOP,
                     reason="TRAILING_STOP", error_context="SELL order",
                 )
             return
@@ -556,25 +632,36 @@ class StrategyEngine:
         )
         if level is None:
             return
+        if trading_balance_usdt is None:
+            logger.info(
+                "DCA level %s reached for %s but the trading balance is unavailable this cycle - DCA waits for the next tick",
+                level.level_index, symbol,
+            )
+            return
 
-        decision = await self.evaluate_candidate(symbol, btc_regime=btc_regime)
+        decision, fresh_decision = await self._dca_candidate_decision(
+            position_id, symbol, level_index=level.level_index, btc_regime=btc_regime
+        )
         liquidity_check = check_liquidity_fresh(order_book, self._settings)
         dca_risk = self._risk_manager.can_dca(
             regime=btc_regime, requested_usdt=level.size_usdt, trading_balance_usdt=trading_balance_usdt
         )
+        news_blocks = any("news" in v.lower() for v in decision.breakdown.vetoes)
         dca_decision = evaluate_dca(
             current_price=current_price, avg_entry_price=avg_entry, dca_count_done=dca_count,
             current_position_cost_usdt=total_cost, settings=self._settings, score_breakdown=decision.breakdown,
             market_crash=apply_crash_policy(btc_regime, self._settings).dca_paused,
-            news_blocks_trading=any("news" in v.lower() for v in decision.breakdown.vetoes),
+            news_blocks_trading=news_blocks,
             liquidity_ok=liquidity_check.passed,
         )
         if not (dca_risk.allowed and dca_decision.allowed):
-            reasons = dca_risk.reasons + dca_decision.reasons
-            self._record_signal(replace(decision, action="NO_TRADE", reasons=reasons))
-            await self._notifier.on_no_trade(replace(decision, action="NO_TRADE", reasons=reasons))
+            if fresh_decision:  # a reused decision's NO_TRADE was already recorded this candle
+                reasons = dca_risk.reasons + dca_decision.reasons
+                self._record_signal(replace(decision, action="NO_TRADE", reasons=reasons))
+                await self._notifier.on_no_trade(replace(decision, action="NO_TRADE", reasons=reasons))
             return
 
+        self._dca_decisions.pop(position_id, None)
         self._record_signal(replace(decision, action="DCA"))
         await self._notifier.on_dca_signal(replace(decision, action="DCA"))
 
@@ -590,7 +677,63 @@ class StrategyEngine:
             # fill once it resolves, or does nothing if it times out unfilled.
             return
 
-        await self._apply_dca_fill(position_id, level_index=level.level_index, result=result)
+        await self._apply_dca_fill(position_id, symbol=symbol, level_index=level.level_index, result=result)
+
+    async def _dca_candidate_decision(
+        self, position_id: int, symbol: str, *, level_index: int, btc_regime: RegimeAssessment
+    ) -> tuple[TradeDecision, bool]:
+        """The full `evaluate_candidate()` behind a DCA, run at most once per
+        position per DCA level per closed 15m candle. Returns (decision,
+        fresh); `fresh` is False for a reused decision, whose NO_TRADE signal
+        was already recorded.
+
+        The position monitor polls every 60s but the indicators only change
+        on a candle close: while price sat below an unmet DCA level, every
+        tick re-scored and wrote another NO_TRADE row (~40 signal rows per
+        candle instead of the 25 the health check expects). Only this
+        scoring is cached - the caller still runs the cheap gates (liquidity,
+        can_dca, evaluate_dca) every tick, so a DCA still happens mid-candle
+        if e.g. exposure frees up. Without an M15 snapshot there is no
+        candle id, so nothing is cached.
+
+        A cached decision is re-scored early when anything it was scored on
+        changes: an H1/H4 candle closing, the BTC regime (e.g. into
+        STRONG_BEAR, whose veto is the only thing blocking DCA there), or
+        the symbol's news. The news check is a cheap DB read, so a critical
+        headline still blocks a DCA straight away rather than up to 15
+        minutes later."""
+        candle_ids = tuple(
+            snap.open_time if snap is not None else None
+            for snap in (self._market_data.snapshot(symbol, tf) for tf in _MTF_TIMEFRAMES)
+        )
+        key = (level_index, candle_ids, btc_regime.level)
+        news = await self._news_provider.get_symbol_news_score(symbol)
+        news_state = (news.score, news.critical)
+        cached = self._dca_decisions.get(position_id)
+        if (
+            cached is not None and cached[0] == key and cached[3] == news_state
+            and time.monotonic() - cached[2] < _DCA_DECISION_MAX_AGE_SECONDS
+            and not self._any_series_stale(symbol)
+        ):
+            return cached[1], False
+        decision = await self.evaluate_candidate(symbol, btc_regime=btc_regime)
+        if candle_ids[0] is None or any(r in _MARKET_DATA_VETOES for r in decision.breakdown.vetoes):
+            # A 'stale/insufficient market data' block says nothing about
+            # the next tick: once the feed recovers the position must be
+            # scored for real, not held off by a cached block.
+            self._dca_decisions.pop(position_id, None)
+        else:
+            self._dca_decisions[position_id] = (key, decision, time.monotonic(), news_state)
+        return decision, True
+
+    def _any_series_stale(self, symbol: str) -> bool:
+        """A dead kline feed freezes the last candle's open_time, so the
+        candle-keyed cache alone would keep reusing a decision scored on
+        data that is by now stale - the very case evaluate_candidate's own
+        'stale market data' veto exists to block."""
+        return any(
+            self._market_data.is_stale(symbol, tf, self._settings.market_data_stale_seconds) for tf in _MTF_TIMEFRAMES
+        )
 
     async def _check_drawdown_warnings(
         self,
@@ -630,25 +773,37 @@ class StrategyEngine:
                 )
             )
 
-    async def _apply_dca_fill(self, position_id: int, *, level_index: int, result: ExecutionResult) -> None:
+    async def _apply_dca_fill(
+        self, position_id: int, *, symbol: str, level_index: int, result: ExecutionResult
+    ) -> None:
         """Folds a filled DCA buy into its position - shared by the
         immediate-fill path (`manage_position`) and the delayed-fill path
         (`_resolve_dca_order`)."""
         with session_scope() as session:
             p = PositionRepository(session).get(position_id)
-            if p is None or p.status != PositionStatus.OPEN:
-                return
-            PositionRepository(session).apply_fill_and_recompute(
-                p, fill_price=result.avg_fill_price, fill_qty=result.net_base_quantity,
-                fee_usdt_equivalent=result.commission_total_usdt_equivalent, dca=True,
-            )
-            new_target = compute_target_price(
-                p.avg_entry_price, target_profit_percent=self._settings.target_profit_percent,
-                taker_fee_rate=self._settings.taker_fee_rate, expected_slippage_percent=self._settings.expected_slippage_percent,
-            )
-            PositionRepository(session).update_target_price(p, new_target)
-            new_avg = p.avg_entry_price
-            symbol = p.symbol
+            position_open = p is not None and p.status == PositionStatus.OPEN
+            if p is not None and position_open:
+                PositionRepository(session).apply_fill_and_recompute(
+                    p, fill_price=result.avg_fill_price, fill_qty=result.net_base_quantity,
+                    fee_usdt_equivalent=result.commission_total_usdt_equivalent, dca=True,
+                )
+                new_target = compute_target_price(
+                    p.avg_entry_price, target_profit_percent=self._settings.target_profit_percent,
+                    taker_fee_rate=self._settings.taker_fee_rate, expected_slippage_percent=self._settings.expected_slippage_percent,
+                )
+                PositionRepository(session).update_target_price(p, new_target)
+                new_avg = p.avg_entry_price
+        if not position_open:
+            # e.g. a resting DCA LIMIT that filled after a force-close: real
+            # coins were bought that no position tracks, so nothing will ever
+            # sell them - the operator must hear about it.
+            if result.net_base_quantity > 0:
+                await self._notifier.on_error(
+                    f"DCA order for {symbol} filled {result.net_base_quantity} at {result.avg_fill_price} after "
+                    f"position #{position_id} was already closed - these coins are NOT tracked by the bot. "
+                    "Check Binance and handle them manually."
+                )
+            return
 
         self._risk_manager.record_new_capital_deployed(result.filled_quote)
         await self._notifier.on_dca_executed(
@@ -696,6 +851,7 @@ class StrategyEngine:
 
         if fully_closed:
             assert cumulative_pnl is not None and cumulative_pnl_pct is not None
+            self._dca_decisions.pop(position_id, None)
             holding_seconds = (utcnow() - opened_at).total_seconds()
             self._risk_manager.register_trade_result(is_win=cumulative_pnl > 0)
             await self._notifier.on_position_closed(
@@ -741,7 +897,7 @@ class StrategyEngine:
 
     async def _cancel_resting_orders_for_position(
         self, position_id: int, symbol: str, *, btc_regime: RegimeAssessment
-    ) -> None:
+    ) -> list[Order]:
         """Cancels any order still resting for this position (a DCA or exit
         LIMIT order that hasn't resolved yet) and applies whatever fill it
         had already picked up before being cancelled, via the same dispatch
@@ -754,15 +910,36 @@ class StrategyEngine:
         EMERGENCY_SELL/HARD_CEILING orders here - an ENTRY order has no
         `position_id` until it fills (see `OrderRepository.set_position`),
         so it can never show up in `for_position`.
+
+        Returns the resting orders that could not be confirmed cancelled.
+        Their results are not final, so nothing is applied for them here:
+        the regular poll keeps tracking them and applies their fills once
+        they resolve. The caller must not force-sell while a SELL is among
+        them (Binance may still hold its coins locked, so a full-size
+        MARKET sell would be rejected or oversell) and retries on a later
+        tick instead. An unconfirmed BUY (DCA) doesn't lock the coins: the
+        sell can proceed, and if that DCA fills later the untracked-coins
+        alert in `_apply_dca_fill` fires.
         """
         with session_scope() as session:
             resting = [
                 o for o in OrderRepository(session).for_position(position_id)
                 if o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
             ]
+        unconfirmed: list[Order] = []
         for order in resting:
             result = await self._execution_engine.cancel(symbol, client_order_id=order.client_order_id)
+            if result.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED) or result.fill_data_incomplete:
+                # Applying it here raised a false "check Binance manually"
+                # alert for an order the poll is still handling.
+                unconfirmed.append(order)
+                logger.warning(
+                    "Resting %s %s for %s could not be confirmed cancelled (%s) - left to the order poll",
+                    order.side.value, order.client_order_id, symbol, result.status.value,
+                )
+                continue
             await self.apply_resolved_order(order, result, btc_regime=btc_regime)
+        return unconfirmed
 
     async def _force_close_ceiling(
         self, position_id: int, *, symbol: str, current_price: Decimal, btc_regime: RegimeAssessment
@@ -772,7 +949,14 @@ class StrategyEngine:
         full MARKET close on whatever quantity remains - regardless of
         trailing state. See `manage_position`'s call site for why this must
         run before the resting-order early return."""
-        await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+        unconfirmed = await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+        if any(o.side == OrderSide.SELL for o in unconfirmed):
+            # The ceiling condition still holds next tick, so this retries.
+            await self._notifier.on_error(
+                f"Hard profit-ceiling close for {symbol} postponed: a resting SELL could not be confirmed "
+                "cancelled - retrying on the next check"
+            )
+            return
         with session_scope() as session:
             position = PositionRepository(session).get(position_id)
             if position is None or position.status != PositionStatus.OPEN:
@@ -795,6 +979,12 @@ class StrategyEngine:
         itself never sells anything on its own). Returns the symbols that
         failed to liquidate so the caller can alert on them specifically.
         """
+        async with self._resolution_lock:
+            return await self._emergency_liquidate_all_locked(order_books=order_books, btc_regime=btc_regime)
+
+    async def _emergency_liquidate_all_locked(
+        self, *, order_books: dict[str, OrderBookSnapshot], btc_regime: RegimeAssessment
+    ) -> list[str]:
         with session_scope() as session:
             open_positions = [(p.id, p.symbol) for p in PositionRepository(session).get_open_positions()]
 
@@ -805,25 +995,62 @@ class StrategyEngine:
                 failed.append(symbol)
                 await self._notifier.on_error(f"Emergency liquidation for {symbol} skipped: no order book available")
                 continue
+            try:
+                liquidated = await self._emergency_liquidate_position(
+                    position_id, symbol, order_book=order_book, btc_regime=btc_regime
+                )
+            except Exception as exc:  # noqa: BLE001 - one coin's failure must not stop the kill switch selling the rest
+                logger.exception("Emergency liquidation for %s failed: %r", symbol, exc)
+                await self._notifier.on_error(f"Emergency liquidation for {symbol} failed: {exc!r} - check Binance manually")
+                liquidated = False
+            if not liquidated:
+                failed.append(symbol)
+        return failed
+
+    async def _emergency_liquidate_position(
+        self, position_id: int, symbol: str, *, order_book: OrderBookSnapshot, btc_regime: RegimeAssessment
+    ) -> bool:
+        """One position of `emergency_liquidate_all`. Returns False when the
+        symbol must be reported as not cleanly liquidated."""
+        # Runs in the Telegram handler's task, concurrently with the
+        # position monitor: held from the cancel through the sell so
+        # manage_position can't read the same OPEN quantity and sell it
+        # too. If it is mid-call, this waits for it and then re-reads
+        # below whatever it left (possibly already closed).
+        async with self._position_lock(position_id):
             # Cancel (and fold in the fill of) anything still resting first,
             # so the quantity read below is accurate and the force-sell
             # can't be rejected/oversized against what Binance actually holds.
-            await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+            unconfirmed = await self._cancel_resting_orders_for_position(position_id, symbol, btc_regime=btc_regime)
+            if any(o.side == OrderSide.SELL for o in unconfirmed):
+                await self._notifier.on_error(
+                    f"Emergency liquidation for {symbol} skipped: a resting SELL could not be confirmed cancelled"
+                )
+                return False
+            clean = True
+            if unconfirmed:
+                # The sell below still goes ahead, but a live DCA BUY
+                # could refill the position after it: the kill switch
+                # must not report this symbol as cleanly liquidated.
+                clean = False
+                await self._notifier.on_error(
+                    f"Emergency liquidation for {symbol}: DCA order(s) "
+                    f"{', '.join(o.client_order_id for o in unconfirmed)} could not be confirmed cancelled - "
+                    "cancel them on Binance manually"
+                )
             with session_scope() as session:
                 position = PositionRepository(session).get(position_id)
                 if position is None or position.status != PositionStatus.OPEN:
-                    continue  # a cancelled order's own fill already closed it
+                    return clean  # a cancelled order's own fill already closed it
                 quantity = position.total_quantity
             if quantity <= 0:
-                continue
+                return clean
             outcome = await self._submit_and_apply_sell(
                 position_id, symbol=symbol, quantity=quantity, reference_price=order_book.mid_price,
                 spread_percent=Decimal("0"),  # force MARKET: an emergency sell must not wait in a resting LIMIT order
                 purpose=OrderPurpose.EMERGENCY_SELL, reason="EMERGENCY_SELL", error_context="Emergency SELL",
             )
-            if outcome is None:
-                failed.append(symbol)
-        return failed
+        return clean and outcome is not None
 
     # ------------------------------------------------------------------
     # Delayed resolution of LIMIT orders that were resting at submit time
@@ -838,14 +1065,28 @@ class StrategyEngine:
         the exchange with zero visibility here. Must be polled periodically
         by the caller (see `orchestration.runtime`) - it does nothing on
         its own.
+
+        The exchange calls run outside `_resolution_lock`, so a slow poll
+        never holds up /emergency_stop. Only the commit + apply of each
+        result is locked. If a force-close cancelled and applied the same
+        order meanwhile, `commit_resolution` sees the row already resolved
+        and the result is dropped rather than applied twice.
         """
-        resolved = await self._execution_engine.check_pending_limit_orders()
+        resolved = await self._execution_engine.poll_pending_limit_orders()
         for _symbol, client_order_id, result in resolved:
-            with session_scope() as session:
-                order = OrderRepository(session).get_by_client_id(client_order_id)
-            if order is None:
-                continue
-            await self.apply_resolved_order(order, result, btc_regime=btc_regime)
+            async with self._resolution_lock:  # see __init__: commit-then-apply must not interleave with /emergency_stop
+                try:
+                    committed = self._execution_engine.commit_resolution(client_order_id, result)
+                except Exception as exc:  # noqa: BLE001 - still tracked, so the next poll retries it
+                    logger.exception("Failed to record resolved order %s: %r - retrying next poll", client_order_id, exc)
+                    continue
+                if not committed:
+                    continue
+                with session_scope() as session:
+                    order = OrderRepository(session).get_by_client_id(client_order_id)
+                if order is None:
+                    continue
+                await self.apply_resolved_order(order, result, btc_regime=btc_regime)
 
     async def apply_resolved_order(self, order: Order, result: ExecutionResult, *, btc_regime: RegimeAssessment) -> None:
         """Turns one resolved order (from the polling loop above, from
@@ -866,6 +1107,19 @@ class StrategyEngine:
                 await self._resolve_dca_order(order, result)
             elif order.purpose in _EXIT_CLOSE_REASON:
                 await self._resolve_exit_order(order, result)
+            else:
+                # Every OrderPurpose has a branch today; one added later without
+                # a branch here would otherwise resolve silently while its fill
+                # moved real money and no position was updated.
+                logger.error(
+                    "Resolved order %s for %s has unhandled purpose %s - no position updated",
+                    order.client_order_id, order.symbol, order.purpose,
+                )
+                await self._notifier.on_error(
+                    f"{order.symbol} order {order.client_order_id} resolved as {result.status.value} with an "
+                    f"unhandled purpose ({order.purpose.value}) - the bot did NOT update any position from it. "
+                    "Check Binance manually."
+                )
         except Exception as exc:  # noqa: BLE001 - one bad resolution must not block the rest
             logger.exception("Failed to resolve order %s (%s) for %s: %r", order.client_order_id, order.purpose, order.symbol, exc)
             await self._notifier.on_error(f"Failed to finalize resolved order for {order.symbol}: {exc!r}")
@@ -881,10 +1135,18 @@ class StrategyEngine:
                 "Entry LIMIT order for %s filled late but a position already exists (id=%s) - skipping duplicate",
                 order.symbol, already_open.id,
             )
+            # Skipping keeps the open position's accounting intact, but these
+            # coins were really bought and nothing will ever sell them.
+            await self._notifier.on_error(
+                f"Entry order {order.client_order_id} for {order.symbol} filled {result.net_base_quantity} late, but "
+                f"position #{already_open.id} is already open - the late fill was NOT added to it, so these coins "
+                "are NOT tracked by the bot. Check Binance and handle them manually."
+            )
             return
 
         position_id, target_price = await self._apply_entry_fill(
-            order.symbol, result=result, btc_regime=btc_regime, order_id=order.id
+            order.symbol, result=result, btc_regime=btc_regime, order_id=order.id,
+            entry_score=None, entry_signals=None,  # the decision that placed it is long gone
         )
         await self._notifier.on_delayed_fill(
             DelayedFillEvent(
@@ -894,11 +1156,19 @@ class StrategyEngine:
         )
 
     async def _resolve_dca_order(self, order: Order, result: ExecutionResult) -> None:
-        if result.net_base_quantity <= 0 or order.position_id is None:
+        if result.net_base_quantity <= 0:
             logger.info("DCA LIMIT order for %s resolved with no fill - nothing to apply", order.symbol)
             return
+        if order.position_id is None:
+            # Never expected (a DCA order is always placed for a position),
+            # but real coins were bought - never drop that silently.
+            await self._notifier.on_error(
+                f"DCA order {order.client_order_id} for {order.symbol} filled {result.net_base_quantity} but is not "
+                "linked to any position - these coins are NOT tracked by the bot. Check Binance and handle them manually."
+            )
+            return
         level_index = _DCA_LEVEL_BY_PURPOSE[order.purpose]
-        await self._apply_dca_fill(order.position_id, level_index=level_index, result=result)
+        await self._apply_dca_fill(order.position_id, symbol=order.symbol, level_index=level_index, result=result)
 
     async def _resolve_exit_order(self, order: Order, result: ExecutionResult) -> None:
         if result.filled_quantity <= 0 or order.position_id is None:
@@ -907,20 +1177,27 @@ class StrategyEngine:
         reason = _EXIT_CLOSE_REASON[order.purpose]
         outcome = await self._apply_sell_result(order.position_id, result=result, reason=reason)
         if outcome is not None and not outcome[1]:
-            # Mirrors manage_position's immediate-fill partial-TP path
-            # (USE_TRAILING_AFTER_TP branch): a partial exit that didn't
-            # fully close the position must arm trailing on the remainder
-            # too, or the remainder is left with trailing_active=False and
-            # manage_position keeps re-submitting a fresh partial-close
-            # order against a shrinking remainder every tick instead of
-            # trailing it - silently breaking USE_TRAILING_AFTER_TP whenever
-            # the partial TP happens to rest as a LIMIT order first. Uses
-            # the fill price as the trailing peak since there is no "current
-            # price" available this long after the fact.
-            with session_scope() as session:
-                p = PositionRepository(session).get(order.position_id)
-                if p is not None and p.status == PositionStatus.OPEN:
-                    PositionRepository(session).set_trailing(p, active=True, peak_price=result.avg_fill_price)
+            if order.purpose == OrderPurpose.TAKE_PROFIT and self._settings.use_trailing_after_tp:
+                # Mirrors manage_position's immediate-fill partial-TP path
+                # (USE_TRAILING_AFTER_TP branch): a partial exit that didn't
+                # fully close the position must arm trailing on the remainder
+                # too, or the remainder is left with trailing_active=False and
+                # manage_position keeps re-submitting a fresh partial-close
+                # order against a shrinking remainder every tick instead of
+                # trailing it - silently breaking USE_TRAILING_AFTER_TP whenever
+                # the partial TP happens to rest as a LIMIT order first. Uses
+                # the fill price as the trailing peak since there is no "current
+                # price" available this long after the fact.
+                with session_scope() as session:
+                    p = PositionRepository(session).get(order.position_id)
+                    if p is not None and p.status == PositionStatus.OPEN:
+                        PositionRepository(session).set_trailing(p, active=True, peak_price=result.avg_fill_price)
+            # Every other partial exit leaves the trailing state as it was.
+            # Re-arming after a partial TRAILING_STOP reset trailing_is_early
+            # and lowered the peak to the fill price (an early 1% trail
+            # became a 2.5% trail from a lower price); a partial
+            # EMERGENCY_SELL/HARD_CEILING is a forced close, not a profit-
+            # taking step that hands the remainder over to a trail.
             await self._notifier.on_delayed_fill(
                 DelayedFillEvent(
                     symbol=order.symbol, side="SELL", price=result.avg_fill_price, quantity=result.filled_quantity,

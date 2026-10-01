@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from database.models import OrderPurpose, OrderSide, OrderStatus, OrderType
-from database.repository import OrderRepository
+from database.repository import FillRepository, OrderRepository
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
@@ -301,3 +301,247 @@ def test_market_order_with_unknown_outcome_is_tracked_for_resolution(db_engine, 
     ))
 
     assert len(engine._pending_limit_orders) == 1
+
+
+# ---------------------------------------------------------------------------
+# ExecutionEngine.cancel (force-close path) vs. results that aren't final yet
+# ---------------------------------------------------------------------------
+
+
+def _result_with_fills(status: OrderStatus, *trade_ids: str) -> ExecutionResult:
+    fills = [_fill(t) for t in trade_ids]
+    qty = Decimal(len(fills))
+    return ExecutionResult(
+        accepted=True, status=status, exchange_order_id="9", fills=fills, avg_fill_price=Decimal("100"),
+        filled_quantity=qty, net_base_quantity=qty - Decimal("0.001") * len(fills), filled_quote=qty * Decimal("100"),
+        commission_total_usdt_equivalent=Decimal("0.1") * len(fills),
+    )
+
+
+def _stored_status(client_order_id: str) -> OrderStatus:
+    with session_scope() as session:
+        return OrderRepository(session).get_by_client_id(client_order_id).status
+
+
+def _stored_trade_ids(client_order_id: str) -> list[str]:
+    with session_scope() as session:
+        order = OrderRepository(session).get_by_client_id(client_order_id)
+        return sorted(f.trade_id for f in FillRepository(session).for_order(order.id))
+
+
+def test_execution_engine_cancel_keeps_polling_an_order_whose_status_could_not_be_determined(
+    db_engine, settings, filters_provider,
+):
+    """BinanceExecutionAdapter.cancel falls back to get_status, which says NEW
+    when a network blip hides the real status. cancel() used to untrack
+    that order, leaving a NEW row nothing polled: has_resting_order() then
+    stopped manage_position from doing anything for the position until a
+    restart. The order must stay tracked with its original age, so the
+    regular poll can resolve it."""
+    _seed_order("bot-cancel-blip")
+    unknown = ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timed out")
+    executor = _ScriptedExecutor([_result_with_fills(OrderStatus.FILLED, "t1")], cancel_results=[unknown])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    placed_at = utcnow() - timedelta(seconds=30)
+    engine._pending_limit_orders["bot-cancel-blip"] = ("SOLUSDT", placed_at)
+
+    result = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-blip"))
+
+    assert result.status == OrderStatus.NEW
+    assert engine._pending_limit_orders.get("bot-cancel-blip") == ("SOLUSDT", placed_at)
+    assert _stored_status("bot-cancel-blip") == OrderStatus.NEW
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert [(cid, r.status) for _s, cid, r in resolved] == [("bot-cancel-blip", OrderStatus.FILLED)]
+    assert "bot-cancel-blip" not in engine._pending_limit_orders
+    assert _stored_status("bot-cancel-blip") == OrderStatus.FILLED
+    assert _stored_trade_ids("bot-cancel-blip") == ["t1"]
+
+
+def test_execution_engine_cancel_puts_an_untracked_unresolved_order_back_under_polling(
+    db_engine, settings, filters_provider,
+):
+    """A NEW row that isn't tracked in memory (for example one left behind
+    by the old cancel() behaviour) must be put back under polling after an
+    inconclusive cancel. Its placement time comes from the DB row, so the
+    timeout counts from the real placement."""
+    _seed_order("bot-cancel-untracked")
+    unknown = ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timed out")
+    executor = _ScriptedExecutor([unknown], cancel_results=[unknown])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+
+    asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-untracked"))
+
+    with session_scope() as session:
+        created_at = OrderRepository(session).get_by_client_id("bot-cancel-untracked").created_at
+    assert engine._pending_limit_orders.get("bot-cancel-untracked") == ("SOLUSDT", created_at)
+
+
+def test_execution_engine_cancel_does_not_persist_a_terminal_result_with_incomplete_fill_data(
+    db_engine, settings, filters_provider,
+):
+    """A cancel can race a real partial fill and come back CANCELED while the
+    myTrades lookup fails. Saving that as a zero-fill CANCELED would lose the
+    partial fill for good. The row must stay unresolved, and the next poll
+    must record the real fill."""
+    _seed_order("bot-cancel-incomplete-2")
+    incomplete = ExecutionResult(accepted=True, status=OrderStatus.CANCELED, exchange_order_id="9", fill_data_incomplete=True)
+    executor = _ScriptedExecutor([_result_with_fills(OrderStatus.CANCELED, "t1")], cancel_results=[incomplete])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-cancel-incomplete-2"] = ("SOLUSDT", utcnow())
+
+    result = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-incomplete-2"))
+
+    assert result.status == OrderStatus.CANCELED
+    assert result.fill_data_incomplete is True  # kept, so the caller still alerts the owner
+    assert _stored_status("bot-cancel-incomplete-2") == OrderStatus.NEW
+    assert "bot-cancel-incomplete-2" in engine._pending_limit_orders
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert len(resolved) == 1
+    assert resolved[0][2].filled_quantity == Decimal("1")
+    assert _stored_status("bot-cancel-incomplete-2") == OrderStatus.CANCELED
+    assert _stored_trade_ids("bot-cancel-incomplete-2") == ["t1"]
+
+
+def test_execution_engine_cancel_hands_back_no_fills_until_the_order_resolves(db_engine, settings, filters_provider):
+    """The force-close caller applies whatever fills cancel() returns to the
+    position. If the cancel failed and get_status found the order
+    PARTIALLY_FILLED, the poll later reports the cumulative fills again when
+    the order resolves. Returning the partial fills now as well would apply
+    them to the position twice."""
+    _seed_order("bot-cancel-partial")
+    executor = _ScriptedExecutor(
+        [_result_with_fills(OrderStatus.FILLED, "t1", "t2")],
+        cancel_results=[_result_with_fills(OrderStatus.PARTIALLY_FILLED, "t1")],
+    )
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-cancel-partial"] = ("SOLUSDT", utcnow())
+
+    result = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-partial"))
+
+    assert result.status == OrderStatus.PARTIALLY_FILLED
+    assert result.fills == []
+    assert result.filled_quantity == result.net_base_quantity == result.filled_quote == Decimal("0")
+    assert "bot-cancel-partial" in engine._pending_limit_orders
+    assert _stored_status("bot-cancel-partial") == OrderStatus.NEW
+    assert _stored_trade_ids("bot-cancel-partial") == []
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert len(resolved) == 1  # the one and only time these fills are handed out
+    assert resolved[0][2].filled_quantity == Decimal("2")
+    assert _stored_trade_ids("bot-cancel-partial") == ["t1", "t2"]
+
+
+@pytest.mark.parametrize("cancel_status", [OrderStatus.NEW, OrderStatus.FILLED])
+def test_execution_engine_cancel_leaves_alone_an_order_the_poll_resolved_meanwhile(
+    db_engine, settings, filters_provider, cancel_status,
+):
+    """/emergency_stop runs in a Telegram task and can interleave with the
+    monitor loop's poll. If the poll resolves the order while this cancel
+    is waiting on Binance, the poll's caller applies its fills. cancel()
+    must not return those fills again, overwrite the stored FILLED with a
+    network-blip NEW, or start tracking the order again. Each of those
+    would apply the fill twice or undo the resolution."""
+    _seed_order("bot-cancel-race")
+    filled = _result_with_fills(OrderStatus.FILLED, "t1")
+    cancel_result = (
+        filled if cancel_status == OrderStatus.FILLED
+        else ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timed out")
+    )
+
+    class _PollResolvesDuringCancel(_ScriptedExecutor):
+        async def cancel(self, symbol, *, client_order_id):
+            self.poll_resolved = await engine.check_pending_limit_orders()
+            return await super().cancel(symbol, client_order_id=client_order_id)
+
+    executor = _PollResolvesDuringCancel([filled], cancel_results=[cancel_result])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-cancel-race"] = ("SOLUSDT", utcnow())
+
+    result = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-cancel-race"))
+
+    assert [cid for _s, cid, _r in executor.poll_resolved] == ["bot-cancel-race"]  # the poll owns applying it
+    assert result.fills == []
+    assert result.filled_quantity == result.net_base_quantity == Decimal("0")
+    assert _stored_status("bot-cancel-race") == OrderStatus.FILLED
+    assert "bot-cancel-race" not in engine._pending_limit_orders
+    assert _stored_trade_ids("bot-cancel-race") == ["t1"]
+
+@pytest.mark.parametrize("cancel_status", [OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED])
+def test_timeout_cancel_that_cannot_be_confirmed_keeps_the_order_under_polling(
+    db_engine, settings, filters_provider, cancel_status,
+):
+    """The poll's cancel-on-timeout used to untrack and persist an unconfirmed
+    cancel (network outage, key/IP rejection): a NEW row nothing polled, so
+    has_resting_order() silently froze that position's exits and DCA until a
+    restart. It must stay tracked, unpersisted, and not be reported resolved."""
+    _seed_order("bot-timeout-blip")
+    unknown = ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="timed out")
+    fallback = ExecutionResult(accepted=False, status=cancel_status, error_message="cancel failed")
+    executor = _ScriptedExecutor([unknown], cancel_results=[fallback])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    placed_at = utcnow() - timedelta(seconds=settings.limit_order_timeout_seconds + 60)
+    engine._pending_limit_orders["bot-timeout-blip"] = ("SOLUSDT", placed_at)
+
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert resolved == []
+    assert engine._pending_limit_orders.get("bot-timeout-blip") == ("SOLUSDT", placed_at)
+    assert _stored_status("bot-timeout-blip") == OrderStatus.NEW
+
+
+def test_poll_result_is_dropped_when_a_cancel_resolved_the_order_while_the_poll_waited(
+    db_engine, settings, filters_provider,
+):
+    """process_resolved_orders polls Binance outside its lock, so a
+    force-close can cancel the same order and apply its fill in between. The
+    poll's own result must then be dropped at commit: applying it as well
+    would count the fill twice."""
+    _seed_order("bot-poll-race")
+    filled = _result_with_fills(OrderStatus.FILLED, "t1")
+    executor = _ScriptedExecutor([filled], cancel_results=[filled])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-poll-race"] = ("SOLUSDT", utcnow())
+
+    polled = asyncio.run(engine.poll_pending_limit_orders())
+
+    assert [cid for _s, cid, _r in polled] == ["bot-poll-race"]
+    assert _stored_status("bot-poll-race") == OrderStatus.NEW  # the network half persists nothing
+
+    cancelled = asyncio.run(engine.cancel("SOLUSDT", client_order_id="bot-poll-race"))
+    assert cancelled.filled_quantity == Decimal("1")  # the force-close applies this one
+
+    assert engine.commit_resolution("bot-poll-race", polled[0][2]) is False
+    assert _stored_status("bot-poll-race") == OrderStatus.FILLED
+    assert _stored_trade_ids("bot-poll-race") == ["t1"]
+    assert "bot-poll-race" not in engine._pending_limit_orders
+
+
+def test_resolved_order_stays_under_polling_when_recording_it_fails(db_engine, settings, filters_provider):
+    """The order used to be untracked before its result was written. A DB
+    error in between (sqlite "database is locked") left a NEW row nothing
+    polled, freezing that position's exits and DCA until a restart."""
+    _seed_order("bot-persist-fails")
+    executor = _ScriptedExecutor([_result_with_fills(OrderStatus.FILLED, "t1")])
+    engine = ExecutionEngine(executor=executor, filters_provider=filters_provider, settings=settings, dry_run=False)
+    engine._pending_limit_orders["bot-persist-fails"] = ("SOLUSDT", utcnow())
+    real_persist = engine._persist_result
+
+    def locked(order_id, result):
+        raise RuntimeError("database is locked")
+
+    engine._persist_result = locked
+    assert asyncio.run(engine.check_pending_limit_orders()) == []
+    assert "bot-persist-fails" in engine._pending_limit_orders
+    assert _stored_status("bot-persist-fails") == OrderStatus.NEW
+
+    engine._persist_result = real_persist
+    resolved = asyncio.run(engine.check_pending_limit_orders())
+
+    assert [cid for _s, cid, _r in resolved] == ["bot-persist-fails"]
+    assert _stored_status("bot-persist-fails") == OrderStatus.FILLED
+    assert "bot-persist-fails" not in engine._pending_limit_orders

@@ -112,6 +112,42 @@ def test_monitor_open_positions_isolates_one_bad_symbol_from_the_rest(db_engine,
     assert strategy_engine.manage_position.call_count == 1  # GOODUSDT still got managed despite BADUSDT failing
 
 
+def test_monitor_open_positions_still_manages_positions_when_the_balance_fetch_fails(db_engine, settings, rules):
+    """The balance fetch sat outside the per-position try: one failed
+    /account call skipped managing every position that cycle (no hard
+    ceiling, trailing or take-profit). Now each position is managed with
+    trading_balance_usdt=None, which skips only DCA."""
+    with session_scope() as session:
+        for symbol in ("SOLUSDT", "ETHUSDT"):
+            PositionRepository(session).create(
+                symbol=symbol, opened_at=utcnow(), avg_entry_price=Decimal("100"),
+                total_quantity=Decimal("1"), total_cost_usdt=Decimal("100"), target_price=Decimal("110"),
+            )
+    strategy_engine = MagicMock()
+    strategy_engine.process_resolved_orders = AsyncMock()
+    strategy_engine.manage_position = AsyncMock()
+    client = MagicMock()
+    client.get_account_balances = AsyncMock(side_effect=RuntimeError("simulated /account failure"))
+    notifier = MagicMock()
+    notifier.on_error = AsyncMock()
+    notifier.mark_exchange_ok = AsyncMock()
+    runtime = _make_runtime(
+        settings, rules, client=client, strategy_engine=strategy_engine, notifier=notifier, paper_broker=None
+    )
+    book = MagicMock()
+    book.is_empty = False
+    book.mid_price = Decimal("100")
+    runtime._get_order_book = AsyncMock(return_value=book)
+
+    asyncio.run(runtime._monitor_open_positions())
+
+    assert strategy_engine.manage_position.await_count == 2
+    assert all(c.kwargs["trading_balance_usdt"] is None for c in strategy_engine.manage_position.await_args_list)
+    notifier.on_error.assert_awaited_once()
+    assert "simulated /account failure" in notifier.on_error.await_args.args[0]
+    notifier.mark_exchange_ok.assert_not_awaited()
+
+
 def test_evaluate_entry_respects_max_open_positions(db_engine, settings, rules):
     tuned = settings.model_copy(update={"max_open_positions": 1})
     with session_scope() as session:

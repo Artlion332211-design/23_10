@@ -68,6 +68,8 @@ def regime_label(value: str) -> str:
 _CLOSE_REASON_LABELS = {
     "TAKE_PROFIT": "ТЕЙК-ПРОФІТ",
     "TRAILING_STOP": "ТРЕЙЛІНГ-СТОП",
+    "HARD_PROFIT_CEILING": "АВАРІЙНА МЕЖА ПРИБУТКУ",
+    "EMERGENCY_SELL": "АВАРІЙНИЙ ПРОДАЖ",
     "OPEN_AT_END": "ВІДКРИТА НА КІНЕЦЬ ПЕРІОДУ",  # backtest-only, never appears live
 }
 

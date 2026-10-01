@@ -26,6 +26,8 @@ def format_summary(metrics: BacktestMetrics, *, symbols: list[str], params: dict
         f"Total fees paid:  {metrics.total_fees_usdt:.2f} USDT",
         "-" * 62,
         f"Trades: {metrics.num_trades}   Win rate: {metrics.win_rate:.1f}%",
+        f"Still open at end: {metrics.open_at_end_count} "
+        f"(unrealized {metrics.open_at_end_unrealized_pnl_usdt:+.2f} USDT, not counted as trades)",
         f"Avg profit (winners): {metrics.avg_profit_percent:+.2f}%   Avg loss (losers): {metrics.avg_loss_percent:+.2f}%",
         f"Profit factor: {profit_factor}",
         f"Sharpe ratio:  {metrics.sharpe_ratio:.2f}",
