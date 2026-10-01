@@ -86,3 +86,30 @@ run the full test suite on it, verify Binance answers from the server IP
 the SQLite backup API, then verify startup, streams and the next candle.
 Note for DigitalOcean: outbound traffic leaves from the droplet's own IP,
 not from a Reserved IP - whitelist the droplet IP on Binance.
+
+**12. "No signals for hours" with all position slots full (not a bug).** With
+`MAX_OPEN_POSITIONS` reached, entry evaluation returns before scoring, so the
+`signals` table gets no rows per candle; DCA scoring writes rows only while a
+position sits at a DCA level. Lesson: the "25 per candle" health check only
+applies while a slot is free - otherwise check the kline stream, errors.log
+and the position monitor.
+
+## 2026-10-01
+
+**13. Code review of the first live days - fixed before any of it bit
+(deployed 03:32, commit b2fb2f8, positions verified unchanged).** Main finds:
+a cancel that Binance couldn't confirm (network blip, key/IP rejection) left
+the order unpolled, which would have frozen that position's exits and DCA
+until a restart; a force-close could sell on top of a resting SELL whose
+cancel wasn't confirmed; `/emergency_stop` could interleave with the
+monitor or the order poll and sell the same coins twice, or wait minutes
+behind a slow poll; DCA re-scoring every minute wrote ~40 NO_TRADE rows per
+candle; the backtest counted sell orders instead of positions. Lessons: an
+unconfirmed cancel means "unknown", never "cancelled"; exactly one code path
+may apply each fill, and every other path must check whether it already
+happened; keep network calls outside locks.
+
+**14. A test failed every night between 00:00 and 01:00 UTC.** The
+daily-report test built "an hour ago" from the wall clock, which is
+yesterday in that hour. It would have blocked a night-time deploy (tests run
+on the server first). Lesson: tests must never depend on the time of day.
