@@ -27,6 +27,7 @@ from telegram.ext import ContextTypes
 from config.settings import RulesConfig, Settings
 from database.repository import DailyStatRepository, NewsRepository, PositionRepository
 from database.session import session_scope
+from market.macro_regime import MacroAssessment
 from market.market_regime import RegimeAssessment
 from news.news_engine import NewsEngine
 from risk.risk_manager import RiskManager
@@ -37,6 +38,7 @@ from telegram_bot.notifications import (
     StatusSnapshot,
     close_reason_label,
     format_daily_report,
+    format_macro_report,
     format_status,
     regime_label,
 )
@@ -69,6 +71,7 @@ class BotContext:
     get_mark_prices: Callable[[], dict[str, Decimal]]
     get_status_snapshot: Callable[[], StatusSnapshot]
     trigger_emergency_stop: Callable[[], Awaitable[list[str] | None]]
+    get_macro_assessment: Callable[[], MacroAssessment | None] = lambda: None
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -229,11 +232,17 @@ async def cmd_start_dca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @_restricted
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     regime = _ctx(context).get_current_regime()
-    if regime is None:
+    macro = _ctx(context).get_macro_assessment()
+    if regime is None and macro is None:
         await _reply(update, "Режим ринку ще не розраховано.")
         return
-    reasons = "\n".join(regime.reasons[:5]) if regime.reasons else "-"
-    await _reply(update, f"РИНКОВИЙ РЕЖИМ\nBTC: {regime_label(regime.level.value)} (бал {regime.score:.0f})\n{reasons}")
+    parts = ["РИНКОВИЙ РЕЖИМ"]
+    if regime is not None:
+        reasons = "\n".join(regime.reasons[:5]) if regime.reasons else "-"
+        parts.append(f"Зараз (15 хв - 4 год), BTC: {regime_label(regime.level.value)} (бал {regime.score:.0f})\n{reasons}")
+    if macro is not None:
+        parts.append(format_macro_report(macro))
+    await _reply(update, "\n\n".join(parts))
 
 
 @_restricted

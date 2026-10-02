@@ -20,7 +20,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from database.models import DailyStat
 from strategy.strategy_engine import (
@@ -31,6 +31,9 @@ from strategy.strategy_engine import (
     PositionClosedEvent,
     TradeDecision,
 )
+
+if TYPE_CHECKING:
+    from market.macro_regime import MacroAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,78 @@ _REGIME_LABELS = {
 
 def regime_label(value: str) -> str:
     return _REGIME_LABELS.get(value, value)
+
+
+# Long-term market phase (market/macro_regime.py), from BTC daily/weekly candles.
+_MACRO_LABELS = {
+    "BULL": "ЗРОСТАННЯ",
+    "CAUTION": "ОБЕРЕЖНО (ринок слабшає)",
+    "BEAR": "ВЕДМЕЖИЙ РИНОК",
+    "DEEP_BEAR": "ГЛИБОКИЙ ВЕДМЕЖИЙ РИНОК",
+}
+_MACRO_MEANING = {
+    "BULL": "Довгостроковий тренд BTC висхідний. Бот торгує як звичайно.",
+    "CAUTION": (
+        "Раннє попередження: тижневе закриття BTC нижче 20-тижневої і 21-тижневої середніх. "
+        "Ведмежий ринок ще не підтверджено. Бот торгує як звичайно."
+    ),
+    "BEAR": (
+        "BTC 3 дні поспіль закривається нижче 200-денної середньої - ведмежий ринок. У тестах 2018, 2022 "
+        "і 2025-26 звичайна торгівля альткоїнами в такій фазі приносила збитки. Бот поки торгує як звичайно; "
+        "зупинити нові купівлі можна командою /pause (відкриті позиції бот веде далі)."
+    ),
+    "DEEP_BEAR": (
+        "BTC більше ніж на 20% нижче 200-денної середньої. Історично це була зона, де BTC був найдешевшим. "
+        "Бот поки торгує як звичайно; зупинити нові купівлі - /pause."
+    ),
+}
+
+
+def macro_label(value: str | None) -> str:
+    return _MACRO_LABELS.get(value, value) if value else "невідомо"
+
+
+def _num(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ")
+
+
+def macro_status_detail(btc_close: float, sma200: float) -> str:
+    pct = (btc_close / sma200 - 1) * 100
+    side = "вище" if pct >= 0 else "нижче"
+    return f"BTC {_num(btc_close)} на {abs(pct):.0f}% {side} 200-денної середньої ({_num(sma200)})"
+
+
+def format_macro_report(assessment: MacroAssessment) -> str:
+    """The long-term part of /market and of a phase-change alert."""
+    a = assessment
+    since = f"з {a.phase_since.isoformat()}" if a.phase_since else f"понад {a.phase_days_at_least} днів"
+    lines = [
+        f"Фаза ринку (довгостроково): {macro_label(a.phase.value)}, {since}",
+        f"За закриттям {a.as_of.isoformat()}: {macro_status_detail(a.btc_close, a.sma200)}",
+        f"200-денна середня {'росте' if a.sma200_rising else 'падає'} (порівняно з 20 днями тому)",
+    ]
+    if a.weekly_close is not None and a.sma20w is not None and a.ema21w is not None:
+        band = "нижче" if a.weekly_close < min(a.sma20w, a.ema21w) else (
+            "вище" if a.weekly_close > max(a.sma20w, a.ema21w) else "всередині")
+        lines.append(
+            f"Тижневе закриття {_num(a.weekly_close)} - {band} смуги 20-тижневої ({_num(a.sma20w)}) "
+            f"і 21-тижневої EMA ({_num(a.ema21w)})"
+        )
+    if a.sma50w is not None:
+        lines.append(f"50-тижнева середня: {_num(a.sma50w)}")
+    if a.is_bear:
+        lines.append(f"Кінець ведмежого ринку: 3 денні закриття BTC вище {_num(a.sma200)}")
+    else:
+        lines.append(f"Початок ведмежого ринку: 3 денні закриття BTC нижче {_num(a.sma200)}")
+    return "\n".join(lines)
+
+
+def format_macro_change(previous: str | None, assessment: MacroAssessment) -> str:
+    return (
+        f"ФАЗА РИНКУ ЗМІНИЛАСЬ: {macro_label(previous)} -> {macro_label(assessment.phase.value)}\n"
+        f"{format_macro_report(assessment)}\n\n"
+        f"Що це означає: {_MACRO_MEANING.get(assessment.phase.value, '')}"
+    )
 
 
 _CLOSE_REASON_LABELS = {
@@ -381,6 +456,9 @@ class StatusSnapshot:
     # internal loop, ...) - empty means everything is healthy. Raw health
     # diagnostics stay out of the message; they're in the logs.
     problems: tuple[str, ...]
+    # Long-term market phase (market/macro_regime.py); None until computed.
+    macro_phase: str | None = None
+    macro_detail: str | None = None
 
 
 def _mode_text(mode: str, dry_run: bool) -> str:
@@ -412,6 +490,11 @@ def format_status(snap: StatusSnapshot) -> str:
         f"Працює: {format_uptime(snap.uptime_seconds)}",
         f"Стан: {health_text}",
         f"Ринок (BTC): {market_text}",
+    ]
+    if snap.macro_phase is not None:
+        detail = f" - {snap.macro_detail}" if snap.macro_detail else ""
+        lines.append(f"Фаза ринку (довгостроково): {macro_label(snap.macro_phase)}{detail}")
+    lines += [
         f"Монет під наглядом: {snap.watched_symbols}",
         f"Відкриті позиції: {snap.open_positions_count} з {snap.max_open_positions}",
     ]
@@ -462,11 +545,15 @@ class TelegramNotifier:
         self._active_errors: dict[str, tuple[float, int]] = {}
         self._error_categories: dict[str, ErrorCategory] = {}
 
-    async def _send(self, text: str) -> None:
+    async def _send(self, text: str) -> bool:
+        """True if Telegram accepted the message. Never raises - a failed
+        notification must never crash the trading loop."""
         try:
             await self._sender.send_message(chat_id=self._chat_id, text=text)
         except Exception as exc:  # noqa: BLE001 - a failed notification must never crash the trading loop
             logger.error("Failed to send Telegram message: %r", exc)
+            return False
+        return True
 
     async def on_buy_signal(self, decision: TradeDecision) -> None:
         await self._send(format_buy_signal(decision))
@@ -543,6 +630,10 @@ class TelegramNotifier:
 
     async def crash_alert(self, reasons: list[str]) -> None:
         await self._send(format_crash_alert(reasons))
+
+    async def macro_phase_change(self, previous: str | None, assessment: MacroAssessment) -> bool:
+        """True if delivered, so the caller can retry an alert Telegram didn't accept."""
+        return await self._send(format_macro_change(previous, assessment))
 
     async def daily_report(self, data: DailyReportData) -> None:
         await self._send(format_daily_report(data))

@@ -373,3 +373,121 @@ def test_status_snapshot_says_starting_until_initialize_finishes(db_engine, sett
 
     assert snapshot.starting
     assert snapshot.problems == ()
+
+
+def _btc_daily(closes):
+    """Binance-style 1d klines whose last candle closed yesterday (UTC)."""
+    from datetime import timedelta
+
+    import pandas as pd
+
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    opens = [today - timedelta(days=len(closes) - i) for i in range(len(closes))]
+    return pd.DataFrame({
+        "open_time": pd.to_datetime(opens, utc=True),
+        "close": closes,
+        "close_time": pd.to_datetime([t + timedelta(days=1) - timedelta(milliseconds=1) for t in opens], utc=True),
+    })
+
+
+def _macro_runtime(settings, rules, closes):
+    client = MagicMock()
+    client.get_historical_klines = AsyncMock(return_value=_btc_daily(closes))
+    notifier = MagicMock()
+    notifier.macro_phase_change = AsyncMock(return_value=True)
+    return _make_runtime(settings, rules, client=client, notifier=notifier), client, notifier
+
+
+def test_market_phase_is_stored_silently_on_first_run_and_announced_only_when_it_changes(db_engine, settings, rules):
+    from database.repository import SettingsRepository
+
+    runtime, client, notifier = _macro_runtime(settings, rules, [100.0] * 300)
+
+    asyncio.run(runtime._refresh_macro())  # first ever: nothing to compare with -> no alert
+    asyncio.run(runtime._refresh_macro())  # unchanged -> no alert
+    notifier.macro_phase_change.assert_not_called()
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BULL"
+
+    client.get_historical_klines.return_value = _btc_daily([100.0] * 300 + [90.0] * 3)
+    asyncio.run(runtime._refresh_macro())
+
+    notifier.macro_phase_change.assert_awaited_once()
+    previous, assessment = notifier.macro_phase_change.await_args.args
+    assert (previous, assessment.phase.value) == ("BULL", "BEAR")
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BEAR"
+
+
+def test_market_phase_change_while_the_bot_was_down_is_announced_after_restart(db_engine, settings, rules):
+    """The last announced phase lives in the DB, not in memory: a fresh
+    process compares against it instead of treating its first check as new."""
+    from database.repository import SettingsRepository
+
+    with session_scope() as session:
+        SettingsRepository(session).set("macro_phase", "BEAR")
+    runtime, _client, notifier = _macro_runtime(settings, rules, [100.0] * 300)
+
+    asyncio.run(runtime._refresh_macro())
+
+    notifier.macro_phase_change.assert_awaited_once()
+    assert notifier.macro_phase_change.await_args.args[0] == "BEAR"
+
+
+def test_status_snapshot_shows_the_long_term_market_phase(db_engine, settings, rules):
+    runtime, _client, _notifier = _macro_runtime(settings, rules, [100.0] * 300 + [70.0] * 5)
+    runtime._strategy_engine.regime_allows_buy = MagicMock(return_value=True)
+
+    assert runtime.build_status_snapshot().macro_phase is None  # not computed yet
+    asyncio.run(runtime._refresh_macro())
+    snapshot = runtime.build_status_snapshot()
+
+    assert snapshot.macro_phase == "DEEP_BEAR"
+    assert "нижче 200-денної середньої" in snapshot.macro_detail
+
+
+def test_market_phase_alert_that_telegram_did_not_accept_is_retried(db_engine, settings, rules):
+    from database.repository import SettingsRepository
+
+    with session_scope() as session:
+        SettingsRepository(session).set("macro_phase", "BULL")
+    runtime, _client, notifier = _macro_runtime(settings, rules, [100.0] * 300 + [90.0] * 3)
+    notifier.macro_phase_change.return_value = False  # e.g. Telegram API hiccup
+
+    asyncio.run(runtime._refresh_macro())
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BULL"  # not marked as announced
+
+    notifier.macro_phase_change.return_value = True
+    asyncio.run(runtime._refresh_macro())
+    assert notifier.macro_phase_change.await_count == 2
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BEAR"
+
+
+def test_quiet_phase_changes_are_recorded_without_an_alert(db_engine, settings, rules):
+    from database.repository import SettingsRepository
+
+    with session_scope() as session:
+        SettingsRepository(session).set("macro_phase", "DEEP_BEAR")
+    runtime, _client, notifier = _macro_runtime(settings, rules, [100.0] * 300 + [90.0] * 3)  # now plain BEAR
+
+    asyncio.run(runtime._refresh_macro())
+
+    notifier.macro_phase_change.assert_not_called()
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BEAR"
+
+
+def test_first_ever_phase_check_is_silent_even_in_a_bear_market(db_engine, settings, rules):
+    """Deploying the feature mid-bear must not greet the owner with a
+    'phase changed' alert for a change nobody saw happen."""
+    from database.repository import SettingsRepository
+
+    runtime, _client, notifier = _macro_runtime(settings, rules, [100.0] * 300 + [90.0] * 3)
+
+    asyncio.run(runtime._refresh_macro())
+
+    notifier.macro_phase_change.assert_not_called()
+    with session_scope() as session:
+        assert SettingsRepository(session).get("macro_phase") == "BEAR"

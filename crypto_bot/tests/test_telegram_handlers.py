@@ -209,3 +209,27 @@ def test_market_before_and_after_regime_computed(db_engine, settings, rules):
     text = update2.message.reply_text.call_args[0][0]
     assert "ЗРОСТАННЯ" in text
     assert "strong uptrend" in text
+
+
+def test_market_command_shows_both_the_intraday_regime_and_the_long_term_phase(db_engine, settings, rules):
+    from datetime import date
+
+    from market.macro_regime import MacroAssessment, MacroPhase
+
+    ctx = _make_ctx(db_engine, settings, rules)
+    ctx.get_current_regime = lambda: RegimeAssessment(level=RegimeLevel.NEUTRAL, score=3.0, reasons=["4h: price above EMA200"], crash=False)
+    ctx.get_macro_assessment = lambda: MacroAssessment(
+        phase=MacroPhase.BULL, as_of=date(2026, 10, 1), phase_since=date(2026, 8, 23), phase_days_at_least=40,
+        btc_close=84_880.0,
+        sma200=71_360.0, mayer=1.19, sma200_rising=True, weekly_close=84_472.0, sma20w=70_367.0,
+        ema21w=73_701.0, sma50w=78_211.0,
+    )
+    update = _make_update(user_id=42)
+
+    asyncio.run(cmd_market(update, _make_context(ctx)))
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "Зараз (15 хв - 4 год), BTC: НЕЙТРАЛЬНИЙ" in text
+    assert "Фаза ринку (довгостроково): ЗРОСТАННЯ, з 2026-08-23" in text
+    assert "BTC 84 880 на 19% вище 200-денної середньої (71 360)" in text
+    assert "Початок ведмежого ринку: 3 денні закриття BTC нижче 71 360" in text

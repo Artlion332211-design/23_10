@@ -33,11 +33,23 @@ from typing import Any
 
 from config.settings import RulesConfig, Settings, TradingMode
 from database.models import OrderPurpose
-from database.repository import NewsRepository, OrderRepository, PositionRepository
+from database.repository import (
+    NewsRepository,
+    OrderRepository,
+    PositionRepository,
+    SettingsRepository,
+)
 from database.session import session_scope
 from exchange.binance_client import BinanceClient
 from exchange.execution_engine import ExecutionEngine
 from exchange.websocket_manager import WebSocketManager
+from market.macro_regime import (
+    HISTORY_DAYS,
+    MacroAssessment,
+    MacroPhase,
+    assess_macro,
+    phase_change_alert_due,
+)
 from market.market_data import MarketDataStore
 from market.market_regime import MarketRegimeEngine, RegimeAssessment, RegimeLevel
 from market.orderbook import OrderBookSnapshot, parse_order_book
@@ -53,6 +65,7 @@ from telegram_bot.notifications import (
     StatusSnapshot,
     TelegramNotifier,
     format_status,
+    macro_status_detail,
 )
 from utils.time import Timeframe, floor_to_timeframe, utcnow
 
@@ -66,6 +79,13 @@ _STALE_FEED_SECONDS = 120
 # Longer than a planned stream swap on universe rescan (1-3s) plus the
 # reconnect backoff's first steps, so only a real outage is reported.
 _FEED_DOWN_GRACE_SECONDS = 60
+# The long-term phase uses closed DAILY candles; an hourly check sees each
+# new daily close within the hour, for one cheap REST call.
+_MACRO_REFRESH_SECONDS = 3600
+# Last phase announced in Telegram, persisted so a restart neither repeats an
+# old alert nor misses a change that happened while the bot was down.
+_MACRO_PHASE_KEY = "macro_phase"
+_MACRO_CAUTION_ALERT_KEY = "macro_caution_alert_at"
 
 
 def _minutes(seconds: float) -> int:
@@ -77,6 +97,7 @@ _TASK_LABELS = {
     "news_refresh": "новини",
     "daily_report": "щоденний звіт",
     "status_ping": "статус-повідомлення",
+    "macro_regime": "фаза ринку",
 }
 
 
@@ -120,6 +141,7 @@ class BotRuntime:
 
         self._regime_engine = MarketRegimeEngine(rules.crash_detector)
         self._btc_regime: RegimeAssessment | None = None
+        self._macro: MacroAssessment | None = None
         self._latest_decisions: dict[str, TradeDecision] = {}
         self._candidate_symbols: set[str] = set()
         self._tracked_symbols: set[str] = set()
@@ -155,6 +177,10 @@ class BotRuntime:
             await self._news_engine.refresh()
             self._last_news_refresh_at = utcnow()
         self._update_btc_regime()
+        try:
+            await self._refresh_macro()
+        except Exception as exc:  # noqa: BLE001 - informational only; never block startup on it
+            logger.warning("Market phase not computed at startup (retried hourly): %r", exc)
         self._initialized = True
 
     def register_tasks(self) -> None:
@@ -165,6 +191,7 @@ class BotRuntime:
             self._watchdog.register("news_refresh", self.run_news_refresh_loop)
         self._watchdog.register("daily_report", self.run_daily_report_loop)
         self._watchdog.register("status_ping", self.run_status_ping_loop)
+        self._watchdog.register("macro_regime", self.run_macro_regime_loop)
 
     # ------------------------------------------------------------------
     # Universe tracking + market data
@@ -265,6 +292,51 @@ class BotRuntime:
             task = asyncio.create_task(self._notifier.crash_alert(self._btc_regime.reasons))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+
+    async def run_macro_regime_loop(self) -> None:
+        while True:
+            await self._sleep_with_heartbeat(_MACRO_REFRESH_SECONDS, "macro_regime")
+            try:
+                await self._refresh_macro()
+            except Exception as exc:  # noqa: BLE001 - one failed refresh must not kill the loop
+                logger.warning("Market phase refresh failed (retrying in an hour): %r", exc)
+
+    async def _refresh_macro(self) -> None:
+        """Recomputes the long-term phase from closed BTC daily candles and
+        announces a change in Telegram. Informational only - it changes no
+        trading decision."""
+        now = utcnow()
+        daily = await self._client.get_historical_klines("BTCUSDT", "1d", now - timedelta(days=HISTORY_DAYS), now)
+        assessment = assess_macro(daily, now=now)
+        if assessment is None:
+            logger.warning("Market phase: not enough BTC daily history yet (%s candles)", len(daily))
+            return
+        self._macro = assessment
+        phase = assessment.phase.value
+        with session_scope() as session:
+            settings_repo = SettingsRepository(session)
+            previous = settings_repo.get(_MACRO_PHASE_KEY)
+            last_caution_raw = settings_repo.get(_MACRO_CAUTION_ALERT_KEY)
+            if previous is None:
+                settings_repo.set(_MACRO_PHASE_KEY, phase)
+        if previous is None:
+            logger.info("Market phase initialised: %s (BTC %.0f, SMA200 %.0f)", phase, assessment.btc_close, assessment.sma200)
+            return
+        if previous == phase:
+            return
+        last_caution = datetime.fromisoformat(last_caution_raw) if last_caution_raw else None
+        due = phase_change_alert_due(previous, phase, last_caution_alert_at=last_caution, now=now)
+        logger.warning("Market phase changed: %s -> %s (alert: %s)", previous, phase, due)
+        # Persist only after Telegram accepted the alert: a failed send keeps
+        # the old phase stored, so the next hourly refresh announces it again.
+        if due and not await self._notifier.macro_phase_change(previous, assessment):
+            logger.warning("Market phase alert not delivered - retrying at the next refresh")
+            return
+        with session_scope() as session:
+            settings_repo = SettingsRepository(session)
+            settings_repo.set(_MACRO_PHASE_KEY, phase)
+            if due and phase == MacroPhase.CAUTION.value:
+                settings_repo.set(_MACRO_CAUTION_ALERT_KEY, now.isoformat())
 
     async def _on_user_event(self, event: dict[str, Any]) -> None:
         """Supplementary low-latency signal only - order-state correctness
@@ -586,6 +658,8 @@ class BotRuntime:
             ),
             starting=not self._initialized,
             problems=tuple(self._status_problems()) if self._initialized else (),
+            macro_phase=self._macro.phase.value if self._macro else None,
+            macro_detail=macro_status_detail(self._macro.btc_close, self._macro.sma200) if self._macro else None,
         )
 
     def _status_problems(self) -> list[str]:
@@ -622,6 +696,9 @@ class BotRuntime:
 
     def get_current_regime(self) -> RegimeAssessment | None:
         return self._btc_regime
+
+    def get_macro_assessment(self) -> MacroAssessment | None:
+        return self._macro
 
     def get_latest_signals(self) -> list[TradeDecision]:
         return list(self._latest_decisions.values())
