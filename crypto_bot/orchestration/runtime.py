@@ -59,7 +59,7 @@ from orchestration.daily_report import build_daily_stat
 from orchestration.watchdog import Watchdog
 from paper.simulator import PaperBroker
 from risk.risk_manager import RiskManager
-from strategy.strategy_engine import StrategyEngine, TradeDecision
+from strategy.strategy_engine import ManualSellResult, StrategyEngine, TradeDecision
 from telegram_bot.notifications import (
     DailyReportData,
     StatusSnapshot,
@@ -86,6 +86,9 @@ _MACRO_REFRESH_SECONDS = 3600
 # old alert nor misses a change that happened while the bot was down.
 _MACRO_PHASE_KEY = "macro_phase"
 _MACRO_CAUTION_ALERT_KEY = "macro_caution_alert_at"
+# After the owner's /sell the bot doesn't buy that coin back right away.
+MANUAL_SELL_COOLDOWN = timedelta(hours=24)
+_MANUAL_SELL_KEY = "manual_sell_at:{symbol}"
 
 
 def _minutes(seconds: float) -> int:
@@ -380,6 +383,8 @@ class BotRuntime:
             open_symbols = [p.symbol for p in position_repo.get_open_positions()]
         if open_count >= self._settings.max_open_positions:
             return
+        if self._in_manual_sell_cooldown(symbol):
+            return
 
         regime = self._btc_regime or _default_neutral_regime()
         try:
@@ -392,6 +397,9 @@ class BotRuntime:
             decision = await self._strategy_engine.try_open_position(
                 symbol, btc_regime=regime, trading_balance_usdt=trading_balance,
                 order_book=order_book, open_position_symbols=open_symbols,
+                # The bigger strong-signal entry only while the long-term phase is BULL:
+                # never in an early warning or a bear, and never before the phase is known.
+                strong_size_allowed=self._macro is not None and self._macro.phase == MacroPhase.BULL,
             )
             self._latest_decisions[symbol] = decision
         except Exception as exc:  # noqa: BLE001 - one bad candidate must not kill the feed
@@ -455,6 +463,27 @@ class BotRuntime:
     # ------------------------------------------------------------------
     # Emergency stop
     # ------------------------------------------------------------------
+
+    async def manual_sell(self, symbol: str) -> ManualSellResult:
+        """The owner's /sell: market-sell the whole open position in
+        `symbol`. After anything was sold the bot does not re-buy that coin
+        for MANUAL_SELL_COOLDOWN - the owner just chose to get out of it."""
+        try:
+            order_book: OrderBookSnapshot | None = await self._get_order_book(symbol)
+        except Exception as exc:  # noqa: BLE001 - reported as no_order_book below
+            logger.exception("Failed to fetch order book for manual sell of %s: %r", symbol, exc)
+            order_book = None
+        regime = self._btc_regime or _default_neutral_regime()
+        result = await self._strategy_engine.manual_sell(symbol, order_book=order_book, btc_regime=regime)
+        if result.status in ("sold", "sold_with_warning", "partial"):
+            with session_scope() as session:
+                SettingsRepository(session).set(_MANUAL_SELL_KEY.format(symbol=symbol), utcnow().isoformat())
+        return result
+
+    def _in_manual_sell_cooldown(self, symbol: str) -> bool:
+        with session_scope() as session:
+            raw = SettingsRepository(session).get(_MANUAL_SELL_KEY.format(symbol=symbol))
+        return raw is not None and utcnow() - datetime.fromisoformat(raw) < MANUAL_SELL_COOLDOWN
 
     async def emergency_stop(self) -> list[str] | None:
         """Triggers the kill switch (stop new BUY/DCA) and, only if

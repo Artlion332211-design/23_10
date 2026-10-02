@@ -210,6 +210,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
         get_latest_signals=runtime.get_latest_signals, get_health_snapshot=runtime.get_health_snapshot,
         get_mark_prices=runtime.get_mark_prices, get_status_snapshot=runtime.build_status_snapshot,
         trigger_emergency_stop=runtime.emergency_stop, get_macro_assessment=runtime.get_macro_assessment,
+        manual_sell=runtime.manual_sell,
     )
     attach_context(application, ctx)
     bot_runner = TelegramBotRunner(application)

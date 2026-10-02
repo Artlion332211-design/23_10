@@ -31,7 +31,7 @@ from market.macro_regime import MacroAssessment
 from market.market_regime import RegimeAssessment
 from news.news_engine import NewsEngine
 from risk.risk_manager import RiskManager
-from strategy.strategy_engine import TradeDecision
+from strategy.strategy_engine import ManualSellResult, TradeDecision
 from telegram_bot.notifications import (
     SIGNAL_LABELS,
     DailyReportData,
@@ -72,6 +72,8 @@ class BotContext:
     get_status_snapshot: Callable[[], StatusSnapshot]
     trigger_emergency_stop: Callable[[], Awaitable[list[str] | None]]
     get_macro_assessment: Callable[[], MacroAssessment | None] = lambda: None
+    # The owner's /sell (runtime.manual_sell); None = not available in this build.
+    manual_sell: Callable[[str], Awaitable[ManualSellResult]] | None = None
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -94,8 +96,11 @@ def _restricted(
 
 
 async def _reply(update: Update, text: str) -> None:
-    assert update.message is not None
-    await update.message.reply_text(text)
+    # effective_message also covers an EDITED command (e.g. "/sell AAVE" edited to
+    # "/sell AAVE так" on a phone), where update.message is None.
+    message = update.effective_message
+    assert message is not None
+    await message.reply_text(text)
 
 
 @_restricted
@@ -135,6 +140,86 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"відкрито={p.opened_at.date()}"
             )
     await _reply(update, "\n".join(lines))
+
+
+_SELL_CONFIRM_WORDS = {"так", "yes", "confirm", "підтверджую"}
+
+
+def _sell_symbol(raw: str) -> str:
+    symbol = raw.strip().upper()
+    return symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+
+
+def _price(value: Decimal) -> str:
+    """4 decimals for normal prices, enough significant digits for sub-cent coins (PEPE)."""
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.10f}".rstrip("0").rstrip(".") or "0"
+
+
+@_restricted
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sell -> list; /sell AAVE -> show it and ask to confirm; /sell AAVE так -> market sell.
+    Two steps on purpose: the owner is often on a phone, and a mistyped
+    symbol must never sell a position by itself."""
+    ctx = _ctx(context)
+    args = list(context.args or [])
+    mark_prices = ctx.get_mark_prices()
+    with session_scope() as session:
+        positions = {p.symbol: (p.avg_entry_price, p.total_quantity) for p in PositionRepository(session).get_open_positions()}
+    if not args:
+        if not positions:
+            await _reply(update, "Відкритих позицій немає - продавати нічого.")
+            return
+        names = ", ".join(sorted(s.removesuffix("USDT") for s in positions))
+        await _reply(update, f"Продаж по ринку. Відкриті позиції: {names}\nНапиши, наприклад: /sell {sorted(positions)[0].removesuffix('USDT')}")
+        return
+    symbol = _sell_symbol(args[0])
+    if symbol not in positions:
+        await _reply(update, f"Позиції {symbol} немає серед відкритих. Список: /sell")
+        return
+    avg_entry, quantity = positions[symbol]
+    current = mark_prices.get(symbol)
+    if len(args) < 2 or args[1].strip().lower() not in _SELL_CONFIRM_WORDS:
+        if current is not None and avg_entry > 0:
+            pnl_pct = (current / avg_entry - 1) * 100
+            pnl_usdt = (current - avg_entry) * quantity
+            info = f"Зараз {_price(current)}, вхід {_price(avg_entry)}: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%) без комісій"
+        else:
+            info = f"Вхід {_price(avg_entry)}, поточна ціна недоступна"
+        await _reply(
+            update,
+            f"⚠️ ПРОДАТИ ВСЮ ПОЗИЦІЮ {symbol} ПО РИНКУ?\nКількість: {quantity}\n{info}\n"
+            f"Для підтвердження напиши: /sell {symbol.removesuffix('USDT')} так\n"
+            "Після продажу бот не купуватиме цю монету 24 години.",
+        )
+        return
+    if ctx.manual_sell is None:
+        await _reply(update, "Продаж через Telegram недоступний у цій версії бота.")
+        return
+    try:
+        await _reply(update, f"Продаю {symbol} по ринку...")
+    except Exception as exc:  # noqa: BLE001 - the owner confirmed: a failed courtesy reply must not stop the sale
+        logger.warning("Could not send the /sell progress reply: %r", exc)
+    result = await ctx.manual_sell(symbol)
+    await _reply(update, _sell_reply(symbol, result))
+
+
+def _sell_reply(symbol: str, result: ManualSellResult) -> str:
+    detail = f"\nПричина: {result.detail}" if result.detail else ""
+    if result.status == "sold":
+        return f"✅ {symbol} продано повністю. Підсумок угоди - в окремому повідомленні."
+    if result.status == "sold_with_warning":
+        return f"✅ {symbol} продано, але є попередження.{detail}"
+    if result.status == "partial":
+        return (f"⚠️ {symbol} продано ЧАСТКОВО - залишок {result.remaining} ще у позиції.{detail}\n"
+                f"Повтори /sell {symbol.removesuffix('USDT')} так, щоб продати решту.")
+    if result.status == "no_position":
+        return f"Позиції {symbol} вже немає - можливо, її щойно закрив сам бот."
+    if result.status == "no_order_book":
+        return f"❌ Не вдалося отримати ціни {symbol} з біржі - нічого не продано. Спробуй ще раз."
+    left = f" Залишок у позиції: {result.remaining}." if result.remaining is not None else ""
+    return f"❌ Продаж {symbol} не виконано.{left}{detail}\nПеревір /positions і Binance."
 
 
 @_restricted
@@ -265,6 +350,9 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "НАЛАШТУВАННЯ",
         f"MODE={s.mode.value}  DRY_RUN={s.dry_run}",
         f"INITIAL_ORDER_USDT={s.initial_order_usdt}  MAX_POSITION_USDT={s.max_position_usdt}",
+        (f"STRONG_SIGNAL_ORDER_USDT={s.strong_signal_order_usdt} (бал >= потрібний + {s.strong_signal_score_margin:g}, "
+         "лише коли довгострокова фаза ринку = 🟢 ЗРОСТАННЯ, див. /market)")
+        if s.strong_signal_order_usdt > s.initial_order_usdt else "Збільшений вхід на сильному сигналі: вимкнено",
         f"MAX_OPEN_POSITIONS={s.max_open_positions}  MAX_TOTAL_EXPOSURE_PERCENT={s.max_total_exposure_percent}%",
         f"TARGET_PROFIT_PERCENT={s.target_profit_percent}%  USE_TRAILING_AFTER_TP={s.use_trailing_after_tp}",
         f"MIN_BUY_SCORE={s.min_buy_score}  MIN_DCA_SCORE={s.min_dca_score}",

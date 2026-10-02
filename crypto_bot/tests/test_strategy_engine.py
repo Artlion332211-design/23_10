@@ -1040,3 +1040,162 @@ def test_one_coin_failing_does_not_stop_emergency_liquidation_of_the_others(stra
     with session_scope() as session:
         assert PositionRepository(session).get(sol_id).status == PositionStatus.OPEN
         assert PositionRepository(session).get(eth_id).close_reason == "EMERGENCY_SELL"
+
+
+def _entry_order_usdt(symbol="SOLUSDT"):
+    with session_scope() as session:
+        orders = [o for o in OrderRepository(session).recent(limit=50) if o.symbol == symbol and o.purpose == OrderPurpose.ENTRY]
+        return orders[0].requested_usdt if orders else None
+
+
+def test_strong_signal_enters_with_the_bigger_amount_only_when_allowed(strategy_setup):
+    """Owner 2026-10-02: a strong signal enters bigger (live: 50 USDT instead of 20).
+    'Strong' = the score beats what the regime requires by the margin, and the
+    caller allows it (the long-term phase is BULL)."""
+    strategy, executor, notifier, book = strategy_setup
+    strategy._settings = strategy._settings.model_copy(update={
+        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+    })
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book, strong_size_allowed=True,
+    ))
+
+    assert decision.action == "BUY"
+    assert strategy.is_strong_signal(decision)
+    assert _entry_order_usdt() == Decimal("150")  # the fixture's normal entry is 100
+
+
+def test_no_bigger_entry_when_the_long_term_phase_does_not_allow_it(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    strategy._settings = strategy._settings.model_copy(update={
+        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+    })
+
+    asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book, strong_size_allowed=False,
+    ))
+
+    assert _entry_order_usdt() == strategy._settings.initial_order_usdt
+
+
+def test_a_score_below_the_margin_is_not_a_strong_signal(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    strategy._settings = strategy._settings.model_copy(update={
+        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 100.0,
+    })
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book, strong_size_allowed=True,
+    ))
+
+    assert decision.action == "BUY"
+    assert not strategy.is_strong_signal(decision)
+    assert _entry_order_usdt() == strategy._settings.initial_order_usdt
+
+
+def test_bigger_entry_that_does_not_fit_the_risk_caps_falls_back_to_the_normal_size(strategy_setup):
+    """The bigger size must never cost the trade itself."""
+    strategy, executor, notifier, book = strategy_setup
+    tight = strategy._settings.model_copy(update={
+        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+        "max_daily_new_capital_usdt": Decimal("120"),
+    })
+    strategy._settings = tight
+    strategy._risk_manager = RiskManager(tight)
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book, strong_size_allowed=True,
+    ))
+
+    assert decision.action == "BUY"
+    assert _entry_order_usdt() == tight.initial_order_usdt
+
+
+def test_manual_sell_market_sells_the_whole_position(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert result.status == "sold"
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "MANUAL_SELL"
+        sells = [o for o in OrderRepository(session).for_position(position_id) if o.side == OrderSide.SELL]
+        assert [(o.purpose, o.type) for o in sells] == [(OrderPurpose.MANUAL_SELL, OrderType.MARKET)]
+    assert [e[1] for e in notifier.events if e[0] == "position_closed"] == ["MANUAL_SELL"]
+
+
+def test_manual_sell_reports_missing_position_or_prices_and_sells_nothing(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    _open_position(strategy, book)
+    sells_before = _sells(executor)
+
+    assert asyncio.run(strategy.manual_sell("ETHUSDT", order_book=book, btc_regime=NEUTRAL)).status == "no_position"
+    assert asyncio.run(strategy.manual_sell("SOLUSDT", order_book=None, btc_regime=NEUTRAL)).status == "no_order_book"
+    assert _sells(executor) == sells_before
+
+
+def test_manual_sell_refuses_while_a_resting_sell_cannot_be_confirmed_cancelled(strategy_setup):
+    """Same guard as the kill switch: Binance may still hold the coins in that
+    order, so a full-size market sell on top could oversell."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.TAKE_PROFIT, "bot-tp-unconfirmed", side=OrderSide.SELL)
+    unconfirmed = _UnconfirmedCancelExecutor()
+    strategy._execution_engine._executor = unconfirmed
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+    assert result.status == "failed"
+    assert "висить ордер на продаж" in (result.detail or "")
+
+    assert _sells(unconfirmed) == 0
+    assert any("Manual sell for SOLUSDT skipped" in e for e in _errors(notifier))
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).status == PositionStatus.OPEN
+
+
+class _HalfFilledSellExecutor(FakeExecutor):
+    """A MARKET SELL that Binance cuts short on a thin book: EXPIRED after half fills."""
+
+    async def submit(self, request):
+        result = await super().submit(request)
+        if request.side.value != "SELL":
+            return result
+        half = result.filled_quantity / 2
+        return dataclasses.replace(
+            result, status=OrderStatus.EXPIRED, filled_quantity=half, net_base_quantity=half,
+            filled_quote=half * result.avg_fill_price,
+            commission_total_usdt_equivalent=result.commission_total_usdt_equivalent / 2,
+        )
+
+
+def test_manual_sell_that_only_partly_fills_is_reported_as_partial_not_sold(strategy_setup):
+    """Telling the owner 'sold' while half the coins stayed in the position
+    (and the bot kept managing them, DCA included) was the review's main find."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    strategy._execution_engine._executor = _HalfFilledSellExecutor()
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert result.status == "partial"
+    assert result.remaining is not None and result.remaining > 0
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).status == PositionStatus.OPEN
+    # The kill switch must not count such a symbol as cleanly liquidated either.
+    assert asyncio.run(strategy.emergency_liquidate_all(order_books={"SOLUSDT": book}, btc_regime=NEUTRAL)) == ["SOLUSDT"]
+
+
+def test_a_manual_sell_at_a_loss_does_not_count_toward_the_loss_streak_pause(strategy_setup):
+    """Three /sell at a loss used to pause all buying silently (MAX_CONSECUTIVE_BAD_TRADES=3)."""
+    strategy, executor, notifier, book = strategy_setup
+    for _ in range(3):
+        executor.price = Decimal("100")
+        _open_position(strategy, book)
+        executor.price = Decimal("95")
+        assert asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL)).status == "sold"
+
+    flags = strategy._risk_manager.status()
+    assert flags.consecutive_bad_trades == 0
+    assert not flags.buy_paused

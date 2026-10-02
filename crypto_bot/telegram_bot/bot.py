@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Bot
+from telegram import Bot, BotCommand
 from telegram.ext import Application, CommandHandler
 
 from telegram_bot.handlers import (
@@ -27,6 +27,7 @@ from telegram_bot.handlers import (
     cmd_pnl,
     cmd_positions,
     cmd_resume,
+    cmd_sell,
     cmd_signals,
     cmd_start_dca,
     cmd_status,
@@ -40,6 +41,7 @@ _COMMANDS = {
     "status": cmd_status,
     "balance": cmd_balance,
     "positions": cmd_positions,
+    "sell": cmd_sell,
     "signals": cmd_signals,
     "pnl": cmd_pnl,
     "today": cmd_today,
@@ -52,6 +54,27 @@ _COMMANDS = {
     "news": cmd_news,
     "config": cmd_config,
     "emergency_stop": cmd_emergency_stop,
+}
+
+# The "/" menu in Telegram, set from code at startup so it never drifts from
+# the registered handlers (it used to be set by hand in BotFather).
+COMMAND_DESCRIPTIONS = {
+    "status": "стан бота",
+    "positions": "відкриті позиції",
+    "sell": "продати позицію по ринку (/sell AAVE так)",
+    "market": "ринок і фаза (ведмежий / зростання)",
+    "balance": "баланс",
+    "pnl": "прибуток / збиток",
+    "today": "підсумок за сьогодні",
+    "history": "закриті угоди",
+    "signals": "останні сигнали",
+    "news": "новини",
+    "config": "налаштування",
+    "pause": "зупинити нові купівлі",
+    "resume": "відновити купівлі",
+    "stop_dca": "вимкнути докупки",
+    "start_dca": "увімкнути докупки",
+    "emergency_stop": "АВАРІЙНА ЗУПИНКА",
 }
 
 
@@ -89,6 +112,12 @@ class TelegramBotRunner:
         if self._app.updater is not None:
             await self._app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram bot polling started")
+        try:
+            await self._app.bot.set_my_commands(
+                [BotCommand(name, COMMAND_DESCRIPTIONS.get(name, name)) for name in _COMMANDS]
+            )
+        except Exception as exc:  # noqa: BLE001 - the menu is a convenience; never block startup on it
+            logger.warning("Could not update the Telegram command menu: %r", exc)
 
     async def stop(self) -> None:
         if self._app.updater is not None and self._app.updater.running:

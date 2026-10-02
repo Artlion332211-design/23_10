@@ -377,3 +377,9 @@ def test_market_phase_headlines_use_emoji_and_the_bear_end_flags_the_btc_bag_sig
     assert end.startswith("✅🟢 ВЕДМЕЖИЙ РИНОК ЗАКІНЧИВСЯ 🟢✅")
     assert "Сигнал для «мішка BTC»" in end
     assert "мішка BTC" not in format_macro_change("BULL", _macro_assessment("BEAR"))
+
+
+def test_strong_signal_buy_and_manual_sell_are_labelled():
+    from telegram_bot.notifications import close_reason_label
+
+    assert close_reason_label("MANUAL_SELL") == "РУЧНИЙ ПРОДАЖ (/sell)"

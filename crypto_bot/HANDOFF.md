@@ -802,3 +802,33 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
 7. **Performance reporting**: weekly summary of closed trades (win rate,
    avg win/loss, fees, time in trade) vs. the backtest's expectations, so
    drift between live and backtest is noticed early.
+
+## 15. Added 2026-10-02 (owner requests)
+
+- **Long-term market phase** (`market/macro_regime.py`, hourly from BTC daily
+  candles): BULL / CAUTION (3 closes below a falling SMA50, or the weekly close
+  below the 20w SMA and 21w EMA) / BEAR (3 daily closes below SMA200, ends
+  after 3 above) / DEEP_BEAR (Mayer < 0.80, ends at >= 0.85). Shown in
+  /status and /market; Telegram alerts with emoji on bear start/end, the deep
+  zone and (at most every 14 days) the early warning. The bear-end alert is
+  the owner's signal to start the BTC accumulation bag. Informational - it
+  only gates the bigger entry below.
+- **Strong-signal entry**: STRONG_SIGNAL_ORDER_USDT (50) instead of
+  INITIAL_ORDER_USDT (20) when the score beats the regime's required score by
+  STRONG_SIGNAL_SCORE_MARGIN (5) AND the long-term phase is BULL; falls back
+  to 20 if the caps reject 50. Relative on purpose: an absolute "80+" would
+  upsize exactly the NEUTRAL/BEAR-regime entries (required 80-85). The
+  backtest engine does not model it; in the research harness the same rule
+  never fired in 2023-24 and 2025-26 (live scores so far max 72), so it is
+  expected to be rare.
+- **/sell** (Telegram): `/sell` lists, `/sell AAVE` asks, `/sell AAVE так`
+  market-sells the whole position via the kill switch's cancel-then-sell path
+  (OrderPurpose.MANUAL_SELL, close reason MANUAL_SELL). A partly filled sale
+  is reported as partial with the remainder; the reply carries the failure
+  reason itself. A manual sale does not count toward the loss streak, and the
+  bot does not re-buy that coin for 24 h. The "/" menu is set from code at
+  startup.
+- Bear-market research results (why nothing else was added): long altcoin
+  trading lost in the 2018, 2022 and 2025-26 bears; bounce trading, shorts,
+  grid, Dual Investment and "careful mode" variants did not beat holding
+  USDT in Simple Earn. Details in the operator's memory notes.

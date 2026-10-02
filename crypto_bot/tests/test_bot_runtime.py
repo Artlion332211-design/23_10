@@ -491,3 +491,67 @@ def test_first_ever_phase_check_is_silent_even_in_a_bear_market(db_engine, setti
     notifier.macro_phase_change.assert_not_called()
     with session_scope() as session:
         assert SettingsRepository(session).get("macro_phase") == "BEAR"
+
+
+def test_bigger_strong_signal_entry_is_allowed_only_in_the_bull_phase(db_engine, settings, rules):
+    from datetime import date
+
+    from market.macro_regime import MacroAssessment, MacroPhase
+
+    strategy_engine = MagicMock()
+    strategy_engine.try_open_position = AsyncMock()
+    runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
+    runtime._get_order_book = AsyncMock(return_value=MagicMock())
+    runtime._trading_balance_usdt = AsyncMock(return_value=Decimal("1000"))
+    runtime._notifier.mark_exchange_ok = AsyncMock()
+
+    def allowed_with(phase):
+        runtime._macro = None if phase is None else MacroAssessment(
+            phase=MacroPhase(phase), as_of=date(2026, 10, 1), phase_since=None, phase_days_at_least=40,
+            btc_close=1.0, sma200=1.0, mayer=1.0, sma200_rising=True, sma50=1.0, early_warning=False,
+            weekly_close=None, sma20w=None, ema21w=None, sma50w=None,
+        )
+        asyncio.run(runtime._evaluate_entry("SOLUSDT"))
+        return strategy_engine.try_open_position.await_args.kwargs["strong_size_allowed"]
+
+    assert allowed_with("BULL") is True
+    assert allowed_with(None) is False  # phase not computed yet
+    assert allowed_with("CAUTION") is False
+    assert allowed_with("BEAR") is False
+
+
+def test_bot_does_not_buy_back_a_coin_for_24h_after_the_owner_sold_it(db_engine, settings, rules):
+    from datetime import timedelta
+
+    from database.repository import SettingsRepository
+    from strategy.strategy_engine import ManualSellResult
+
+    strategy_engine = MagicMock()
+    strategy_engine.try_open_position = AsyncMock()
+    strategy_engine.manual_sell = AsyncMock(return_value=ManualSellResult("sold"))
+    runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
+    runtime._get_order_book = AsyncMock(return_value=MagicMock())
+    runtime._trading_balance_usdt = AsyncMock(return_value=Decimal("1000"))
+    runtime._notifier.mark_exchange_ok = AsyncMock()
+
+    assert asyncio.run(runtime.manual_sell("AAVEUSDT")).status == "sold"
+    asyncio.run(runtime._evaluate_entry("AAVEUSDT"))
+    strategy_engine.try_open_position.assert_not_called()
+
+    with session_scope() as session:  # 25 hours later the coin is a normal candidate again
+        SettingsRepository(session).set("manual_sell_at:AAVEUSDT", (utcnow() - timedelta(hours=25)).isoformat())
+    asyncio.run(runtime._evaluate_entry("AAVEUSDT"))
+    strategy_engine.try_open_position.assert_awaited_once()
+
+
+def test_failed_manual_sell_sets_no_cooldown(db_engine, settings, rules):
+    from strategy.strategy_engine import ManualSellResult
+
+    strategy_engine = MagicMock()
+    strategy_engine.manual_sell = AsyncMock(return_value=ManualSellResult("no_order_book"))
+    runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
+    runtime._get_order_book = AsyncMock(side_effect=RuntimeError("network down"))
+
+    asyncio.run(runtime.manual_sell("AAVEUSDT"))
+
+    assert not runtime._in_manual_sell_cooldown("AAVEUSDT")

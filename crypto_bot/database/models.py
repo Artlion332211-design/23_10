@@ -126,6 +126,7 @@ class OrderPurpose(str, enum.Enum):
     TRAILING_STOP = "TRAILING_STOP"
     EMERGENCY_SELL = "EMERGENCY_SELL"
     HARD_CEILING = "HARD_CEILING"  # HARD_PROFIT_CEILING_PERCENT backstop force-close
+    MANUAL_SELL = "MANUAL_SELL"  # owner's /sell command in Telegram
 
 
 class SignalDecision(str, enum.Enum):

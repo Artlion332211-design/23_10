@@ -69,6 +69,12 @@ class Settings(BaseSettings):
 
     # --- Position sizing -------------------------------------------------
     initial_order_usdt: Decimal = Decimal("20")
+    # A strong signal (score beats the market regime's required score by at
+    # least STRONG_SIGNAL_SCORE_MARGIN, while the long-term market phase is
+    # BULL) enters with STRONG_SIGNAL_ORDER_USDT instead (owner request
+    # 2026-10-02). Set it equal to INITIAL_ORDER_USDT to turn this off.
+    strong_signal_order_usdt: Decimal = Decimal("50")
+    strong_signal_score_margin: float = 5.0
     max_position_usdt: Decimal = Decimal("300")
     max_open_positions: int = 3
 
@@ -201,12 +207,20 @@ class Settings(BaseSettings):
                 f"(got {self.dca_level_1}, {self.dca_level_2}, {self.dca_level_3})"
             )
         sizes = [self.dca_size_1_usdt, self.dca_size_2_usdt, self.dca_size_3_usdt]
-        planned_total = self.initial_order_usdt + sum(sizes[: self.max_dca_count])
+        largest_entry = max(self.initial_order_usdt, self.strong_signal_order_usdt)
+        planned_total = largest_entry + sum(sizes[: self.max_dca_count])
         if planned_total > self.max_position_usdt:
             raise ValueError(
-                f"Initial order + planned DCA sizes ({planned_total} USDT) exceed "
+                f"Entry order + planned DCA sizes ({planned_total} USDT) exceed "
                 f"MAX_POSITION_USDT ({self.max_position_usdt}). Adjust sizing or raise the cap."
             )
+        if self.strong_signal_order_usdt < self.initial_order_usdt:
+            raise ValueError(
+                f"STRONG_SIGNAL_ORDER_USDT ({self.strong_signal_order_usdt}) must not be below "
+                f"INITIAL_ORDER_USDT ({self.initial_order_usdt})"
+            )
+        if self.strong_signal_score_margin < 0:
+            raise ValueError(f"STRONG_SIGNAL_SCORE_MARGIN must be >= 0 (got {self.strong_signal_score_margin})")
         if self.mode == TradingMode.LIVE and self.dry_run:
             # Not an error: this is the safe "shadow live" combination. Left
             # here as documentation of intent, no exception raised.

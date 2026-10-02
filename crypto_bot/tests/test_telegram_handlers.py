@@ -8,6 +8,7 @@ from database.repository import PositionRepository
 from database.session import session_scope
 from market.market_regime import RegimeAssessment, RegimeLevel
 from risk.risk_manager import RiskManager
+from strategy.strategy_engine import ManualSellResult
 from telegram_bot.handlers import (
     CTX_KEY,
     BotContext,
@@ -28,6 +29,7 @@ def _make_update(user_id: int | None):
     update = MagicMock()
     update.effective_user.id = user_id
     update.message.reply_text = AsyncMock()
+    update.effective_message = update.message  # what python-telegram-bot returns for a normal message
     return update
 
 
@@ -234,3 +236,102 @@ def test_market_command_shows_both_the_intraday_regime_and_the_long_term_phase(d
     assert "Фаза ринку (довгостроково): 🟢 ЗРОСТАННЯ, з 2026-08-23" in text
     assert "BTC 84 880 на 19% вище 200-денної середньої (71 360)" in text
     assert "Початок ведмежого ринку: 3 денні закриття BTC нижче 71 360" in text
+
+
+def _ctx_with_position(db_engine, settings, rules):
+    from telegram_bot.handlers import cmd_sell  # noqa: F401 - imported for the tests below
+
+    with session_scope() as session:
+        PositionRepository(session).create(
+            symbol="AAVEUSDT", opened_at=utcnow(), avg_entry_price=Decimal("164.84"),
+            total_quantity=Decimal("0.120879"), total_cost_usdt=Decimal("19.93"), target_price=Decimal("181.60"),
+        )
+    ctx = _make_ctx(db_engine, settings, rules)
+    ctx.get_mark_prices = lambda: {"AAVEUSDT": Decimal("170")}
+    ctx.manual_sell = AsyncMock(return_value=ManualSellResult("sold"))
+    return ctx
+
+
+def _sell(ctx, *args):
+    from telegram_bot.handlers import cmd_sell
+
+    update = _make_update(user_id=42)
+    context = _make_context(ctx)
+    context.args = list(args)
+    asyncio.run(cmd_sell(update, context))
+    return [c.args[0] for c in update.message.reply_text.call_args_list]
+
+
+def test_sell_without_confirmation_only_shows_the_position_and_sells_nothing(db_engine, settings, rules):
+    ctx = _ctx_with_position(db_engine, settings, rules)
+
+    listing = _sell(ctx)
+    prompt = _sell(ctx, "aave")
+
+    assert "AAVE" in listing[0] and "/sell AAVE" in listing[0]
+    assert "ПРОДАТИ ВСЮ ПОЗИЦІЮ AAVEUSDT ПО РИНКУ?" in prompt[0]
+    assert "/sell AAVE так" in prompt[0]
+    assert "+0.62 USDT" in prompt[0]  # (170 - 164.84) * 0.120879
+    ctx.manual_sell.assert_not_called()
+
+
+def test_sell_with_confirmation_market_sells_the_position(db_engine, settings, rules):
+    ctx = _ctx_with_position(db_engine, settings, rules)
+
+    replies = _sell(ctx, "AAVE", "так")
+
+    ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
+    assert replies[-1].startswith("✅ AAVEUSDT продано повністю")
+
+
+def test_sell_of_a_coin_without_an_open_position_does_nothing(db_engine, settings, rules):
+    ctx = _ctx_with_position(db_engine, settings, rules)
+
+    replies = _sell(ctx, "ETH", "так")
+
+    ctx.manual_sell.assert_not_called()
+    assert "Позиції ETHUSDT немає" in replies[0]
+
+
+def test_sell_reports_a_failed_sale_plainly(db_engine, settings, rules):
+    ctx = _ctx_with_position(db_engine, settings, rules)
+    ctx.manual_sell = AsyncMock(return_value=ManualSellResult("failed", "біржа відхилила продаж: Account has insufficient balance"))
+
+    replies = _sell(ctx, "AAVE", "так")
+
+    assert replies[-1].startswith("❌ Продаж AAVEUSDT не виконано.")
+    assert "Причина: біржа відхилила продаж: Account has insufficient balance" in replies[-1]  # the reason is in the reply itself
+
+
+def test_an_edited_sell_command_still_works(db_engine, settings, rules):
+    """On a phone it is natural to edit '/sell AAVE' into '/sell AAVE так';
+    Telegram then sends edited_message and update.message is None."""
+    from telegram_bot.handlers import cmd_sell
+
+    ctx = _ctx_with_position(db_engine, settings, rules)
+    update = MagicMock()
+    update.effective_user.id = 42
+    update.message = None
+    update.effective_message.reply_text = AsyncMock()
+    context = _make_context(ctx)
+    context.args = ["AAVE", "так"]
+
+    asyncio.run(cmd_sell(update, context))
+
+    ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
+    assert update.effective_message.reply_text.call_args_list[-1].args[0].startswith("✅ AAVEUSDT продано")
+
+
+def test_sell_prompt_shows_real_prices_for_sub_cent_coins():
+    from telegram_bot.handlers import _price
+
+    assert _price(Decimal("0.00001234")) == "0.00001234"
+    assert _price(Decimal("164.84")) == "164.8400"
+
+
+def test_partial_sale_reply_tells_the_owner_what_is_left_and_what_to_do():
+    from telegram_bot.handlers import _sell_reply
+
+    text = _sell_reply("AAVEUSDT", ManualSellResult("partial", "біржа продала лише частину", remaining=Decimal("0.06")))
+    assert text.startswith("⚠️ AAVEUSDT продано ЧАСТКОВО - залишок 0.06")
+    assert "/sell AAVE так" in text
