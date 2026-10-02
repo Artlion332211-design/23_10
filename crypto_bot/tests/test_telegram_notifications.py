@@ -331,7 +331,7 @@ def _macro_assessment(phase: str = "BEAR", **overrides: object):
 
     fields: dict[str, object] = dict(
         phase=MacroPhase(phase), as_of=date(2026, 11, 7), phase_since=date(2026, 11, 5), phase_days_at_least=3,
-        btc_close=66_000.0, sma200=71_500.0, mayer=66_000 / 71_500, sma200_rising=False,
+        btc_close=66_000.0, sma200=71_500.0, mayer=66_000 / 71_500, sma200_rising=False, sma50=69_000.0, early_warning=True,
         weekly_close=67_200.0, sma20w=70_300.0, ema21w=72_100.0, sma50w=78_000.0,
     )
     fields.update(overrides)
@@ -340,7 +340,7 @@ def _macro_assessment(phase: str = "BEAR", **overrides: object):
 
 def test_format_status_shows_the_long_term_market_phase():
     text = format_status(_status_snapshot(macro_phase="BEAR", macro_detail="BTC 66 000 на 8% нижче 200-денної середньої (71 500)"))
-    assert "Фаза ринку (довгостроково): ВЕДМЕЖИЙ РИНОК - BTC 66 000 на 8% нижче" in text
+    assert "Фаза ринку (довгостроково): 🐻 ВЕДМЕЖИЙ РИНОК - BTC 66 000 на 8% нижче" in text
     assert "Фаза ринку" not in format_status(_status_snapshot())  # not computed yet -> no line
 
 
@@ -348,7 +348,8 @@ def test_market_phase_change_alert_explains_what_it_means_in_plain_language():
     from telegram_bot.notifications import format_macro_change, macro_status_detail
 
     text = format_macro_change("CAUTION", _macro_assessment("BEAR"))
-    assert text.startswith("ФАЗА РИНКУ ЗМІНИЛАСЬ: ОБЕРЕЖНО (ринок слабшає) -> ВЕДМЕЖИЙ РИНОК")
+    assert text.startswith("🐻🔴 ПОЧАВСЯ ВЕДМЕЖИЙ РИНОК 🔴🐻\nФаза: ⚠️ ОБЕРЕЖНО (ринок слабшає) -> 🐻 ВЕДМЕЖИЙ РИНОК")
+    assert "50-денна середня: 69 000, BTC нижче неї - раннє попередження увімкнено" in text
     assert "200-денна середня падає" in text
     assert "нижче смуги 20-тижневої (70 300) і 21-тижневої EMA (72 100)" in text
     assert "Кінець ведмежого ринку: 3 денні закриття BTC вище 71 500" in text  # in a bear: the exit rule
@@ -363,4 +364,16 @@ def test_notifier_sends_the_market_phase_change():
     asyncio.run(notifier.macro_phase_change("BULL", _macro_assessment("CAUTION", btc_close=74_000.0, mayer=1.03)))
 
     assert len(sender.sent) == 1
-    assert "ЗРОСТАННЯ -> ОБЕРЕЖНО (ринок слабшає)" in sender.sent[0][1]
+    assert "⚠️⚠️⚠️ РАННЄ ПОПЕРЕДЖЕННЯ: РИНОК СЛАБШАЄ ⚠️⚠️⚠️" in sender.sent[0][1]
+    assert "🟢 ЗРОСТАННЯ -> ⚠️ ОБЕРЕЖНО (ринок слабшає)" in sender.sent[0][1]
+
+
+def test_market_phase_headlines_use_emoji_and_the_bear_end_flags_the_btc_bag_signal():
+    from telegram_bot.notifications import format_macro_change
+
+    assert format_macro_change("BULL", _macro_assessment("CAUTION", btc_close=74_000.0)).startswith("⚠️⚠️⚠️ РАННЄ ПОПЕРЕДЖЕННЯ")
+    assert format_macro_change("BEAR", _macro_assessment("DEEP_BEAR")).startswith("🧊🐻 ГЛИБОКИЙ ВЕДМЕЖИЙ РИНОК")
+    end = format_macro_change("BEAR", _macro_assessment("CAUTION", btc_close=72_000.0))
+    assert end.startswith("✅🟢 ВЕДМЕЖИЙ РИНОК ЗАКІНЧИВСЯ 🟢✅")
+    assert "Сигнал для «мішка BTC»" in end
+    assert "мішка BTC" not in format_macro_change("BULL", _macro_assessment("BEAR"))

@@ -70,16 +70,17 @@ def regime_label(value: str) -> str:
 
 # Long-term market phase (market/macro_regime.py), from BTC daily/weekly candles.
 _MACRO_LABELS = {
-    "BULL": "ЗРОСТАННЯ",
-    "CAUTION": "ОБЕРЕЖНО (ринок слабшає)",
-    "BEAR": "ВЕДМЕЖИЙ РИНОК",
-    "DEEP_BEAR": "ГЛИБОКИЙ ВЕДМЕЖИЙ РИНОК",
+    "BULL": "🟢 ЗРОСТАННЯ",
+    "CAUTION": "⚠️ ОБЕРЕЖНО (ринок слабшає)",
+    "BEAR": "🐻 ВЕДМЕЖИЙ РИНОК",
+    "DEEP_BEAR": "🧊🐻 ГЛИБОКИЙ ВЕДМЕЖИЙ РИНОК",
 }
 _MACRO_MEANING = {
     "BULL": "Довгостроковий тренд BTC висхідний. Бот торгує як звичайно.",
     "CAUTION": (
-        "Раннє попередження: тижневе закриття BTC нижче 20-тижневої і 21-тижневої середніх. "
-        "Ведмежий ринок ще не підтверджено. Бот торгує як звичайно."
+        "Раннє попередження: BTC 3 дні тримається нижче 50-денної середньої, яка падає, або тижневе закриття "
+        "нижче 20-тижневої і 21-тижневої середніх. Ведмежий ринок ще не підтверджено, але раніше саме так "
+        "він і починався. Бот поки торгує як звичайно."
     ),
     "BEAR": (
         "BTC 3 дні поспіль закривається нижче 200-денної середньої - ведмежий ринок. У тестах 2018, 2022 "
@@ -115,6 +116,8 @@ def format_macro_report(assessment: MacroAssessment) -> str:
         f"Фаза ринку (довгостроково): {macro_label(a.phase.value)}, {since}",
         f"За закриттям {a.as_of.isoformat()}: {macro_status_detail(a.btc_close, a.sma200)}",
         f"200-денна середня {'росте' if a.sma200_rising else 'падає'} (порівняно з 20 днями тому)",
+        f"50-денна середня: {_num(a.sma50)}, BTC {'нижче' if a.btc_close < a.sma50 else 'вище'} неї"
+        + (" - раннє попередження увімкнено" if a.early_warning else ""),
     ]
     if a.weekly_close is not None and a.sma20w is not None and a.ema21w is not None:
         band = "нижче" if a.weekly_close < min(a.sma20w, a.ema21w) else (
@@ -132,12 +135,33 @@ def format_macro_report(assessment: MacroAssessment) -> str:
     return "\n".join(lines)
 
 
+_BEAR_PHASES = ("BEAR", "DEEP_BEAR")
+
+
+def _macro_headline(previous: str | None, current: str) -> str:
+    was_bear, is_bear = previous in _BEAR_PHASES, current in _BEAR_PHASES
+    if is_bear and not was_bear:
+        return "🐻🔴 ПОЧАВСЯ ВЕДМЕЖИЙ РИНОК 🔴🐻"
+    if was_bear and not is_bear:
+        return "✅🟢 ВЕДМЕЖИЙ РИНОК ЗАКІНЧИВСЯ 🟢✅"
+    if current == "DEEP_BEAR":
+        return "🧊🐻 ГЛИБОКИЙ ВЕДМЕЖИЙ РИНОК"
+    if current == "CAUTION":
+        return "⚠️⚠️⚠️ РАННЄ ПОПЕРЕДЖЕННЯ: РИНОК СЛАБШАЄ ⚠️⚠️⚠️"
+    return "ФАЗА РИНКУ ЗМІНИЛАСЬ"
+
+
 def format_macro_change(previous: str | None, assessment: MacroAssessment) -> str:
-    return (
-        f"ФАЗА РИНКУ ЗМІНИЛАСЬ: {macro_label(previous)} -> {macro_label(assessment.phase.value)}\n"
+    current = assessment.phase.value
+    text = (
+        f"{_macro_headline(previous, current)}\n"
+        f"Фаза: {macro_label(previous)} -> {macro_label(current)}\n"
         f"{format_macro_report(assessment)}\n\n"
-        f"Що це означає: {_MACRO_MEANING.get(assessment.phase.value, '')}"
+        f"Що це означає: {_MACRO_MEANING.get(current, '')}"
     )
+    if previous in _BEAR_PHASES and current not in _BEAR_PHASES:
+        text += "\n\n📈 Сигнал для «мішка BTC»: за індикаторами ведмежий ринок завершився."
+    return text
 
 
 _CLOSE_REASON_LABELS = {

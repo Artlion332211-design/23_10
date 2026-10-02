@@ -108,3 +108,20 @@ def test_alert_policy_announces_bear_start_end_and_deep_zone_but_not_every_step_
     assert due("BULL", "CAUTION")
     assert not due("BULL", "CAUTION", now - timedelta(days=13))  # repeated early warning within 14 days
     assert due("BULL", "CAUTION", now - timedelta(days=14))
+
+
+def test_early_warning_fires_on_a_falling_50_day_sma_before_the_weekly_band_and_the_200_day_line():
+    """The earliest warning at every BTC top since 2017: 3 closes below a
+    50-day SMA that is itself falling, while the weekly band and the 200-day
+    line still hold."""
+    base = list(np.linspace(100, 400, 300))
+    a = _assess(base + list(np.linspace(400, 380, 40)) + [361.0] * 3)
+    assert a.phase == MacroPhase.CAUTION
+    assert a.early_warning
+    assert a.btc_close > a.sma200
+    assert a.weekly_close is not None and a.sma20w is not None and a.ema21w is not None
+    assert not (a.weekly_close < a.sma20w and a.weekly_close < a.ema21w)  # the weekly rule alone would say BULL
+    # The same dip while the 50-day SMA is still rising is not a warning.
+    b = _assess(base + list(np.linspace(400, 380, 30)) + [361.0] * 3)
+    assert b.phase == MacroPhase.BULL
+    assert not b.early_warning

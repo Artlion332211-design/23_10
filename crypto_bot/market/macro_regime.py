@@ -10,9 +10,13 @@ slow view:
 * BEAR: BTC's daily close below its 200-day SMA on 3 consecutive days. It
   ends after 3 consecutive daily closes back above. Since 2014 the 3-day
   confirmation cut false flips from 32 to 10 for about 2 days of extra lag.
-* CAUTION (early warning): not BEAR, but the last weekly close is below both
-  the 20-week SMA and the 21-week EMA (the "bull-market support band"). It
-  was the earliest slow signal in 2021 and 2025 (-25% and -11% from the top).
+* CAUTION (early warning): not BEAR, but either BTC closed below a FALLING
+  50-day SMA on 3 consecutive days (ends after 3 closes back above it), or the
+  last weekly close is below both the 20-week SMA and the 21-week EMA (the
+  "bull-market support band"). The SMA50 rule was the earliest warning at
+  every BTC top since 2017 (2025-01 at -9%, 2025-10 at -11% from the top,
+  2-9 weeks before BEAR) with fewer than 1 false alarm a year, and BTC's
+  median 90-day return after it was negative.
 * DEEP_BEAR: BEAR with BTC more than 20% below its 200-day SMA (Mayer
   multiple < 0.8 on 3 consecutive closes; it ends after 3 closes at >= 0.85 so
   a price hovering around 0.8 doesn't flip it daily) - historically the zone
@@ -31,6 +35,8 @@ from enum import Enum
 import pandas as pd
 
 SMA_DAYS = 200
+EARLY_SMA_DAYS = 50
+EARLY_SLOPE_DAYS = 10
 CONFIRM_DAYS = 3
 SLOPE_DAYS = 20
 DEEP_ENTER_MAYER = 0.80
@@ -63,6 +69,8 @@ class MacroAssessment:
     sma200: float
     mayer: float  # btc_close / sma200
     sma200_rising: bool  # SMA200 today vs SLOPE_DAYS ago
+    sma50: float
+    early_warning: bool  # the falling-SMA50 rule is on (part of CAUTION; also true inside a bear)
     weekly_close: float | None
     sma20w: float | None
     ema21w: float | None
@@ -150,8 +158,15 @@ def assess_macro(daily: pd.DataFrame, *, now: datetime) -> MacroAssessment | Non
     w_close, w20, w21 = on_days(weekly), on_days(sma20w), on_days(ema21w)
     band_below = ((w_close < w21) & (w_close < w20)).fillna(False)
 
+    sma50 = closes.rolling(EARLY_SMA_DAYS).mean()
+    early_valid = sma50.shift(EARLY_SLOPE_DAYS).notna()
+    early = pd.Series(
+        _confirmed((closes < sma50) & (sma50 < sma50.shift(EARLY_SLOPE_DAYS)), closes > sma50, early_valid),
+        index=closes.index,
+    )
+
     phases = pd.Series(MacroPhase.BULL, index=closes.index, dtype=object)
-    phases[band_below] = MacroPhase.CAUTION
+    phases[band_below | early] = MacroPhase.CAUTION
     phases[bear] = MacroPhase.BEAR
     phases[deep] = MacroPhase.DEEP_BEAR
     phases = phases[valid]
@@ -175,6 +190,8 @@ def assess_macro(daily: pd.DataFrame, *, now: datetime) -> MacroAssessment | Non
         sma200=float(sma.iloc[-1]),
         mayer=float(mayer.iloc[-1]),
         sma200_rising=bool(sma.iloc[-1] > sma.iloc[-1 - SLOPE_DAYS]),
+        sma50=float(sma50.iloc[-1]),
+        early_warning=bool(early.iloc[-1]),
         weekly_close=last(weekly),
         sma20w=last(sma20w),
         ema21w=last(ema21w),
