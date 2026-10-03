@@ -34,6 +34,7 @@ from strategy.strategy_engine import (
 
 if TYPE_CHECKING:
     from market.macro_regime import MacroAssessment
+    from orchestration.monthly_report import MonthlyReportData
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,28 @@ _MACRO_MEANING = {
 }
 
 
+# With BEAR_ENTRY_BLOCK on (the default) the bot itself stops new buys in a bear.
+_MACRO_MEANING_ENTRY_BLOCK = {
+    "BEAR": (
+        "BTC 3 дні поспіль закривається нижче 200-денної середньої - ведмежий ринок. У тестах 2018, 2022 "
+        "і 2025-26 звичайна торгівля альткоїнами в такій фазі приносила збитки, тому 🛑 НОВІ КУПІВЛІ "
+        "АВТОМАТИЧНО ЗУПИНЕНО до кінця ведмежого ринку. Відкриті позиції бот веде далі: продаж у плюс і "
+        "докупки (DCA) за звичайними правилами."
+    ),
+    "DEEP_BEAR": (
+        "BTC більше ніж на 20% нижче 200-денної середньої. Історично це була зона, де BTC був найдешевшим. "
+        "🛑 Нові купівлі альткоїнів і далі автоматично зупинено; відкриті позиції бот веде далі."
+    ),
+}
+BEAR_ENTRY_BLOCK_STATUS = "🐻 нові купівлі вимкнено автоматично (ведмежий ринок)"
+
+
+def _macro_meaning(phase: str, *, entry_block: bool) -> str:
+    if entry_block and phase in _MACRO_MEANING_ENTRY_BLOCK:
+        return _MACRO_MEANING_ENTRY_BLOCK[phase]
+    return _MACRO_MEANING.get(phase, "")
+
+
 def macro_label(value: str | None) -> str:
     return _MACRO_LABELS.get(value, value) if value else "невідомо"
 
@@ -102,13 +125,20 @@ def _num(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ")
 
 
+def format_price(value: Decimal | float) -> str:
+    """4 decimals for normal prices, enough significant digits for sub-cent coins (PEPE)."""
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.10f}".rstrip("0").rstrip(".") or "0"
+
+
 def macro_status_detail(btc_close: float, sma200: float) -> str:
     pct = (btc_close / sma200 - 1) * 100
     side = "вище" if pct >= 0 else "нижче"
     return f"BTC {_num(btc_close)} на {abs(pct):.0f}% {side} 200-денної середньої ({_num(sma200)})"
 
 
-def format_macro_report(assessment: MacroAssessment) -> str:
+def format_macro_report(assessment: MacroAssessment, *, entry_block: bool = False) -> str:
     """The long-term part of /market and of a phase-change alert."""
     a = assessment
     since = f"з {a.phase_since.isoformat()}" if a.phase_since else f"понад {a.phase_days_at_least} днів"
@@ -130,6 +160,8 @@ def format_macro_report(assessment: MacroAssessment) -> str:
         lines.append(f"50-тижнева середня: {_num(a.sma50w)}")
     if a.is_bear:
         lines.append(f"Кінець ведмежого ринку: 3 денні закриття BTC вище {_num(a.sma200)}")
+        if entry_block:
+            lines.append("Нові купівлі: вимкнено автоматично, доки триває ведмежий ринок")
     else:
         lines.append(f"Початок ведмежого ринку: 3 денні закриття BTC нижче {_num(a.sma200)}")
     return "\n".join(lines)
@@ -151,15 +183,17 @@ def _macro_headline(previous: str | None, current: str) -> str:
     return "ФАЗА РИНКУ ЗМІНИЛАСЬ"
 
 
-def format_macro_change(previous: str | None, assessment: MacroAssessment) -> str:
+def format_macro_change(previous: str | None, assessment: MacroAssessment, *, entry_block: bool = False) -> str:
     current = assessment.phase.value
     text = (
         f"{_macro_headline(previous, current)}\n"
         f"Фаза: {macro_label(previous)} -> {macro_label(current)}\n"
-        f"{format_macro_report(assessment)}\n\n"
-        f"Що це означає: {_MACRO_MEANING.get(current, '')}"
+        f"{format_macro_report(assessment, entry_block=entry_block)}\n\n"
+        f"Що це означає: {_macro_meaning(current, entry_block=entry_block)}"
     )
     if previous in _BEAR_PHASES and current not in _BEAR_PHASES:
+        if entry_block:
+            text += "\n\n✅ Нові купівлі знову дозволено - бот торгує як звичайно."
         text += "\n\n📈 Сигнал для «мішка BTC»: за індикаторами ведмежий ринок завершився."
     return text
 
@@ -239,7 +273,7 @@ def format_buy_executed(event: BuyExecutedEvent) -> str:
         "КУПІВЛЯ ВИКОНАНА\n"
         f"{strong}"
         f"Пара: {event.symbol}\n"
-        f"Ціна: ${event.price:.4f}\n"
+        f"Ціна: ${format_price(event.price)}\n"
         f"Сума: ${event.usdt_amount:.2f}\n"
         f"БАЛ КУПІВЛІ: {event.breakdown.final_score:.0f}/100\n"
         "Сигнали:\n"
@@ -249,7 +283,7 @@ def format_buy_executed(event: BuyExecutedEvent) -> str:
         "Новини:\n"
         f"{event.news_score:+d} {_news_label(event.news_score)}\n"
         "Ціль:\n"
-        f"${event.target_price:.4f}\n"
+        f"${format_price(event.target_price)}\n"
         "Рівні докупки (DCA):\n"
         f"{dca_lines}"
     )
@@ -260,10 +294,10 @@ def format_dca_executed(event: DCAExecutedEvent) -> str:
         "ДОКУПКА (DCA) ВИКОНАНА\n"
         f"Пара: {event.symbol}\n"
         f"Рівень: DCA{event.level_index}\n"
-        f"Ціна: ${event.price:.4f}\n"
+        f"Ціна: ${format_price(event.price)}\n"
         f"Сума: ${event.usdt_amount:.2f}\n"
-        f"Нова середня ціна входу: ${event.new_avg_entry:.4f}\n"
-        f"Нова ціль: ${event.new_target_price:.4f}"
+        f"Нова середня ціна входу: ${format_price(event.new_avg_entry)}\n"
+        f"Нова ціль: ${format_price(event.new_target_price)}"
     )
 
 
@@ -272,7 +306,7 @@ def format_position_closed(event: PositionClosedEvent) -> str:
         "ПОЗИЦІЯ ЗАКРИТА\n"
         f"Пара: {event.symbol}\n"
         f"Причина: {close_reason_label(event.close_reason)}\n"
-        f"Вхід: ${event.avg_entry_price:.4f}  Вихід: ${event.exit_price:.4f}\n"
+        f"Вхід: ${format_price(event.avg_entry_price)}  Вихід: ${format_price(event.exit_price)}\n"
         f"Чистий PnL: {event.net_pnl_usdt:+.2f} USDT ({event.net_pnl_percent:+.2f}%)\n"
         f"Утримувалась: {_format_timedelta_hours(event.holding_time_seconds)}"
     )
@@ -286,7 +320,7 @@ def format_delayed_fill(event: DelayedFillEvent) -> str:
         "ВІДКЛАДЕНЕ ВИКОНАННЯ ОРДЕРА\n"
         f"Пара: {event.symbol}\n"
         f"Тип: {_SIDE_LABELS.get(event.side, event.side)} ({event.purpose})\n"
-        f"Ціна: ${event.price:.4f}\n"
+        f"Ціна: ${format_price(event.price)}\n"
         f"Кількість: {event.quantity:.6f}\n"
         f"Сума: ${event.usdt_amount:.2f}\n"
         "Ордер стояв у книзі (LIMIT) і щойно виконався."
@@ -297,8 +331,64 @@ def format_drawdown_warning(event: DrawdownWarningEvent) -> str:
     return (
         f"ПОПЕРЕДЖЕННЯ: ПРОСІДАННЯ ПОЗИЦІЇ НА {event.threshold_percent:.0f}%+\n"
         f"Пара: {event.symbol}\n"
-        f"Вхід: ${event.avg_entry_price:.4f}  Поточна: ${event.current_price:.4f}\n"
+        f"Вхід: ${format_price(event.avg_entry_price)}  Поточна: ${format_price(event.current_price)}\n"
         f"Фактичне падіння від входу: -{event.drawdown_percent:.2f}%"
+    )
+
+
+_MONTHS = ("січень", "лютий", "березень", "квітень", "травень", "червень",
+           "липень", "серпень", "вересень", "жовтень", "листопад", "грудень")
+
+
+def _pct(value: float | None) -> str:
+    return "н/д" if value is None else f"{value:+.2f}%"
+
+
+def format_monthly_report(data: MonthlyReportData) -> str:
+    month = f"{_MONTHS[data.month_start.month - 1]} {data.month_start.year}"
+    period = f"{data.period_start:%d.%m}-{data.period_end:%d.%m}"
+    title = "ЗВІТ З ПОЧАТКУ МІСЯЦЯ" if data.month_to_date else "ЗВІТ ЗА МІСЯЦЬ"
+    lines = [f"📊 {title}: {month} ({period})"]
+    if data.equity_start is None:
+        lines.append(f"Бот: ще немає щоденної статистики для старту; капітал зараз {data.equity_end:.2f} USDT")
+    else:
+        lines.append(
+            f"Бот: {data.bot_change_usdt:+.2f} USDT ({_pct(data.bot_change_pct)}) - "
+            f"капітал {data.equity_start:.2f} -> {data.equity_end:.2f} USDT"
+        )
+    lines += [
+        f"  закрито угод: {data.closed_trades} (у плюсі {data.wins}), прибуток з них {data.realized_pnl:+.2f} USDT",
+        f"  відкриті позиції зараз: {data.unrealized_now:+.2f} USDT",
+        "Для порівняння за той самий час:",
+        f"  тримати лише BTC: {_pct(data.btc_change_pct)}",
+        f"  35% BTC + 65% USDT в Earn: {_pct(data.mix_pct)}",
+        "  лише USDT в Earn"
+        + (f" ({data.earn_apr * 100:.2f}% річних)" if data.earn_apr is not None else "")
+        + f": {_pct(data.earn_pct)}",
+    ]
+    bot, mix = data.bot_change_pct, data.mix_pct
+    if bot is not None and mix is not None:
+        diff = bot - mix
+        if abs(diff) < 0.1:
+            lines.append("➖ Бот іде нарівні з «35% BTC + 65% Earn».")
+        elif diff > 0:
+            lines.append(f"✅ Бот попереду «35% BTC + 65% Earn» на {diff:.2f} пункту.")
+        else:
+            lines.append(
+                f"⚠️ Бот відстає від «35% BTC + 65% Earn» на {-diff:.2f} пункту. Якщо так буде кілька місяців "
+                "поспіль - варто обговорити з Claude зміну стратегії."
+            )
+    lines.append("(Поповнення чи виведення коштів теж змінюють капітал - тоді порівняння неточне.)")
+    return "\n".join(lines)
+
+
+def format_earn_sweep(moved: Decimal, held: Decimal | None, apr: float | None, spot_buffer: Decimal) -> str:
+    rate = f" (Flexible, {apr * 100:.2f}% річних)" if apr is not None else " (Flexible)"
+    total = f"Зараз в Earn: {held:.2f} USDT. " if held is not None else ""
+    return (
+        f"💰 {moved:.2f} USDT переміщено в Simple Earn{rate}.\n"
+        f"{total}На споті лишається ~{spot_buffer:.0f} USDT для купівель; "
+        "якщо для купівлі не вистачить, бот сам забере потрібне з Earn."
     )
 
 
@@ -486,6 +576,8 @@ class StatusSnapshot:
     # Long-term market phase (market/macro_regime.py); None until computed.
     macro_phase: str | None = None
     macro_detail: str | None = None
+    # BEAR_ENTRY_BLOCK is holding back new buys right now.
+    bear_entry_block: bool = False
 
 
 def _mode_text(mode: str, dry_run: bool) -> str:
@@ -538,6 +630,8 @@ def format_status(snap: StatusSnapshot) -> str:
         limits.append("купівлі на паузі")
     if snap.dca_paused:
         limits.append("докупівлі (DCA) на паузі")
+    if snap.bear_entry_block:
+        limits.append(BEAR_ENTRY_BLOCK_STATUS)
     lines.append(f"Обмеження: {', '.join(limits) if limits else 'немає'}")
     return "\n".join(lines)
 
@@ -658,12 +752,17 @@ class TelegramNotifier:
     async def crash_alert(self, reasons: list[str]) -> None:
         await self._send(format_crash_alert(reasons))
 
-    async def macro_phase_change(self, previous: str | None, assessment: MacroAssessment) -> bool:
+    async def macro_phase_change(
+        self, previous: str | None, assessment: MacroAssessment, *, entry_block: bool = False
+    ) -> bool:
         """True if delivered, so the caller can retry an alert Telegram didn't accept."""
-        return await self._send(format_macro_change(previous, assessment))
+        return await self._send(format_macro_change(previous, assessment, entry_block=entry_block))
 
     async def daily_report(self, data: DailyReportData) -> None:
         await self._send(format_daily_report(data))
+
+    async def monthly_report(self, data: MonthlyReportData) -> None:
+        await self._send(format_monthly_report(data))
 
     async def status_ping(self, text: str) -> None:
         await self._send(text)

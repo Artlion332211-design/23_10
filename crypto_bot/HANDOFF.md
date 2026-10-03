@@ -336,8 +336,10 @@ Ukrainian term exists for them).
 | Command | What it does |
 |---|---|
 | `/status` | Mode, uptime, BTC regime, open positions count, total unrealized PnL, pause/emergency flags, health |
-| `/balance` | Live balance (exchange or paper account) + approximate total portfolio value |
+| `/balance` | Live balance (exchange or paper account) incl. USDT in Simple Earn + approximate total portfolio value |
 | `/positions` | Each open position: entry, current price, live PnL%, DCA count, target |
+| `/sell` | `/sell` lists, `/sell AAVE` shows the position and asks, `/sell AAVE так` within 2 min market-sells it (§15, §16) |
+| `/report` | Month to date: bot vs BTC vs "35% BTC + 65% Earn" (§16) |
 | `/signals` | Most recently scored candidates |
 | `/pnl` | All-time realized PnL and win rate |
 | `/today` | Today's report (balance, PnL, trades, fees, exposure) |
@@ -345,7 +347,7 @@ Ukrainian term exists for them).
 | `/pause` | Stop new BUYs (open positions keep being managed) |
 | `/resume` | **Atomically** clears buy_paused, dca_paused, AND emergency_stop (one DB transaction, per the fix in §8.7 - `/emergency_stop`'s own confirmation message tells the operator to use this to recover, so it must undo everything that command set) |
 | `/stop_dca` / `/start_dca` | Disable/enable DCA on open positions |
-| `/market` | Current BTC regime + reasons |
+| `/market` | Current BTC regime + reasons, and the long-term phase (§15) |
 | `/news` | Recent news items + sentiment |
 | `/config` | Current configuration (secrets redacted) |
 | `/emergency_stop` | **The real, instant kill switch.** Stops new BUYs and DCA immediately. Existing positions are left alone UNLESS `EMERGENCY_AUTO_SELL=true`, in which case every open position is market-sold immediately too. This is what the project owner should use for "stop it now" - see §11. |
@@ -369,6 +371,9 @@ asking.
 | ВАЖЛИВА НОВИНА (news alert) | A critical/high-impact news item on a tracked symbol |
 | ТРИВОГА: ОБВАЛ РИНКУ (crash alert) | BTC regime transitions into CRASH |
 | ЩОДЕННИЙ ЗВІТ (daily report) | Once a day at `DAILY_REPORT_HOUR_UTC` (default 21:00 UTC) |
+| ЗВІТ ЗА МІСЯЦЬ (monthly scoreboard) | Last day of the month, right after the daily report (§16) |
+| Фаза ринку змінилась (market phase) | Bear start/end, deep bear, early warning (§15); bear start/end say buying stopped/resumed (§16) |
+| 💰 USDT в Earn | Each time the sweep moves idle USDT into Simple Earn (§16) |
 | status ping | 3x/day, see above |
 
 `on_no_trade` (a rejected/no-trade candidate) is deliberately **not** pushed
@@ -811,8 +816,8 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
   after 3 above) / DEEP_BEAR (Mayer < 0.80, ends at >= 0.85). Shown in
   /status and /market; Telegram alerts with emoji on bear start/end, the deep
   zone and (at most every 14 days) the early warning. The bear-end alert is
-  the owner's signal to start the BTC accumulation bag. Informational - it
-  only gates the bigger entry below.
+  the owner's signal to start the BTC accumulation bag. It gates the bigger
+  entry below and, since §16, blocks new entries in a bear.
 - **Strong-signal entry**: STRONG_SIGNAL_ORDER_USDT (50) instead of
   INITIAL_ORDER_USDT (20) when the score beats the regime's required score by
   STRONG_SIGNAL_SCORE_MARGIN (5) AND the long-term phase is BULL; falls back
@@ -832,3 +837,59 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
   trading lost in the 2018, 2022 and 2025-26 bears; bounce trading, shorts,
   grid, Dual Investment and "careful mode" variants did not beat holding
   USDT in Simple Earn. Details in the operator's memory notes.
+
+## 16. Added 2026-10-03 (owner requests: "less idle time in a bear")
+
+- **5 slots**: MAX_OPEN_POSITIONS 5 (was 3) with the same 35% exposure cap.
+  In the research harness it won or tied 3 slots in every period (2023-24
+  bull +11.2% vs +7.3%, 2025 V-shape +2.8% vs -0.8%, 2022 bear -9.0% vs
+  -11.1%, 2018 -4.1% vs -4.3%, 2025-26 cycle -9.5% vs -9.6%); raising the cap
+  to 50% or shrinking DCA was worse or mixed.
+- **Bear gate** (BEAR_ENTRY_BLOCK=true): no new entries while the long-term
+  phase is BEAR or DEEP_BEAR; open positions are still managed (exits, DCA).
+  Candidates are still scored and recorded (the 25-per-candle health check
+  keeps working), only the order is skipped (`entry_block_reason`). Fails
+  closed: a stale phase still counts, and right after a restart the stored
+  `macro_phase` settings key decides until the first refresh. The bigger
+  strong-signal entry needs a FRESH (<= 2 days) BULL phase. Six hourly
+  refresh failures in a row -> one alert. Bear alerts now say buying stopped
+  / resumed automatically; /status lists it under "Обмеження".
+- **Simple Earn** (`exchange/earn.py`, LIVE + DRY_RUN=false + mainnet only):
+  every 30 min (first sweep 10 min after start) the sweep keeps free spot USDT
+  near EARN_SPOT_BUFFER_USDT (150): the surplus goes into USDT Flexible Earn
+  (Telegram message on each such move), a spent buffer is topped back up
+  from Earn. Before an entry or DCA buy, `StrategyEngine` calls the funds
+  provider (`EarnManager.ensure_spot`); if spot is short it redeems the
+  shortfall plus a fresh buffer and waits up to 10 s; if that fails the buy is
+  skipped with an alert. Kill switch / pause are re-checked after that wait,
+  and for 2 min after a buy asked for money the sweep leaves spot alone. The
+  trading balance the caps use = spot + Earn, read together under the
+  transfer lock (no double counting mid-sweep); if Earn can't be read the
+  caps fall back to spot only (fewer buys, never more) with ONE alert per
+  outage, worded to match no exchange-error category. The report equity
+  (daily stat, monthly scoreboard) never falls back: the report fails
+  instead of recording a figure short by the whole Earn balance. Earn calls cost 150
+  request weight: balance cached 60 s, product 1 h, a failed read is not
+  retried and is remembered for 5 min; subscribe/redeem are never resent
+  after an ambiguous network error.
+- **Monthly scoreboard** (`orchestration/monthly_report.py`): on the last day
+  of a month, after the daily report, and on demand via /report (month to
+  date): equity change of the bot vs holding BTC vs "35% BTC + 65% USDT in
+  Earn" (what consistent copy-traders earned passively), with a verdict line.
+  Deposits/withdrawals distort it (the message says so). The month's trades
+  are counted from the moment of its starting equity (the previous month's
+  last daily report). No catch-up: if the bot is down at the daily report
+  hour on a month's last day, that month's report isn't sent (use /report).
+- **/sell hardening** (review of 9b64255): the 24 h no-re-buy cooldown is
+  written in the same transaction that applies a MANUAL_SELL fill (so a fill
+  the order poll resolves later counts) and also blocks DCA into what a
+  partial sale left; "/sell X так" only works within 2 min of "/sell X" (one
+  prompt, one sale); edited messages never run commands; a lost-response
+  sale says "not confirmed yet", an EXPIRED one with no fill says "nothing
+  sold"; exceptions reach the owner; /sell and /report don't block other
+  commands; the "/" menu is set for the owner's chat only.
+- STRONG_SIGNAL_ORDER_USDT that doesn't fit MAX_POSITION_USDT with the DCA
+  ladder (or isn't above INITIAL_ORDER_USDT) now just switches the bigger
+  entry off (shown in /config) instead of stopping the bot at startup.
+- The backtest engine models the bear gate and the strong size (app.py
+  backtest mode computes `macro_regime.phase_by_day` from BTC daily candles).

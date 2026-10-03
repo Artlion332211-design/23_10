@@ -29,7 +29,7 @@ Informational only: nothing here blocks or changes a trade.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 
 import pandas as pd
@@ -127,6 +127,24 @@ def phase_change_alert_due(
     if previous == MacroPhase.BULL.value and current == MacroPhase.CAUTION.value:
         return last_caution_alert_at is None or now - last_caution_alert_at >= CAUTION_ALERT_MIN_INTERVAL
     return False
+
+
+def phase_by_day(daily: pd.DataFrame, first: date, last: date) -> dict[date, MacroPhase]:
+    """For backtests: the phase the live bot would have used on each day -
+    computed just after that day's 00:00 UTC from the HISTORY_DAYS of closed
+    candles before it, like the hourly refresh does. Days without enough
+    history are left out (the live bot then doesn't know the phase either)."""
+    open_times = pd.to_datetime(daily["open_time"], utc=True)
+    phases: dict[date, MacroPhase] = {}
+    day = first
+    while day <= last:
+        now = datetime.combine(day, time(0, 5), tzinfo=UTC)
+        window = daily[(open_times >= pd.Timestamp(now - timedelta(days=HISTORY_DAYS))) & (open_times < pd.Timestamp(now))]
+        assessment = assess_macro(window, now=now)
+        if assessment is not None:
+            phases[day] = assessment.phase
+        day += timedelta(days=1)
+    return phases
 
 
 def assess_macro(daily: pd.DataFrame, *, now: datetime) -> MacroAssessment | None:

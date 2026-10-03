@@ -383,3 +383,93 @@ def test_grid_search_insufficient_trades_raises_actionable_error(settings, rules
 
     with pytest.raises(ValueError, match="enough trades"):
         grid_search(tuned, rules, {"min_buy_score": [70, 80]}, split, objective=default_objective)
+
+
+def _trend_klines():
+    n = 2000
+    symbols = {
+        "AAAUSDT": _synthetic_ohlcv(n, seed=10, regime="trend_with_dip"),
+        "BBBUSDT": _synthetic_ohlcv(n, seed=11, regime="trend_with_dip"),
+    }
+    return symbols, _synthetic_ohlcv(n, seed=12, regime="trend_with_dip")
+
+
+def _phases(phase, symbols):
+    from market.macro_regime import MacroPhase
+
+    days = pd.to_datetime(next(iter(symbols.values()))["open_time"]).dt.date.unique()
+    return {d: MacroPhase(phase) for d in days}
+
+
+def _entry_sizes(monkeypatch):
+    sizes = []
+    real = engine_module._simulate_buy
+
+    def spy(price, usdt_amount, settings):
+        sizes.append(usdt_amount)
+        return real(price, usdt_amount, settings)
+
+    monkeypatch.setattr(engine_module, "_simulate_buy", spy)
+    return sizes
+
+
+def test_backtest_blocks_new_entries_in_a_bear_phase_like_live(settings, rules):
+    symbols, btc = _trend_klines()
+    tuned = settings.model_copy(update={"min_listing_age_days": 0, "news_enabled": False})
+
+    baseline = BacktestEngine(tuned, rules).run(symbols, btc, starting_balance=Decimal("10000"))
+    bear = BacktestEngine(tuned, rules).run(
+        symbols, btc, starting_balance=Decimal("10000"), macro_phase_by_day=_phases("BEAR", symbols)
+    )
+    gate_off = BacktestEngine(tuned.model_copy(update={"bear_entry_block": False}), rules).run(
+        symbols, btc, starting_balance=Decimal("10000"), macro_phase_by_day=_phases("BEAR", symbols)
+    )
+
+    assert baseline.trades  # the synthetic dips do get bought without the gate
+    assert bear.trades == []
+    assert any("bear market" in e["reasons"] for e in bear.no_trade_log if e["action"] == "BLOCKED")
+    assert len(gate_off.trades) == len(baseline.trades)
+
+
+def test_backtest_uses_the_strong_signal_size_only_in_a_bull_phase(settings, rules, monkeypatch):
+    symbols, btc = _trend_klines()
+    tuned = settings.model_copy(update={
+        "min_listing_age_days": 0, "news_enabled": False, "initial_order_usdt": Decimal("20"),
+        "strong_signal_order_usdt": Decimal("50"), "strong_signal_score_margin": 0.0,
+        "max_open_positions": 1,  # entries only, so every buy recorded below is an entry
+        "max_dca_count": 0,
+    })
+
+    sizes = _entry_sizes(monkeypatch)
+    BacktestEngine(tuned, rules).run(symbols, btc, starting_balance=Decimal("10000"),
+                                     macro_phase_by_day=_phases("BULL", symbols))
+    assert sizes and set(sizes) == {Decimal("50")}
+
+    sizes.clear()
+    BacktestEngine(tuned, rules).run(symbols, btc, starting_balance=Decimal("10000"),
+                                     macro_phase_by_day=_phases("CAUTION", symbols))
+    assert sizes and set(sizes) == {Decimal("20")}
+
+    sizes.clear()
+    BacktestEngine(tuned, rules).run(symbols, btc, starting_balance=Decimal("10000"))  # phase unknown
+    assert sizes and set(sizes) == {Decimal("20")}
+
+
+def test_phase_by_day_matches_what_the_live_refresh_sees_each_morning():
+    from datetime import date, timedelta
+
+    from market.macro_regime import MacroPhase, phase_by_day
+
+    first = date(2025, 1, 1)
+    closes = [100.0] * 300 + [90.0] * 5
+    opens = [pd.Timestamp(first + timedelta(days=i), tz="UTC") for i in range(len(closes))]
+    daily = pd.DataFrame({
+        "open_time": opens, "close": closes,
+        "close_time": [t + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1) for t in opens],
+    })
+    third_low_close = first + timedelta(days=302)  # the 3rd day closing at 90
+
+    phases = phase_by_day(daily, third_low_close - timedelta(days=1), third_low_close + timedelta(days=1))
+
+    assert phases[third_low_close] == MacroPhase.BULL  # that day's own close isn't known yet in the morning
+    assert phases[third_low_close + timedelta(days=1)] == MacroPhase.BEAR

@@ -17,7 +17,12 @@ from database.models import (
     PositionStatus,
     SignalDecision,
 )
-from database.repository import OrderRepository, PositionRepository, SignalRepository
+from database.repository import (
+    OrderRepository,
+    PositionRepository,
+    SettingsRepository,
+    SignalRepository,
+)
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
@@ -25,7 +30,7 @@ from market.market_regime import RegimeAssessment, RegimeLevel
 from market.orderbook import OrderBookSnapshot
 from risk.risk_manager import RiskManager
 from strategy.signal_engine import SignalEngine
-from strategy.strategy_engine import NewsAssessment, StrategyEngine
+from strategy.strategy_engine import NewsAssessment, StrategyEngine, in_manual_sell_cooldown
 from tests.conftest import make_snapshot
 from utils.time import Timeframe, utcnow
 
@@ -1054,7 +1059,7 @@ def test_strong_signal_enters_with_the_bigger_amount_only_when_allowed(strategy_
     caller allows it (the long-term phase is BULL)."""
     strategy, executor, notifier, book = strategy_setup
     strategy._settings = strategy._settings.model_copy(update={
-        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+        "strong_signal_order_usdt": Decimal("150"), "max_position_usdt": Decimal("400"), "strong_signal_score_margin": 0.0,
     })
 
     decision = asyncio.run(strategy.try_open_position(
@@ -1069,7 +1074,7 @@ def test_strong_signal_enters_with_the_bigger_amount_only_when_allowed(strategy_
 def test_no_bigger_entry_when_the_long_term_phase_does_not_allow_it(strategy_setup):
     strategy, executor, notifier, book = strategy_setup
     strategy._settings = strategy._settings.model_copy(update={
-        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+        "strong_signal_order_usdt": Decimal("150"), "max_position_usdt": Decimal("400"), "strong_signal_score_margin": 0.0,
     })
 
     asyncio.run(strategy.try_open_position(
@@ -1082,7 +1087,7 @@ def test_no_bigger_entry_when_the_long_term_phase_does_not_allow_it(strategy_set
 def test_a_score_below_the_margin_is_not_a_strong_signal(strategy_setup):
     strategy, executor, notifier, book = strategy_setup
     strategy._settings = strategy._settings.model_copy(update={
-        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 100.0,
+        "strong_signal_order_usdt": Decimal("150"), "max_position_usdt": Decimal("400"), "strong_signal_score_margin": 100.0,
     })
 
     decision = asyncio.run(strategy.try_open_position(
@@ -1098,7 +1103,7 @@ def test_bigger_entry_that_does_not_fit_the_risk_caps_falls_back_to_the_normal_s
     """The bigger size must never cost the trade itself."""
     strategy, executor, notifier, book = strategy_setup
     tight = strategy._settings.model_copy(update={
-        "strong_signal_order_usdt": Decimal("150"), "strong_signal_score_margin": 0.0,
+        "strong_signal_order_usdt": Decimal("150"), "max_position_usdt": Decimal("400"), "strong_signal_score_margin": 0.0,
         "max_daily_new_capital_usdt": Decimal("120"),
     })
     strategy._settings = tight
@@ -1199,3 +1204,189 @@ def test_a_manual_sell_at_a_loss_does_not_count_toward_the_loss_streak_pause(str
     flags = strategy._risk_manager.status()
     assert flags.consecutive_bad_trades == 0
     assert not flags.buy_paused
+
+
+class _LostResponseSellExecutor(FakeExecutor):
+    """The MARKET SELL reached Binance but its response was lost (timeout/5xx)."""
+
+    async def submit(self, request):
+        if request.side.value != "SELL":
+            return await super().submit(request)
+        self.sides.append("SELL")
+        return ExecutionResult(accepted=False, status=OrderStatus.NEW, error_message="read timeout")
+
+
+def test_manual_sell_with_a_lost_response_is_reported_pending_and_its_late_fill_starts_the_cooldown(strategy_setup):
+    """A lost response used to read "біржа відхилила продаж" although the
+    order may well have filled; and the no-re-buy cooldown was only written
+    by the /sell call itself, so a fill the poll resolved later never set it."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    strategy._execution_engine._executor = _LostResponseSellExecutor()
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert result.status == "pending"  # not "❌ не виконано": it may well have filled
+    assert "ще не підтвердила" in (result.detail or "")
+    assert "відхилила" not in (result.detail or "")
+    assert not in_manual_sell_cooldown("SOLUSDT")
+
+    with session_scope() as session:  # the order poll later learns that it filled
+        order = next(o for o in OrderRepository(session).for_position(position_id) if o.purpose == OrderPurpose.MANUAL_SELL)
+        quantity = PositionRepository(session).get(position_id).total_quantity
+    filled = _fill(price=Decimal("100"), qty=quantity, status=OrderStatus.FILLED)
+    asyncio.run(strategy.apply_resolved_order(order, filled, btc_regime=NEUTRAL))
+
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "MANUAL_SELL"
+    assert in_manual_sell_cooldown("SOLUSDT")
+
+
+@pytest.mark.parametrize(("answer", "expected"), [
+    (ExecutionResult(accepted=True, status=OrderStatus.EXPIRED, exchange_order_id="2"), "нічого не продано"),
+    (ExecutionResult(accepted=False, status=OrderStatus.REJECTED, error_message="LOT_SIZE"), "відхилила продаж: LOT_SIZE"),
+])
+def test_manual_sell_that_sold_nothing_says_why(strategy_setup, answer, expected):
+    """An EXPIRED market sell with no fill (no buyers) used to be reported as
+    "біржа ще не підтвердила" - as if a result were still coming."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+
+    class NothingSold(FakeExecutor):
+        async def submit(self, request):
+            if request.side.value != "SELL":
+                return await super().submit(request)
+            return answer
+
+    strategy._execution_engine._executor = NothingSold()
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert result.status == "failed"
+    assert expected in (result.detail or "")
+    assert "ще не підтвердила" not in (result.detail or "")
+    assert not in_manual_sell_cooldown("SOLUSDT")
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).status == PositionStatus.OPEN
+
+
+def test_no_dca_into_what_is_left_after_the_owner_sold_by_hand(strategy_setup, bullish_snapshots):
+    """A /sell that Binance filled only partly leaves a position behind;
+    averaging down into it would undo the owner's decision."""
+    strategy, executor, notifier, book = strategy_setup
+    _position_id, _m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+    with session_scope() as session:
+        SettingsRepository(session).set("manual_sell_at:SOLUSDT", utcnow().isoformat())
+
+    tick()
+    assert executor.sides.count("BUY") == 1  # only the entry
+
+    with session_scope() as session:  # cooldown over -> the DCA goes ahead
+        SettingsRepository(session).set("manual_sell_at:SOLUSDT", "2000-01-01T00:00:00+00:00")
+    tick()
+    assert executor.sides.count("BUY") == 2
+
+
+def test_bear_gate_blocks_the_entry_but_the_signal_is_still_recorded(strategy_setup):
+    """The 25-signals-per-candle health check must keep working in a bear."""
+    strategy, executor, notifier, book = strategy_setup
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book,
+        entry_block_reason="bear market",
+    ))
+
+    assert decision.action == "BLOCKED"
+    assert decision.reasons == ["bear market"]
+    assert executor.submit_calls == 0
+    with session_scope() as session:
+        assert len(SignalRepository(session).recent(symbol="SOLUSDT")) == 1
+
+
+def test_entry_brings_its_usdt_back_from_earn_before_buying(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    asked: list[Decimal] = []
+
+    async def funds(amount):
+        asked.append(amount)
+        assert executor.submit_calls == 0  # before the order, not after
+        return True
+
+    strategy._funds_provider = funds
+    position_id = _open_position(strategy, book)
+
+    assert asked == [strategy._settings.initial_order_usdt]
+    assert position_id is not None
+
+
+@pytest.mark.parametrize("failure", ["short", "raises"])
+def test_entry_is_skipped_when_earn_cannot_fund_it(strategy_setup, failure):
+    strategy, executor, notifier, book = strategy_setup
+
+    async def funds(amount):
+        if failure == "raises":
+            raise ConnectionError("sapi down")
+        return False
+
+    strategy._funds_provider = funds
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book
+    ))
+
+    assert decision.action == "BLOCKED"
+    assert executor.submit_calls == 0
+    assert any("entry buy for SOLUSDT skipped" in e for e in _errors(notifier))
+
+
+def test_dca_is_skipped_when_earn_cannot_fund_it(strategy_setup, bullish_snapshots):
+    strategy, executor, notifier, book = strategy_setup
+    _position_id, _m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+    asked: list[Decimal] = []
+
+    async def funds(amount):
+        asked.append(amount)
+        return False
+
+    strategy._funds_provider = funds
+    tick()
+    tick()
+
+    assert asked == [strategy._settings.dca_size_1_usdt] * 2
+    assert executor.sides.count("BUY") == 1  # only the entry
+    assert any("DCA buy for SOLUSDT skipped" in e for e in _errors(notifier))
+    # No "DCA signal" message or DCA signal row for a DCA that can't be paid for.
+    assert not [e for e in notifier.events if e[0] == "dca_signal"]
+    with session_scope() as session:
+        assert all(s.decision.value != "DCA" for s in SignalRepository(session).recent(symbol="SOLUSDT"))
+
+
+def test_emergency_stop_during_an_earn_redemption_stops_the_entry(strategy_setup):
+    """The risk check ran before the redemption's seconds of waiting; a kill
+    switch pressed meanwhile let the entry through after "all sold"."""
+    strategy, executor, notifier, book = strategy_setup
+
+    async def slow_funds(amount):
+        strategy._risk_manager.trigger_emergency_stop()  # pressed while we wait for Earn
+        return True
+
+    strategy._funds_provider = slow_funds
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book
+    ))
+
+    assert decision.action == "BLOCKED"
+    assert executor.submit_calls == 0
+
+
+def test_dca_pause_during_an_earn_redemption_stops_the_dca(strategy_setup, bullish_snapshots):
+    strategy, executor, notifier, book = strategy_setup
+    _position_id, _m15, tick = _dca_setup(strategy_setup, bullish_snapshots)
+
+    async def slow_funds(amount):
+        strategy._risk_manager.stop_dca()
+        return True
+
+    strategy._funds_provider = slow_funds
+    tick()
+
+    assert executor.sides.count("BUY") == 1  # only the entry

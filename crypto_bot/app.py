@@ -27,7 +27,7 @@ import argparse
 import asyncio
 import logging
 import signal
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -38,6 +38,7 @@ from database.migrations import run_migrations
 from database.repository import PositionRepository
 from database.session import init_engine, session_scope
 from exchange.binance_client import BinanceClient
+from exchange.earn import EarnManager
 from exchange.execution_engine import BinanceExecutionAdapter, ExecutionEngine, OrderExecutor
 from exchange.websocket_manager import WebSocketManager
 from market.market_data import MarketDataStore
@@ -82,6 +83,7 @@ def _resolve_config(args: argparse.Namespace) -> AppConfig:
 async def run_backtest_mode(config: AppConfig, args: argparse.Namespace) -> None:
     from backtest.engine import BacktestEngine
     from backtest.reports import format_summary, write_full_report
+    from market.macro_regime import HISTORY_DAYS, phase_by_day
 
     if not args.symbols or not args.start:
         raise SystemExit("--mode backtest requires --symbols and --start (YYYY-MM-DD)")
@@ -97,11 +99,16 @@ async def run_backtest_mode(config: AppConfig, args: argparse.Namespace) -> None
     try:
         btc_klines = await client.get_historical_klines("BTCUSDT", "15m", start, end)
         symbol_klines = {s: await client.get_historical_klines(s, "15m", start, end) for s in symbols}
+        # The long-term phase drives the bear gate and the strong-signal size, as live.
+        btc_daily = await client.get_historical_klines("BTCUSDT", "1d", start - timedelta(days=HISTORY_DAYS + 1), end)
     finally:
         await client.close()
 
     engine = BacktestEngine(config.env, config.rules)
-    result = engine.run(symbol_klines, btc_klines, starting_balance=config.env.paper_starting_balance_usdt)
+    result = engine.run(
+        symbol_klines, btc_klines, starting_balance=config.env.paper_starting_balance_usdt,
+        macro_phase_by_day=phase_by_day(btc_daily, start.date(), end.date()),
+    )
     print(format_summary(result.metrics, symbols=symbols))
     report_path = write_full_report(result, Path(args.out), symbols=symbols)
     print(f"\nFull report written to {report_path.parent}/")
@@ -186,9 +193,18 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
         application.bot, chat_id=settings.telegram_allowed_user_id, public_ip_provider=_fetch_public_ip
     )
 
+    # Idle USDT in Simple Earn only with real money on the real exchange:
+    # PAPER, DRY_RUN and testnet never move funds.
+    earn: EarnManager | None = None
+    if settings.earn_enabled and mode == TradingMode.LIVE and not effective_dry_run and not settings.binance_testnet:
+        earn = EarnManager(
+            client, spot_buffer_usdt=settings.earn_spot_buffer_usdt, min_transfer_usdt=settings.earn_min_transfer_usdt,
+        )
+
     strategy_engine = StrategyEngine(
         settings=settings, rules=rules, signal_engine=signal_engine, risk_manager=risk_manager,
         execution_engine=execution_engine, market_data=market_data, news_provider=news_engine, notifier=notifier,
+        funds_provider=earn.ensure_spot if earn is not None else None,
     )
 
     async def _on_task_gave_up(name: str, exc: BaseException | None) -> None:
@@ -200,7 +216,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
         settings=settings, rules=rules, client=client, ws_manager=ws_manager, market_data=market_data,
         universe_scanner=universe_scanner, risk_manager=risk_manager, news_engine=news_engine,
         execution_engine=execution_engine, strategy_engine=strategy_engine, notifier=notifier,
-        watchdog=watchdog, paper_broker=paper_broker, started_at=utcnow(),
+        watchdog=watchdog, paper_broker=paper_broker, started_at=utcnow(), earn=earn,
     )
 
     ctx = BotContext(
@@ -210,7 +226,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
         get_latest_signals=runtime.get_latest_signals, get_health_snapshot=runtime.get_health_snapshot,
         get_mark_prices=runtime.get_mark_prices, get_status_snapshot=runtime.build_status_snapshot,
         trigger_emergency_stop=runtime.emergency_stop, get_macro_assessment=runtime.get_macro_assessment,
-        manual_sell=runtime.manual_sell,
+        manual_sell=runtime.manual_sell, get_monthly_report_text=runtime.get_monthly_report_text,
     )
     attach_context(application, ctx)
     bot_runner = TelegramBotRunner(application)

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -38,6 +39,7 @@ from backtest.metrics import (
 )
 from config.settings import RulesConfig, Settings
 from market.indicators import compute_all_indicators
+from market.macro_regime import MacroPhase
 from market.market_data import IndicatorSnapshot
 from market.market_regime import MarketRegimeEngine, RegimeAssessment, RegimeLevel
 from risk.correlation import check_correlation_limit
@@ -305,7 +307,14 @@ class BacktestEngine:
         btc_klines_15m: pd.DataFrame,
         *,
         starting_balance: Decimal = Decimal("10000"),
+        macro_phase_by_day: dict[date, MacroPhase] | None = None,
     ) -> BacktestResult:
+        """`macro_phase_by_day` (market.macro_regime.phase_by_day): the
+        long-term phase per UTC day, for the live rules that depend on it -
+        no new entries in a bear (BEAR_ENTRY_BLOCK) and the bigger entry on a
+        strong signal only in BULL. Without it both are off, like a live bot
+        that doesn't know the phase yet."""
+        phases = macro_phase_by_day or {}
         btc_frames = prepare_symbol_frames(btc_klines_15m, self.rules)
         btc_merged = merge_aligned(btc_frames)
 
@@ -377,7 +386,10 @@ class BacktestEngine:
                     row = df.loc[ts]
                     if pd.isna(row.get("rsi_h1")) or pd.isna(row.get("rsi_h4")):
                         continue
-                    self._try_open(portfolio, symbol, row, ts, regime, mark_prices, day_str, symbol_merged, no_trade_log)
+                    self._try_open(
+                        portfolio, symbol, row, ts, regime, mark_prices, day_str, symbol_merged, no_trade_log,
+                        macro_phase=phases.get(ts.date()),
+                    )
 
         if not equity_curve:
             raise ValueError("Backtest produced no equity points - not enough history past the indicator warmup period")
@@ -503,6 +515,8 @@ class BacktestEngine:
         day_str: str,
         symbol_merged: dict[str, pd.DataFrame],
         no_trade_log: list[dict[str, Any]],
+        *,
+        macro_phase: MacroPhase | None = None,
     ) -> None:
         breakdown = self._evaluate_breakdown(
             symbol, row, ts, regime, symbol_merged, open_position_symbols=list(portfolio.open_positions.keys())
@@ -512,13 +526,26 @@ class BacktestEngine:
         if breakdown.blocked or breakdown.final_score < required_score or not breakdown.meets_confirmation_rule:
             no_trade_log.append(self._log_entry(ts, symbol, "NO_TRADE", breakdown, required_score))
             return
+        # Same order as StrategyEngine.try_open_position: bear gate, then size, then the caps.
+        if self.settings.bear_entry_block and macro_phase in (MacroPhase.BEAR, MacroPhase.DEEP_BEAR):
+            no_trade_log.append(self._log_entry(ts, symbol, "BLOCKED", breakdown, required_score, ["bear market"]))
+            return
 
-        can_open, risk_reasons = portfolio.can_open(self.settings.initial_order_usdt, regime, day_str)
+        strong = (
+            macro_phase == MacroPhase.BULL
+            and self.settings.strong_signal_off_reason is None
+            and breakdown.final_score >= required_score + self.settings.strong_signal_score_margin
+        )
+        order_usdt = self.settings.effective_strong_order_usdt if strong else self.settings.initial_order_usdt
+        can_open, risk_reasons = portfolio.can_open(order_usdt, regime, day_str)
+        if not can_open and strong:
+            order_usdt = self.settings.initial_order_usdt
+            can_open, risk_reasons = portfolio.can_open(order_usdt, regime, day_str)
         if not can_open:
             no_trade_log.append(self._log_entry(ts, symbol, "BLOCKED", breakdown, required_score, risk_reasons))
             return
 
-        fill_price, net_qty, commission = _simulate_buy(mark_prices[symbol], self.settings.initial_order_usdt, self.settings)
+        fill_price, net_qty, commission = _simulate_buy(mark_prices[symbol], order_usdt, self.settings)
         target = compute_target_price(
             fill_price, target_profit_percent=self.settings.target_profit_percent,
             taker_fee_rate=self.settings.taker_fee_rate, expected_slippage_percent=self.settings.expected_slippage_percent,
@@ -528,9 +555,9 @@ class BacktestEngine:
             total_quantity=net_qty, total_cost_usdt=fill_price * net_qty, dca_count=0,
             target_price=target, fees_paid_usdt=commission, worst_price_seen=fill_price,
         )
-        portfolio.cash -= self.settings.initial_order_usdt
+        portfolio.cash -= order_usdt
         portfolio.total_fees += commission
-        portfolio.register_deployed(day_str, self.settings.initial_order_usdt)
+        portfolio.register_deployed(day_str, order_usdt)
 
     def _manage_position(
         self,

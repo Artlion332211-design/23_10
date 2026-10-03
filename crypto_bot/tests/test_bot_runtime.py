@@ -493,11 +493,19 @@ def test_first_ever_phase_check_is_silent_even_in_a_bear_market(db_engine, setti
         assert SettingsRepository(session).get("macro_phase") == "BEAR"
 
 
-def test_bigger_strong_signal_entry_is_allowed_only_in_the_bull_phase(db_engine, settings, rules):
-    from datetime import date
+def _phase(phase, *, age_days=1):
+    from datetime import timedelta
 
     from market.macro_regime import MacroAssessment, MacroPhase
 
+    return MacroAssessment(
+        phase=MacroPhase(phase), as_of=utcnow().date() - timedelta(days=age_days), phase_since=None,
+        phase_days_at_least=40, btc_close=1.0, sma200=1.0, mayer=1.0, sma200_rising=True, sma50=1.0,
+        early_warning=False, weekly_close=None, sma20w=None, ema21w=None, sma50w=None,
+    )
+
+
+def _entry_runtime(settings, rules):
     strategy_engine = MagicMock()
     strategy_engine.try_open_position = AsyncMock()
     runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
@@ -505,53 +513,240 @@ def test_bigger_strong_signal_entry_is_allowed_only_in_the_bull_phase(db_engine,
     runtime._trading_balance_usdt = AsyncMock(return_value=Decimal("1000"))
     runtime._notifier.mark_exchange_ok = AsyncMock()
 
-    def allowed_with(phase):
-        runtime._macro = None if phase is None else MacroAssessment(
-            phase=MacroPhase(phase), as_of=date(2026, 10, 1), phase_since=None, phase_days_at_least=40,
-            btc_close=1.0, sma200=1.0, mayer=1.0, sma200_rising=True, sma50=1.0, early_warning=False,
-            weekly_close=None, sma20w=None, ema21w=None, sma50w=None,
-        )
+    def entry_kwargs(macro):
+        runtime._macro = macro
         asyncio.run(runtime._evaluate_entry("SOLUSDT"))
-        return strategy_engine.try_open_position.await_args.kwargs["strong_size_allowed"]
+        return strategy_engine.try_open_position.await_args.kwargs
 
-    assert allowed_with("BULL") is True
-    assert allowed_with(None) is False  # phase not computed yet
-    assert allowed_with("CAUTION") is False
-    assert allowed_with("BEAR") is False
+    return runtime, entry_kwargs
+
+
+def test_bigger_strong_signal_entry_is_allowed_only_in_a_fresh_bull_phase(db_engine, settings, rules):
+    _runtime, entry_kwargs = _entry_runtime(settings, rules)
+
+    assert entry_kwargs(_phase("BULL"))["strong_size_allowed"] is True
+    assert entry_kwargs(None)["strong_size_allowed"] is False  # phase not computed yet
+    assert entry_kwargs(_phase("CAUTION"))["strong_size_allowed"] is False
+    assert entry_kwargs(_phase("BEAR"))["strong_size_allowed"] is False
+    # The refresh has been failing for days: an old BULL must not size up.
+    assert entry_kwargs(_phase("BULL", age_days=5))["strong_size_allowed"] is False
+
+
+def test_new_entries_are_blocked_in_a_bear_phase(db_engine, settings, rules):
+    """Owner 2026-10-03: no new buys in BEAR/DEEP_BEAR (every backtested bear lost money)."""
+    from orchestration.runtime import BEAR_ENTRY_BLOCK_REASON
+
+    runtime, entry_kwargs = _entry_runtime(settings, rules)
+
+    assert entry_kwargs(_phase("BEAR"))["entry_block_reason"] == BEAR_ENTRY_BLOCK_REASON
+    assert entry_kwargs(_phase("DEEP_BEAR"))["entry_block_reason"] == BEAR_ENTRY_BLOCK_REASON
+    assert entry_kwargs(_phase("BEAR", age_days=5))["entry_block_reason"] == BEAR_ENTRY_BLOCK_REASON  # fails closed
+    assert entry_kwargs(_phase("BULL"))["entry_block_reason"] is None
+    assert entry_kwargs(_phase("CAUTION"))["entry_block_reason"] is None
+    assert runtime.build_status_snapshot().bear_entry_block is False
+
+    runtime._macro = _phase("BEAR")
+    assert runtime.build_status_snapshot().bear_entry_block is True
+
+    runtime._settings = settings.model_copy(update={"bear_entry_block": False})
+    assert entry_kwargs(_phase("BEAR"))["entry_block_reason"] is None  # owner switched it off
+
+
+def test_bear_gate_uses_the_stored_phase_until_the_first_refresh_after_a_restart(db_engine, settings, rules):
+    from database.repository import SettingsRepository
+    from orchestration.runtime import BEAR_ENTRY_BLOCK_REASON
+
+    _runtime, entry_kwargs = _entry_runtime(settings, rules)
+    assert entry_kwargs(None)["entry_block_reason"] is None  # nothing known at all
+
+    with session_scope() as session:
+        SettingsRepository(session).set("macro_phase", "BEAR")
+    assert entry_kwargs(None)["entry_block_reason"] == BEAR_ENTRY_BLOCK_REASON
+
+
+def test_owner_is_told_once_when_the_market_phase_cannot_be_refreshed_for_hours(db_engine, settings, rules):
+    runtime, client, notifier = _macro_runtime(settings, rules, [100.0] * 300)
+    notifier.on_error = AsyncMock()
+    runtime._macro = _phase("BULL")  # known before the outage
+    client.get_historical_klines.side_effect = ConnectionError("down")
+
+    for _ in range(5):
+        asyncio.run(runtime._refresh_macro_tracked())
+    notifier.on_error.assert_not_called()
+    asyncio.run(runtime._refresh_macro_tracked())
+    alert = notifier.on_error.await_args.args[0]
+    assert "не оновлюється вже 6 год" in alert
+    assert "останню відому фазу (BULL" in alert  # the strong entry is not off yet - it says when it will be
+    assert "більше 2 днів" in alert
+    asyncio.run(runtime._refresh_macro_tracked())
+    assert notifier.on_error.await_count == 1  # not every hour after that
+
+    client.get_historical_klines.side_effect = None  # recovered -> the counter starts over
+    asyncio.run(runtime._refresh_macro_tracked())
+    assert runtime._macro_failures == 0
 
 
 def test_bot_does_not_buy_back_a_coin_for_24h_after_the_owner_sold_it(db_engine, settings, rules):
     from datetime import timedelta
 
     from database.repository import SettingsRepository
-    from strategy.strategy_engine import ManualSellResult
 
     strategy_engine = MagicMock()
     strategy_engine.try_open_position = AsyncMock()
-    strategy_engine.manual_sell = AsyncMock(return_value=ManualSellResult("sold"))
     runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
     runtime._get_order_book = AsyncMock(return_value=MagicMock())
     runtime._trading_balance_usdt = AsyncMock(return_value=Decimal("1000"))
     runtime._notifier.mark_exchange_ok = AsyncMock()
 
-    assert asyncio.run(runtime.manual_sell("AAVEUSDT")).status == "sold"
+    def sold_hours_ago(hours):
+        with session_scope() as session:  # written by StrategyEngine when the MANUAL_SELL fill is applied
+            SettingsRepository(session).set("manual_sell_at:AAVEUSDT", (utcnow() - timedelta(hours=hours)).isoformat())
+
+    sold_hours_ago(1)
     asyncio.run(runtime._evaluate_entry("AAVEUSDT"))
     strategy_engine.try_open_position.assert_not_called()
 
-    with session_scope() as session:  # 25 hours later the coin is a normal candidate again
-        SettingsRepository(session).set("manual_sell_at:AAVEUSDT", (utcnow() - timedelta(hours=25)).isoformat())
+    sold_hours_ago(25)  # 25 hours later the coin is a normal candidate again
     asyncio.run(runtime._evaluate_entry("AAVEUSDT"))
     strategy_engine.try_open_position.assert_awaited_once()
 
 
-def test_failed_manual_sell_sets_no_cooldown(db_engine, settings, rules):
-    from strategy.strategy_engine import ManualSellResult
+def _earn_runtime(settings, rules, *, spot="150", earn="900"):
+    from tests.test_earn import FakeEarnClient, _manager
 
-    strategy_engine = MagicMock()
-    strategy_engine.manual_sell = AsyncMock(return_value=ManualSellResult("no_order_book"))
-    runtime = _make_runtime(settings, rules, strategy_engine=strategy_engine)
-    runtime._get_order_book = AsyncMock(side_effect=RuntimeError("network down"))
+    fake = FakeEarnClient(spot=spot, earn=earn)
+    client = MagicMock()
+    client.get_account_balances = fake.get_account_balances
+    notifier = MagicMock()
+    notifier.on_error = AsyncMock()
+    notifier.status_ping = AsyncMock()
+    runtime = _make_runtime(settings, rules, client=client, notifier=notifier, earn=_manager(fake))
+    return runtime, fake, notifier
 
-    asyncio.run(runtime.manual_sell("AAVEUSDT"))
 
-    assert not runtime._in_manual_sell_cooldown("AAVEUSDT")
+def test_trading_balance_counts_usdt_held_in_earn(db_engine, settings, rules):
+    """The risk caps are a share of the trading balance: moving idle USDT into
+    Earn must not shrink the bot."""
+    runtime, _fake, _notifier = _earn_runtime(settings, rules)
+
+    assert asyncio.run(runtime._trading_balance_usdt()) == Decimal("1050")
+
+
+def test_trading_balance_falls_back_to_spot_when_earn_is_unavailable(db_engine, settings, rules):
+    runtime, fake, notifier = _earn_runtime(settings, rules)
+    fake.get_flexible_earn_position = AsyncMock(side_effect=ConnectionError("sapi down"))
+
+    assert asyncio.run(runtime._trading_balance_usdt()) == Decimal("150")  # fewer buys, never more
+    assert "баланс Earn недоступний" in notifier.on_error.await_args.args[0]
+
+
+def test_sweep_moves_idle_usdt_into_earn_and_tells_the_owner(db_engine, settings, rules):
+    runtime, fake, notifier = _earn_runtime(settings, rules, spot="2000.00", earn="0")
+
+    asyncio.run(runtime._sweep_to_earn())
+
+    assert fake.earn == Decimal("1850.00")
+    text = notifier.status_ping.await_args.args[0]
+    assert "1850.00 USDT переміщено в Simple Earn" in text
+    assert "2.65% річних" in text
+
+
+def test_failing_sweep_alerts_once_a_day_not_every_half_hour(db_engine, settings, rules):
+    runtime, fake, notifier = _earn_runtime(settings, rules, spot="1000", earn="0")
+    fake.subscribe_flexible_earn = AsyncMock(side_effect=RuntimeError("APIError(code=-2015)"))
+
+    for _ in range(48):
+        asyncio.run(runtime._sweep_to_earn())
+    assert notifier.on_error.await_count == 1
+    asyncio.run(runtime._sweep_to_earn())
+    assert notifier.on_error.await_count == 2
+
+
+def test_balance_shows_the_earn_line(db_engine, settings, rules):
+    runtime, _fake, _notifier = _earn_runtime(settings, rules)
+    runtime.get_mark_prices = lambda: {}
+
+    text = asyncio.run(runtime.get_balance_text())
+
+    assert "USDT в Earn (Flexible, 2.65% річних): 900.00" in text
+    assert "Загалом приблизно: 1050.00 USDT" in text
+
+
+def test_an_earn_outage_alerts_once_without_a_false_recovered_message(db_engine, settings, rules):
+    """Each balance read sent "ПОМИЛКА" + "ВІДНОВЛЕНО" (the timeout text matched
+    the network category and spot trading then marked the exchange ok)."""
+    from telegram_bot.notifications import TelegramNotifier
+    from tests.test_earn import FakeEarnClient, _manager
+    from tests.test_telegram_notifications import _RecordingSender
+
+    fake = FakeEarnClient(spot="150", earn="900")
+
+    async def down(asset):
+        raise TimeoutError("Connection timed out to api.binance.com")
+
+    fake.get_flexible_earn_position = down
+    client = MagicMock()
+    client.get_account_balances = fake.get_account_balances
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=1)
+    runtime = _make_runtime(settings, rules, client=client, notifier=notifier, earn=_manager(fake))
+
+    async def cycles():
+        for _ in range(3):
+            assert await runtime._trading_balance_usdt() == Decimal("150")
+            await notifier.mark_exchange_ok()
+
+    asyncio.run(cycles())
+    assert len(sender.sent) == 1
+    assert "баланс Earn недоступний" in sender.sent[0][1]
+
+
+def test_earn_outage_alert_is_sent_once_per_outage_by_the_runtime_itself(db_engine, settings, rules):
+    """Not left to the notifier's 1-hour de-duplication: an outage of several
+    hours must not re-alert every hour, and a new outage must alert again."""
+    runtime, fake, notifier = _earn_runtime(settings, rules)
+    working = fake.get_flexible_earn_position
+    fake.get_flexible_earn_position = AsyncMock(side_effect=TimeoutError("sapi"))
+
+    for _ in range(3):
+        runtime._earn._failed_read_at = None  # each read really asks Binance
+        asyncio.run(runtime._trading_balance_usdt())
+    assert notifier.on_error.await_count == 1
+
+    fake.get_flexible_earn_position = working  # recovered
+    runtime._earn._failed_read_at = None
+    assert asyncio.run(runtime._trading_balance_usdt()) == Decimal("1050")
+    fake.get_flexible_earn_position = AsyncMock(side_effect=TimeoutError("sapi"))  # a new outage
+    runtime._earn._balance = None
+    asyncio.run(runtime._trading_balance_usdt())
+    assert notifier.on_error.await_count == 2
+
+
+def test_report_equity_is_not_recorded_when_earn_cannot_be_read(db_engine, settings, rules):
+    """The spot-only fallback stored a daily ending balance short by the whole Earn balance:
+    a fake loss in that month's scoreboard and a fake gain the next."""
+    import pytest
+
+    from database.repository import DailyStatRepository
+
+    runtime, fake, notifier = _earn_runtime(settings, rules)
+    fake.get_flexible_earn_position = AsyncMock(side_effect=TimeoutError("sapi"))
+    runtime.get_mark_prices = lambda: {}
+
+    with pytest.raises(RuntimeError, match="equity would be understated"):
+        asyncio.run(runtime._send_daily_report())
+    with session_scope() as session:
+        assert DailyStatRepository(session).recent() == []
+
+
+def test_a_sweep_that_moved_money_is_reported_even_if_the_totals_cannot_be_read(db_engine, settings, rules):
+    runtime, fake, notifier = _earn_runtime(settings, rules, spot="1000", earn="0")
+    runtime._earn.product = AsyncMock(side_effect=[
+        __import__("exchange.earn", fromlist=["EarnProduct"]).EarnProduct("USDT001", 0.0265, Decimal("0.01"), True, True),
+        TimeoutError("sapi"),
+    ])
+
+    asyncio.run(runtime._sweep_to_earn())
+
+    notifier.on_error.assert_not_called()
+    assert "850.00 USDT переміщено в Simple Earn" in notifier.status_ping.await_args.args[0]

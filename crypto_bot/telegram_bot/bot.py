@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Bot, BotCommand
-from telegram.ext import Application, CommandHandler
+from telegram import Bot, BotCommand, BotCommandScopeChat
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from telegram_bot.handlers import (
     CTX_KEY,
@@ -26,6 +26,7 @@ from telegram_bot.handlers import (
     cmd_pause,
     cmd_pnl,
     cmd_positions,
+    cmd_report,
     cmd_resume,
     cmd_sell,
     cmd_signals,
@@ -33,6 +34,8 @@ from telegram_bot.handlers import (
     cmd_status,
     cmd_stop_dca,
     cmd_today,
+    edited_command_hint,
+    on_handler_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,7 @@ _COMMANDS = {
     "signals": cmd_signals,
     "pnl": cmd_pnl,
     "today": cmd_today,
+    "report": cmd_report,
     "history": cmd_history,
     "pause": cmd_pause,
     "resume": cmd_resume,
@@ -66,6 +70,7 @@ COMMAND_DESCRIPTIONS = {
     "balance": "баланс",
     "pnl": "прибуток / збиток",
     "today": "підсумок за сьогодні",
+    "report": "місяць: бот проти BTC і Earn",
     "history": "закриті угоди",
     "signals": "останні сигнали",
     "news": "новини",
@@ -91,11 +96,29 @@ def create_application(bot_token: str) -> Application:
     return Application.builder().token(bot_token).build()
 
 
+# A sale (or the report's candle download) waits on Binance for seconds; it
+# must not hold up the commands behind it (above all /emergency_stop), so it
+# runs as its own task.
+_NON_BLOCKING = {"sell", "report"}
+
+
 def attach_context(application: Application, ctx: BotContext) -> Application:
     application.bot_data[CTX_KEY] = ctx
     for name, handler in _COMMANDS.items():
-        application.add_handler(CommandHandler(name, handler))
+        # New messages only: an edited message re-runs nothing (see edited_command_hint).
+        application.add_handler(
+            CommandHandler(name, handler, filters=filters.UpdateType.MESSAGE, block=name not in _NON_BLOCKING)
+        )
+    application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, edited_command_hint))
+    application.add_error_handler(on_handler_error)
     return application
+
+
+def menu_commands() -> list[BotCommand]:
+    """The "/" menu, in COMMAND_DESCRIPTIONS order (most used first)."""
+    ordered = [name for name in COMMAND_DESCRIPTIONS if name in _COMMANDS]
+    ordered += [name for name in _COMMANDS if name not in COMMAND_DESCRIPTIONS]
+    return [BotCommand(name, COMMAND_DESCRIPTIONS.get(name, name)) for name in ordered]
 
 
 class TelegramBotRunner:
@@ -113,9 +136,11 @@ class TelegramBotRunner:
             await self._app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram bot polling started")
         try:
-            await self._app.bot.set_my_commands(
-                [BotCommand(name, COMMAND_DESCRIPTIONS.get(name, name)) for name in _COMMANDS]
-            )
+            # Only the owner's chat gets the menu (a private chat's id is the
+            # user's id); strangers opening the bot see no command list.
+            ctx: BotContext = self._app.bot_data[CTX_KEY]
+            await self._app.bot.set_my_commands(menu_commands(), scope=BotCommandScopeChat(chat_id=ctx.allowed_user_id))
+            await self._app.bot.delete_my_commands()  # the public default-scope menu
         except Exception as exc:  # noqa: BLE001 - the menu is a convenience; never block startup on it
             logger.warning("Could not update the Telegram command menu: %r", exc)
 

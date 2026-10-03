@@ -20,6 +20,7 @@ from telegram_bot.notifications import (
     format_crash_alert,
     format_daily_report,
     format_position_closed,
+    format_price,
     format_status,
 )
 
@@ -383,3 +384,31 @@ def test_strong_signal_buy_and_manual_sell_are_labelled():
     from telegram_bot.notifications import close_reason_label
 
     assert close_reason_label("MANUAL_SELL") == "РУЧНИЙ ПРОДАЖ (/sell)"
+
+
+def test_prices_of_sub_cent_coins_show_real_digits_in_trade_messages():
+    """PEPE at 0.00001234 printed as $0.0000 in buy/close messages."""
+    assert format_price(Decimal("0.00001234")) == "0.00001234"
+    assert format_price(Decimal("164.84")) == "164.8400"
+    event = PositionClosedEvent(
+        symbol="PEPEUSDT", exit_price=Decimal("0.00001357"), avg_entry_price=Decimal("0.00001234"),
+        net_pnl_usdt=Decimal("2"), net_pnl_percent=Decimal("10"), holding_time_seconds=3600,
+        close_reason="TAKE_PROFIT", position_id=1,
+    )
+    assert "Вхід: $0.00001234  Вихід: $0.00001357" in format_position_closed(event)
+
+
+def test_bear_alerts_say_that_buying_stops_and_resumes_automatically():
+    from telegram_bot.notifications import format_macro_change, format_macro_report
+
+    start = format_macro_change("CAUTION", _macro_assessment("BEAR"), entry_block=True)
+    assert "НОВІ КУПІВЛІ АВТОМАТИЧНО ЗУПИНЕНО" in start
+    assert "/pause" not in start  # nothing to do by hand any more
+    assert "Нові купівлі: вимкнено автоматично" in format_macro_report(_macro_assessment("BEAR"), entry_block=True)
+
+    end = format_macro_change("BEAR", _macro_assessment("BULL"), entry_block=True)
+    assert "Нові купівлі знову дозволено" in end
+    assert "знову дозволено" not in format_macro_change("BEAR", _macro_assessment("BULL"))  # gate off: no claim
+
+    status = format_status(_status_snapshot(macro_phase="BEAR", bear_entry_block=True))
+    assert "Обмеження: 🐻 нові купівлі вимкнено автоматично (ведмежий ринок)" in status

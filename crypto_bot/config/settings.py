@@ -75,8 +75,21 @@ class Settings(BaseSettings):
     # 2026-10-02). Set it equal to INITIAL_ORDER_USDT to turn this off.
     strong_signal_order_usdt: Decimal = Decimal("50")
     strong_signal_score_margin: float = 5.0
+    # No new entries while the long-term phase (market/macro_regime.py) is
+    # BEAR or DEEP_BEAR: in the 2018/2022/2025-26 backtests every bear
+    # lost money and blocking cost nothing in the bulls. Open positions are
+    # still managed (exits, DCA). Owner decision 2026-10-03.
+    bear_entry_block: bool = True
+    # Idle USDT in Binance Simple Earn Flexible (exchange/earn.py), only in
+    # LIVE with DRY_RUN=false. The spot buffer must stay above the largest
+    # single order (entry or DCA). Owner decision 2026-10-03.
+    earn_enabled: bool = True
+    earn_spot_buffer_usdt: Decimal = Decimal("150")
+    earn_min_transfer_usdt: Decimal = Decimal("10")
     max_position_usdt: Decimal = Decimal("300")
-    max_open_positions: int = 3
+    # 5 with the same 35% exposure cap: won or tied 3 slots in every
+    # backtested period 2018-2026 (owner decision 2026-10-03).
+    max_open_positions: int = 5
 
     # --- Take profit -----------------------------------------------------
     target_profit_percent: Decimal = Decimal("10")
@@ -207,17 +220,11 @@ class Settings(BaseSettings):
                 f"(got {self.dca_level_1}, {self.dca_level_2}, {self.dca_level_3})"
             )
         sizes = [self.dca_size_1_usdt, self.dca_size_2_usdt, self.dca_size_3_usdt]
-        largest_entry = max(self.initial_order_usdt, self.strong_signal_order_usdt)
-        planned_total = largest_entry + sum(sizes[: self.max_dca_count])
+        planned_total = self.initial_order_usdt + sum(sizes[: self.max_dca_count])
         if planned_total > self.max_position_usdt:
             raise ValueError(
                 f"Entry order + planned DCA sizes ({planned_total} USDT) exceed "
                 f"MAX_POSITION_USDT ({self.max_position_usdt}). Adjust sizing or raise the cap."
-            )
-        if self.strong_signal_order_usdt < self.initial_order_usdt:
-            raise ValueError(
-                f"STRONG_SIGNAL_ORDER_USDT ({self.strong_signal_order_usdt}) must not be below "
-                f"INITIAL_ORDER_USDT ({self.initial_order_usdt})"
             )
         if self.strong_signal_score_margin < 0:
             raise ValueError(f"STRONG_SIGNAL_SCORE_MARGIN must be >= 0 (got {self.strong_signal_score_margin})")
@@ -269,6 +276,23 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "Cannot start MODE=LIVE trading: missing required settings: " + ", ".join(missing)
             )
+
+    @property
+    def strong_signal_off_reason(self) -> str | None:
+        """Why the bigger strong-signal entry is off, or None when it is on.
+        Not a startup error on purpose: raising INITIAL_ORDER_USDT or the DCA
+        sizes must never stop a live bot over this optional extra."""
+        if self.strong_signal_order_usdt <= self.initial_order_usdt:
+            return "STRONG_SIGNAL_ORDER_USDT не більший за INITIAL_ORDER_USDT"
+        planned_total = self.strong_signal_order_usdt + sum(size for _drop, size in self.dca_plan)
+        if planned_total > self.max_position_usdt:
+            return f"вхід + усі докупки ({planned_total} USDT) більші за MAX_POSITION_USDT ({self.max_position_usdt})"
+        return None
+
+    @property
+    def effective_strong_order_usdt(self) -> Decimal:
+        """The strong-signal entry size actually used (INITIAL_ORDER_USDT while it is off)."""
+        return self.initial_order_usdt if self.strong_signal_off_reason else self.strong_signal_order_usdt
 
     @property
     def dca_plan(self) -> list[tuple[Decimal, Decimal]]:

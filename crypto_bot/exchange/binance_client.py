@@ -25,7 +25,7 @@ import pandas as pd
 from binance import AsyncClient
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from exchange.symbol_filters import SymbolFilters
+from exchange.symbol_filters import SymbolFilters, format_decimal
 from utils.time import utcnow
 
 logger = logging.getLogger(__name__)
@@ -332,6 +332,31 @@ class BinanceClient:
             if free > 0 or locked > 0:
                 balances[entry["asset"]] = (free, locked)
         return balances
+
+    # Simple Earn Flexible (exchange/earn.py). Each list/position call costs
+    # 150 request weight - callers cache. Reads aren't retried either: when
+    # /sapi is down the trading loops fall back to spot at once instead of
+    # stalling ~80 s per call. Booleans go as "true"/"false": Binance
+    # doesn't accept Python's "True".
+    async def get_flexible_earn_product(self, asset: str) -> dict[str, Any] | None:
+        raw = await self._call("get_simple_earn_flexible_product_list", retry_ambiguous=False, asset=asset)
+        return next((r for r in raw.get("rows", []) if r.get("asset") == asset), None)
+
+    async def get_flexible_earn_position(self, asset: str) -> dict[str, Any] | None:
+        raw = await self._call("get_simple_earn_flexible_product_position", retry_ambiguous=False, asset=asset)
+        return next((r for r in raw.get("rows", []) if r.get("asset") == asset), None)
+
+    async def subscribe_flexible_earn(self, product_id: str, amount: Decimal) -> dict[str, Any]:
+        # Not idempotent: an ambiguous failure is not resent (see _call).
+        return await self._call(
+            "subscribe_simple_earn_flexible_product", retry_ambiguous=False,
+            productId=product_id, amount=format_decimal(amount), autoSubscribe="false",
+        )
+
+    async def redeem_flexible_earn(self, product_id: str, amount: Decimal | None) -> dict[str, Any]:
+        """amount=None redeems everything."""
+        params: dict[str, Any] = {"redeemAll": "true"} if amount is None else {"amount": format_decimal(amount)}
+        return await self._call("redeem_simple_earn_flexible_product", retry_ambiguous=False, productId=product_id, **params)
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {"symbol": symbol} if symbol else {}

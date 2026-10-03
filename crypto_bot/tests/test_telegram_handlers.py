@@ -252,14 +252,23 @@ def _ctx_with_position(db_engine, settings, rules):
     return ctx
 
 
-def _sell(ctx, *args):
+def _sell(ctx, *args, bot_data=None):
+    """One /sell message. Pass the same bot_data to chain a prompt and its confirmation."""
     from telegram_bot.handlers import cmd_sell
 
     update = _make_update(user_id=42)
     context = _make_context(ctx)
+    if bot_data is not None:
+        context.bot_data = bot_data
     context.args = list(args)
     asyncio.run(cmd_sell(update, context))
     return [c.args[0] for c in update.message.reply_text.call_args_list]
+
+
+def _prompted(ctx, coin="AAVE"):
+    bot_data = {CTX_KEY: ctx}
+    _sell(ctx, coin, bot_data=bot_data)
+    return bot_data
 
 
 def test_sell_without_confirmation_only_shows_the_position_and_sells_nothing(db_engine, settings, rules):
@@ -270,18 +279,42 @@ def test_sell_without_confirmation_only_shows_the_position_and_sells_nothing(db_
 
     assert "AAVE" in listing[0] and "/sell AAVE" in listing[0]
     assert "ПРОДАТИ ВСЮ ПОЗИЦІЮ AAVEUSDT ПО РИНКУ?" in prompt[0]
-    assert "/sell AAVE так" in prompt[0]
+    assert "протягом 2 хв напиши: /sell AAVE так" in prompt[0]
     assert "+0.62 USDT" in prompt[0]  # (170 - 164.84) * 0.120879
     ctx.manual_sell.assert_not_called()
 
 
-def test_sell_with_confirmation_market_sells_the_position(db_engine, settings, rules):
+def test_sell_with_confirmation_right_after_the_prompt_market_sells_the_position(db_engine, settings, rules):
     ctx = _ctx_with_position(db_engine, settings, rules)
+    bot_data = _prompted(ctx)
 
-    replies = _sell(ctx, "AAVE", "так")
+    replies = _sell(ctx, "AAVE", "так", bot_data=bot_data)
 
     ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
     assert replies[-1].startswith("✅ AAVEUSDT продано повністю")
+
+
+def test_sell_confirmation_without_a_fresh_prompt_sells_nothing(db_engine, settings, rules):
+    """'/sell AAVE так' typed from memory (or an old one resent) used to sell
+    at once, skipping the step that shows the position and its PnL."""
+    from datetime import timedelta
+
+    from telegram_bot.handlers import SELL_CONFIRM_WINDOW
+
+    ctx = _ctx_with_position(db_engine, settings, rules)
+
+    cold = _sell(ctx, "AAVE", "так")
+    assert "Спершу напиши /sell AAVE" in cold[-1]
+
+    bot_data = _prompted(ctx)
+    bot_data["sell_pending"]["AAVEUSDT"] = utcnow() - timedelta(seconds=1)  # the window has passed
+    assert "Спершу напиши /sell AAVE" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]
+
+    bot_data = _prompted(ctx)
+    _sell(ctx, "AAVE", "так", bot_data=bot_data)
+    assert "Спершу напиши" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]  # one prompt, one sale
+    ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
+    assert timedelta(minutes=1) <= SELL_CONFIRM_WINDOW <= timedelta(minutes=5)
 
 
 def test_sell_of_a_coin_without_an_open_position_does_nothing(db_engine, settings, rules):
@@ -297,36 +330,38 @@ def test_sell_reports_a_failed_sale_plainly(db_engine, settings, rules):
     ctx = _ctx_with_position(db_engine, settings, rules)
     ctx.manual_sell = AsyncMock(return_value=ManualSellResult("failed", "біржа відхилила продаж: Account has insufficient balance"))
 
-    replies = _sell(ctx, "AAVE", "так")
+    replies = _sell(ctx, "AAVE", "так", bot_data=_prompted(ctx))
 
     assert replies[-1].startswith("❌ Продаж AAVEUSDT не виконано.")
     assert "Причина: біржа відхилила продаж: Account has insufficient balance" in replies[-1]  # the reason is in the reply itself
 
 
-def test_an_edited_sell_command_still_works(db_engine, settings, rules):
-    """On a phone it is natural to edit '/sell AAVE' into '/sell AAVE так';
-    Telegram then sends edited_message and update.message is None."""
-    from telegram_bot.handlers import cmd_sell
-
+def test_sell_that_raises_says_the_result_is_unknown(db_engine, settings, rules):
+    """An exception used to end the handler silently after "Продаю..." -
+    the owner never learned whether the order went through."""
     ctx = _ctx_with_position(db_engine, settings, rules)
-    update = MagicMock()
-    update.effective_user.id = 42
-    update.message = None
-    update.effective_message.reply_text = AsyncMock()
-    context = _make_context(ctx)
-    context.args = ["AAVE", "так"]
+    ctx.manual_sell = AsyncMock(side_effect=RuntimeError("db locked"))
 
-    asyncio.run(cmd_sell(update, context))
+    replies = _sell(ctx, "AAVE", "так", bot_data=_prompted(ctx))
 
-    ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
-    assert update.effective_message.reply_text.call_args_list[-1].args[0].startswith("✅ AAVEUSDT продано")
+    assert "результат невідомий" in replies[-1]
+    assert "/positions" in replies[-1]
 
 
-def test_sell_prompt_shows_real_prices_for_sub_cent_coins():
-    from telegram_bot.handlers import _price
+def test_handler_error_is_reported_to_the_owner_only(db_engine, settings, rules):
+    from telegram import Update
 
-    assert _price(Decimal("0.00001234")) == "0.00001234"
-    assert _price(Decimal("164.84")) == "164.8400"
+    from telegram_bot.handlers import on_handler_error
+
+    ctx = _make_ctx(db_engine, settings, rules)
+    for user_id, expected_replies in ((42, 1), (7, 0)):
+        update = MagicMock(spec=Update)
+        update.effective_user = MagicMock(id=user_id)
+        update.effective_message = MagicMock(reply_text=AsyncMock())
+        context = _make_context(ctx)
+        context.error = RuntimeError("boom")
+        asyncio.run(on_handler_error(update, context))
+        assert update.effective_message.reply_text.await_count == expected_replies
 
 
 def test_partial_sale_reply_tells_the_owner_what_is_left_and_what_to_do():
@@ -335,3 +370,14 @@ def test_partial_sale_reply_tells_the_owner_what_is_left_and_what_to_do():
     text = _sell_reply("AAVEUSDT", ManualSellResult("partial", "біржа продала лише частину", remaining=Decimal("0.06")))
     assert text.startswith("⚠️ AAVEUSDT продано ЧАСТКОВО - залишок 0.06")
     assert "/sell AAVE так" in text
+
+
+def test_partial_and_pending_sale_replies_say_what_to_do_next(db_engine, settings, rules):
+    from telegram_bot.handlers import _sell_reply
+
+    partial = _sell_reply("AAVEUSDT", ManualSellResult("partial", "мало покупців", remaining=Decimal("0.06")))
+    assert "/sell AAVE, потім /sell AAVE так" in partial  # the old confirmation is used up
+
+    pending = _sell_reply("AAVEUSDT", ManualSellResult("pending", "біржа ще не підтвердила"))
+    assert pending.startswith("⏳")
+    assert "не виконано" not in pending

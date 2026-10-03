@@ -41,6 +41,7 @@ from database.repository import (
 )
 from database.session import session_scope
 from exchange.binance_client import BinanceClient
+from exchange.earn import EarnManager
 from exchange.execution_engine import ExecutionEngine
 from exchange.websocket_manager import WebSocketManager
 from market.macro_regime import (
@@ -56,14 +57,27 @@ from market.orderbook import OrderBookSnapshot, parse_order_book
 from market.universe_scanner import UniverseScanner
 from news.news_engine import NewsEngine
 from orchestration.daily_report import build_daily_stat
+from orchestration.monthly_report import (
+    MonthlyReportData,
+    build_monthly_report,
+    is_last_day_of_month,
+    month_start_of,
+)
 from orchestration.watchdog import Watchdog
 from paper.simulator import PaperBroker
 from risk.risk_manager import RiskManager
-from strategy.strategy_engine import ManualSellResult, StrategyEngine, TradeDecision
+from strategy.strategy_engine import (
+    ManualSellResult,
+    StrategyEngine,
+    TradeDecision,
+    in_manual_sell_cooldown,
+)
 from telegram_bot.notifications import (
     DailyReportData,
     StatusSnapshot,
     TelegramNotifier,
+    format_earn_sweep,
+    format_monthly_report,
     format_status,
     macro_status_detail,
 )
@@ -85,10 +99,16 @@ _MACRO_REFRESH_SECONDS = 3600
 # Last phase announced in Telegram, persisted so a restart neither repeats an
 # old alert nor misses a change that happened while the bot was down.
 _MACRO_PHASE_KEY = "macro_phase"
+# The phase comes from the last CLOSED daily candle (yesterday); older than
+# this means the hourly refresh has been failing - don't size up on it.
+_MACRO_MAX_AGE = timedelta(days=2)
+_MACRO_FAILURE_ALERT_AFTER = 6  # consecutive hourly refresh failures
+_EARN_FIRST_SWEEP_DELAY_SECONDS = 600  # let startup reconciliation settle first
+_EARN_SWEEP_SECONDS = 1800
+_EARN_FAILURE_ALERT_EVERY = 48  # sweeps (~a day) between repeated failure alerts
+BEAR_ENTRY_BLOCK_REASON = "bear market (long-term phase): new entries are off - BEAR_ENTRY_BLOCK"
 _MACRO_CAUTION_ALERT_KEY = "macro_caution_alert_at"
 # After the owner's /sell the bot doesn't buy that coin back right away.
-MANUAL_SELL_COOLDOWN = timedelta(hours=24)
-_MANUAL_SELL_KEY = "manual_sell_at:{symbol}"
 
 
 def _minutes(seconds: float) -> int:
@@ -101,6 +121,7 @@ _TASK_LABELS = {
     "daily_report": "щоденний звіт",
     "status_ping": "статус-повідомлення",
     "macro_regime": "фаза ринку",
+    "earn_sweep": "USDT в Earn",
 }
 
 
@@ -126,6 +147,7 @@ class BotRuntime:
         watchdog: Watchdog,
         paper_broker: PaperBroker | None,
         started_at: datetime,
+        earn: EarnManager | None = None,
     ) -> None:
         self._settings = settings
         self._rules = rules
@@ -141,10 +163,15 @@ class BotRuntime:
         self._watchdog = watchdog
         self._paper_broker = paper_broker
         self.started_at = started_at
+        # Simple Earn for idle USDT (exchange/earn.py); None outside real LIVE trading.
+        self._earn = earn
+        self._earn_failures = 0
+        self._earn_balance_alerted = False  # one alert per Earn outage
 
         self._regime_engine = MarketRegimeEngine(rules.crash_detector)
         self._btc_regime: RegimeAssessment | None = None
         self._macro: MacroAssessment | None = None
+        self._macro_failures = 0
         self._latest_decisions: dict[str, TradeDecision] = {}
         self._candidate_symbols: set[str] = set()
         self._tracked_symbols: set[str] = set()
@@ -180,10 +207,9 @@ class BotRuntime:
             await self._news_engine.refresh()
             self._last_news_refresh_at = utcnow()
         self._update_btc_regime()
-        try:
-            await self._refresh_macro()
-        except Exception as exc:  # noqa: BLE001 - informational only; never block startup on it
-            logger.warning("Market phase not computed at startup (retried hourly): %r", exc)
+        # Never blocks startup: until it succeeds the bear gate falls back to
+        # the last stored phase and the bigger entry stays off.
+        await self._refresh_macro_tracked()
         self._initialized = True
 
     def register_tasks(self) -> None:
@@ -195,6 +221,8 @@ class BotRuntime:
         self._watchdog.register("daily_report", self.run_daily_report_loop)
         self._watchdog.register("status_ping", self.run_status_ping_loop)
         self._watchdog.register("macro_regime", self.run_macro_regime_loop)
+        if self._earn is not None:
+            self._watchdog.register("earn_sweep", self.run_earn_sweep_loop)
 
     # ------------------------------------------------------------------
     # Universe tracking + market data
@@ -299,21 +327,58 @@ class BotRuntime:
     async def run_macro_regime_loop(self) -> None:
         while True:
             await self._sleep_with_heartbeat(_MACRO_REFRESH_SECONDS, "macro_regime")
-            try:
-                await self._refresh_macro()
-            except Exception as exc:  # noqa: BLE001 - one failed refresh must not kill the loop
-                logger.warning("Market phase refresh failed (retrying in an hour): %r", exc)
+            await self._refresh_macro_tracked()
+
+    async def _refresh_macro_tracked(self) -> None:
+        """One refresh that never raises; after _MACRO_FAILURE_ALERT_AFTER
+        failures in a row the owner hears about it once (the bear gate and
+        the strong-entry rule both depend on a current phase)."""
+        try:
+            await self._refresh_macro()
+        except Exception as exc:  # noqa: BLE001 - one failed refresh must not kill the loop
+            self._macro_failures += 1
+            logger.warning("Market phase refresh failed (%s in a row, retrying in an hour): %r", self._macro_failures, exc)
+            if self._macro_failures == _MACRO_FAILURE_ALERT_AFTER:
+                last = (
+                    f"{self._macro.phase.value} за закриттям {self._macro.as_of.isoformat()}"
+                    if self._macro is not None else "невідома"
+                )
+                # No exception text: a timeout would match the network category
+                # and get a false "recovered" as soon as spot trading answers.
+                await self._notifier.on_error(
+                    f"Фаза ринку не оновлюється вже {self._macro_failures} год (деталі в логах). Бот використовує "
+                    f"останню відому фазу ({last}); збільшений вхід вимкнеться, коли їй буде більше 2 днів, "
+                    "а пауза купівель у ведмежому ринку тримається за останньою відомою фазою."
+                )
+            return
+        self._macro_failures = 0
+
+    def _fresh_macro(self) -> MacroAssessment | None:
+        if self._macro is None or utcnow().date() - self._macro.as_of > _MACRO_MAX_AGE:
+            return None
+        return self._macro
+
+    def _bear_entry_block_active(self) -> bool:
+        """BEAR_ENTRY_BLOCK: no new entries in a BEAR/DEEP_BEAR phase. Fails
+        closed: a stale phase still counts, and before the first refresh
+        after a restart the last stored phase decides."""
+        if not self._settings.bear_entry_block:
+            return False
+        if self._macro is not None:
+            return self._macro.is_bear
+        with session_scope() as session:
+            stored = SettingsRepository(session).get(_MACRO_PHASE_KEY)
+        return stored in (MacroPhase.BEAR.value, MacroPhase.DEEP_BEAR.value)
 
     async def _refresh_macro(self) -> None:
         """Recomputes the long-term phase from closed BTC daily candles and
-        announces a change in Telegram. Informational only - it changes no
-        trading decision."""
+        announces a change in Telegram. Drives the bear-market entry gate
+        and the strong-signal entry size."""
         now = utcnow()
         daily = await self._client.get_historical_klines("BTCUSDT", "1d", now - timedelta(days=HISTORY_DAYS), now)
         assessment = assess_macro(daily, now=now)
         if assessment is None:
-            logger.warning("Market phase: not enough BTC daily history yet (%s candles)", len(daily))
-            return
+            raise RuntimeError(f"not enough BTC daily history yet ({len(daily)} candles)")
         self._macro = assessment
         phase = assessment.phase.value
         with session_scope() as session:
@@ -332,7 +397,9 @@ class BotRuntime:
         logger.warning("Market phase changed: %s -> %s (alert: %s)", previous, phase, due)
         # Persist only after Telegram accepted the alert: a failed send keeps
         # the old phase stored, so the next hourly refresh announces it again.
-        if due and not await self._notifier.macro_phase_change(previous, assessment):
+        if due and not await self._notifier.macro_phase_change(
+            previous, assessment, entry_block=self._settings.bear_entry_block
+        ):
             logger.warning("Market phase alert not delivered - retrying at the next refresh")
             return
         with session_scope() as session:
@@ -354,12 +421,66 @@ class BotRuntime:
         raw = await self._client.get_order_book(symbol, limit=50)
         return parse_order_book(symbol, raw)
 
-    async def _trading_balance_usdt(self) -> Decimal:
+    async def _trading_balance_usdt(self, *, strict: bool = False) -> Decimal:
+        """Free USDT: spot + Simple Earn. If Earn can't be read the risk
+        caps fall back to spot only (fewer buys, never more); `strict`
+        callers (equity for the reports) raise instead of recording a
+        figure that is ~the whole Earn balance too low."""
         if self._paper_broker is not None:
             return self._paper_broker.account.usdt_balance
-        balances = await self._client.get_account_balances()
-        free, _locked = balances.get("USDT", (Decimal("0"), Decimal("0")))
-        return free
+        if self._earn is None:
+            balances = await self._client.get_account_balances()
+            return balances.get("USDT", (Decimal("0"), Decimal("0")))[0]
+        # Idle USDT waits in Earn; the risk caps measure the whole of it, so
+        # moving money there doesn't shrink the bot.
+        spot, earn = await self._earn.read_balances()
+        if earn is not None:
+            self._earn_balance_alerted = False
+            return spot + earn
+        if strict:
+            raise RuntimeError("Simple Earn balance unavailable - equity would be understated")
+        if not self._earn_balance_alerted:
+            self._earn_balance_alerted = True
+            # Worded to match no exchange-error category: spot trading works,
+            # so a "recovered" message right after would be noise.
+            await self._notifier.on_error(
+                "Simple Earn: баланс Earn недоступний - доки Binance не відповість, ліміти купівель рахуються "
+                "лише від USDT на споті (бот купуватиме менше, не більше). Деталі в логах."
+            )
+        return spot
+
+    # ------------------------------------------------------------------
+    # Simple Earn sweep
+    # ------------------------------------------------------------------
+
+    async def run_earn_sweep_loop(self) -> None:
+        await self._sleep_with_heartbeat(_EARN_FIRST_SWEEP_DELAY_SECONDS, "earn_sweep")
+        while True:
+            await self._sweep_to_earn()
+            await self._sleep_with_heartbeat(_EARN_SWEEP_SECONDS, "earn_sweep")
+
+    async def _sweep_to_earn(self) -> None:
+        assert self._earn is not None
+        try:
+            moved = await self._earn.sweep()
+        except Exception as exc:  # noqa: BLE001 - the next round sees the real balances
+            self._earn_failures += 1
+            logger.warning("Earn sweep failed (%s in a row): %r", self._earn_failures, exc)
+            if self._earn_failures % _EARN_FAILURE_ALERT_EVERY == 1:
+                hint = " Ключ API, схоже, не має дозволу на Simple Earn (код 2015)." if "-2015" in repr(exc) else ""
+                await self._notifier.on_error(
+                    "Simple Earn: переміщення USDT між спотом і Earn не вдалося або біржа його не підтвердила. "
+                    f"Наступна спроба через 30 хв; баланси видно в /balance.{hint} Деталі в логах."
+                )
+            return
+        self._earn_failures = 0
+        if moved > 0:
+            try:
+                held, apr = await self._earn.balance(), (await self._earn.product()).apr
+            except Exception as exc:  # noqa: BLE001 - the move itself succeeded; report it without the totals
+                logger.warning("Earn totals after the sweep unavailable: %r", exc)
+                held, apr = None, None
+            await self._notifier.status_ping(format_earn_sweep(moved, held, apr, self._settings.earn_spot_buffer_usdt))
 
     # ------------------------------------------------------------------
     # Entry evaluation (candle-close driven)
@@ -383,10 +504,11 @@ class BotRuntime:
             open_symbols = [p.symbol for p in position_repo.get_open_positions()]
         if open_count >= self._settings.max_open_positions:
             return
-        if self._in_manual_sell_cooldown(symbol):
+        if in_manual_sell_cooldown(symbol):
             return
 
         regime = self._btc_regime or _default_neutral_regime()
+        fresh_macro = self._fresh_macro()
         try:
             # Independent REST round trips - run concurrently rather than
             # paying both latencies back-to-back on this candle-close path.
@@ -398,8 +520,9 @@ class BotRuntime:
                 symbol, btc_regime=regime, trading_balance_usdt=trading_balance,
                 order_book=order_book, open_position_symbols=open_symbols,
                 # The bigger strong-signal entry only while the long-term phase is BULL:
-                # never in an early warning or a bear, and never before the phase is known.
-                strong_size_allowed=self._macro is not None and self._macro.phase == MacroPhase.BULL,
+                # never in an early warning or a bear, never on a stale or unknown phase.
+                strong_size_allowed=fresh_macro is not None and fresh_macro.phase == MacroPhase.BULL,
+                entry_block_reason=BEAR_ENTRY_BLOCK_REASON if self._bear_entry_block_active() else None,
             )
             self._latest_decisions[symbol] = decision
         except Exception as exc:  # noqa: BLE001 - one bad candidate must not kill the feed
@@ -466,24 +589,15 @@ class BotRuntime:
 
     async def manual_sell(self, symbol: str) -> ManualSellResult:
         """The owner's /sell: market-sell the whole open position in
-        `symbol`. After anything was sold the bot does not re-buy that coin
-        for MANUAL_SELL_COOLDOWN - the owner just chose to get out of it."""
+        `symbol`. The sale itself starts the no-re-buy cooldown
+        (strategy_engine.MANUAL_SELL_COOLDOWN)."""
         try:
             order_book: OrderBookSnapshot | None = await self._get_order_book(symbol)
         except Exception as exc:  # noqa: BLE001 - reported as no_order_book below
             logger.exception("Failed to fetch order book for manual sell of %s: %r", symbol, exc)
             order_book = None
         regime = self._btc_regime or _default_neutral_regime()
-        result = await self._strategy_engine.manual_sell(symbol, order_book=order_book, btc_regime=regime)
-        if result.status in ("sold", "sold_with_warning", "partial"):
-            with session_scope() as session:
-                SettingsRepository(session).set(_MANUAL_SELL_KEY.format(symbol=symbol), utcnow().isoformat())
-        return result
-
-    def _in_manual_sell_cooldown(self, symbol: str) -> bool:
-        with session_scope() as session:
-            raw = SettingsRepository(session).get(_MANUAL_SELL_KEY.format(symbol=symbol))
-        return raw is not None and utcnow() - datetime.fromisoformat(raw) < MANUAL_SELL_COOLDOWN
+        return await self._strategy_engine.manual_sell(symbol, order_book=order_book, btc_regime=regime)
 
     async def emergency_stop(self) -> list[str] | None:
         """Triggers the kill switch (stop new BUY/DCA) and, only if
@@ -548,13 +662,16 @@ class BotRuntime:
             except Exception as exc:  # noqa: BLE001 - a failed report must not kill the loop
                 logger.exception("Daily report failed: %r", exc)
                 await self._notifier.on_error(f"Daily report failed: {exc!r}")
+            if is_last_day_of_month(utcnow().date()):
+                try:
+                    await self._notifier.monthly_report(await self._monthly_report_data(month_to_date=False))
+                except Exception as exc:  # noqa: BLE001 - same as the daily report
+                    logger.exception("Monthly report failed: %r", exc)
+                    await self._notifier.on_error(f"Monthly report failed: {exc!r}")
 
-    async def _send_daily_report(self) -> None:
-        now = utcnow()
-        date_str = now.date().isoformat()
-        day_start = floor_to_timeframe(now, Timeframe.D1)
-        day_end = day_start + timedelta(days=1)
-
+    async def _equity_now(self) -> tuple[Decimal, Decimal, Decimal, int]:
+        """(equity, unrealized PnL, cost of open positions, open count).
+        Equity = free USDT (spot + Earn) + open positions at mark price."""
         mark_prices = self.get_mark_prices()
         with session_scope() as session:
             open_positions = PositionRepository(session).get_open_positions()
@@ -565,8 +682,37 @@ class BotRuntime:
                     unrealized_pnl += (price - p.avg_entry_price) * p.total_quantity
             open_count = len(open_positions)
             total_open_cost = sum((p.total_cost_usdt for p in open_positions), Decimal("0"))
+        equity = await self._trading_balance_usdt(strict=True) + total_open_cost + unrealized_pnl
+        return equity, unrealized_pnl, total_open_cost, open_count
 
-        current_balance = await self._trading_balance_usdt() + total_open_cost + unrealized_pnl
+    async def _monthly_report_data(self, *, month_to_date: bool) -> MonthlyReportData:
+        now = utcnow()
+        equity, unrealized, _cost, _count = await self._equity_now()
+        since = datetime.combine(month_start_of(now.date()), datetime.min.time(), tzinfo=now.tzinfo) - timedelta(days=1)
+        btc_daily = await self._client.get_historical_klines("BTCUSDT", "1d", since, now)
+        earn_apr: float | None = None
+        if self._earn is not None:
+            try:
+                earn_apr = (await self._earn.product()).apr
+            except Exception as exc:  # noqa: BLE001 - the report shows "н/д" instead
+                logger.warning("Earn rate for the monthly report unavailable: %r", exc)
+        with session_scope() as session:
+            return build_monthly_report(
+                session, now=now, equity_now=equity, unrealized_now=unrealized, btc_daily=btc_daily,
+                earn_apr=earn_apr, month_to_date=month_to_date, report_hour_utc=self._settings.daily_report_hour_utc,
+            )
+
+    async def get_monthly_report_text(self) -> str:
+        """/report: the month so far."""
+        return format_monthly_report(await self._monthly_report_data(month_to_date=True))
+
+    async def _send_daily_report(self) -> None:
+        now = utcnow()
+        date_str = now.date().isoformat()
+        day_start = floor_to_timeframe(now, Timeframe.D1)
+        day_end = day_start + timedelta(days=1)
+
+        current_balance, unrealized_pnl, total_open_cost, open_count = await self._equity_now()
         exposure_pct = float(total_open_cost / current_balance * 100) if current_balance > 0 else 0.0
         btc_regime_value = self._btc_regime.level.value if self._btc_regime else "unknown"
 
@@ -636,7 +782,16 @@ class BotRuntime:
             return "\n".join(lines)
 
         balances = await self._client.get_account_balances()
-        if not balances:
+        earn_line, earn_usdt = None, Decimal("0")
+        if self._earn is not None:
+            try:
+                earn_usdt = await self._earn.balance()
+                apr = (await self._earn.product()).apr
+                earn_line = f"USDT в Earn (Flexible, {apr * 100:.2f}% річних): {earn_usdt:.2f}"
+            except Exception as exc:  # noqa: BLE001 - show the rest of the balance anyway
+                logger.warning("Earn balance for /balance failed: %r", exc)
+                earn_line = "USDT в Earn: недоступно (помилка біржі)"
+        if not balances and earn_usdt <= 0:
             return "БАЛАНС (LIVE)\n(немає ненульових балансів)"
 
         mark_prices = self.get_mark_prices()
@@ -653,6 +808,9 @@ class BotRuntime:
                 total_usdt += (free + locked) * price
             else:
                 priced_everything = False
+        if earn_line is not None:
+            lines.append(earn_line)
+            total_usdt += earn_usdt
         caveat = "" if priced_everything else " (без активів поза відстежуваними парами)"
         lines.append(f"Загалом приблизно: {total_usdt:.2f} USDT{caveat}")
         return "\n".join(lines)
@@ -689,6 +847,7 @@ class BotRuntime:
             problems=tuple(self._status_problems()) if self._initialized else (),
             macro_phase=self._macro.phase.value if self._macro else None,
             macro_detail=macro_status_detail(self._macro.btc_close, self._macro.sma200) if self._macro else None,
+            bear_entry_block=self._bear_entry_block_active(),
         )
 
     def _status_problems(self) -> list[str]:

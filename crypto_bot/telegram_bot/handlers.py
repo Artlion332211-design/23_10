@@ -17,7 +17,7 @@ import functools
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -39,6 +39,7 @@ from telegram_bot.notifications import (
     close_reason_label,
     format_daily_report,
     format_macro_report,
+    format_price,
     format_status,
     regime_label,
 )
@@ -74,6 +75,8 @@ class BotContext:
     get_macro_assessment: Callable[[], MacroAssessment | None] = lambda: None
     # The owner's /sell (runtime.manual_sell); None = not available in this build.
     manual_sell: Callable[[str], Awaitable[ManualSellResult]] | None = None
+    # /report: the month so far vs BTC and "35% BTC + 65% Earn".
+    get_monthly_report_text: Callable[[], Awaitable[str]] | None = None
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -96,11 +99,31 @@ def _restricted(
 
 
 async def _reply(update: Update, text: str) -> None:
-    # effective_message also covers an EDITED command (e.g. "/sell AAVE" edited to
-    # "/sell AAVE так" on a phone), where update.message is None.
+    # effective_message also covers an edited message (edited_command_hint), where update.message is None.
     message = update.effective_message
     assert message is not None
     await message.reply_text(text)
+
+
+@_restricted
+async def edited_command_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Commands run only from new messages: editing "/sell AAVE" into
+    "/sell AAVE так" (or editing an old /emergency_stop) must not act -
+    Telegram delivers edits of messages of any age."""
+    await _reply(update, "Відредаговані повідомлення бот не виконує - надішли команду новим повідомленням.")
+
+
+async def on_handler_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Telegram handler failed for update %r", update, exc_info=context.error)
+    bot_context = context.bot_data.get(CTX_KEY)
+    if (
+        isinstance(update, Update) and update.effective_message is not None and bot_context is not None
+        and update.effective_user is not None and update.effective_user.id == bot_context.allowed_user_id
+    ):
+        try:
+            await update.effective_message.reply_text(f"⚠️ Команда завершилася з помилкою: {context.error!r}")
+        except Exception as exc:  # noqa: BLE001 - nothing more to do; already logged
+            logger.warning("Could not report the handler error to Telegram: %r", exc)
 
 
 @_restricted
@@ -131,18 +154,23 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if current is not None and p.avg_entry_price > 0:
                 pnl_pct = (current / p.avg_entry_price - 1) * 100
                 state = "у плюсі" if pnl_pct > 0 else ("у мінусі" if pnl_pct < 0 else "у нулі")
-                price_info = f"поточна={current:.4f} PnL={pnl_pct:+.2f}% ({state})"
+                price_info = f"поточна={format_price(current)} PnL={pnl_pct:+.2f}% ({state})"
             else:
                 price_info = "поточна ціна недоступна"
             lines.append(
-                f"{p.symbol}: вхід={p.avg_entry_price:.4f} к-сть={p.total_quantity:.6f} "
-                f"{price_info} ціль={p.target_price:.4f} DCA={p.dca_count}/{max_dca} "
+                f"{p.symbol}: вхід={format_price(p.avg_entry_price)} к-сть={p.total_quantity:.6f} "
+                f"{price_info} ціль={format_price(p.target_price)} DCA={p.dca_count}/{max_dca} "
                 f"відкрито={p.opened_at.date()}"
             )
     await _reply(update, "\n".join(lines))
 
 
 _SELL_CONFIRM_WORDS = {"так", "yes", "confirm", "підтверджую"}
+# "/sell AAVE так" sells only right after "/sell AAVE" showed the position:
+# a confirmation typed from memory (or a stale one scrolled back to and
+# resent) must not sell what the owner hasn't just looked at.
+SELL_CONFIRM_WINDOW = timedelta(minutes=2)
+_SELL_PENDING_KEY = "sell_pending"
 
 
 def _sell_symbol(raw: str) -> str:
@@ -150,21 +178,16 @@ def _sell_symbol(raw: str) -> str:
     return symbol if symbol.endswith("USDT") else f"{symbol}USDT"
 
 
-def _price(value: Decimal) -> str:
-    """4 decimals for normal prices, enough significant digits for sub-cent coins (PEPE)."""
-    if value >= 1:
-        return f"{value:.4f}"
-    return f"{value:.10f}".rstrip("0").rstrip(".") or "0"
-
-
 @_restricted
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/sell -> list; /sell AAVE -> show it and ask to confirm; /sell AAVE так -> market sell.
-    Two steps on purpose: the owner is often on a phone, and a mistyped
-    symbol must never sell a position by itself."""
+    """/sell -> list; /sell AAVE -> show it and ask to confirm; /sell AAVE так
+    (within SELL_CONFIRM_WINDOW of that) -> market sell. Two steps on
+    purpose: the owner is often on a phone, and a mistyped symbol must never
+    sell a position by itself."""
     ctx = _ctx(context)
     args = list(context.args or [])
     mark_prices = ctx.get_mark_prices()
+    pending: dict[str, datetime] = context.bot_data.setdefault(_SELL_PENDING_KEY, {})
     with session_scope() as session:
         positions = {p.symbol: (p.avg_entry_price, p.total_quantity) for p in PositionRepository(session).get_open_positions()}
     if not args:
@@ -175,7 +198,9 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, f"Продаж по ринку. Відкриті позиції: {names}\nНапиши, наприклад: /sell {sorted(positions)[0].removesuffix('USDT')}")
         return
     symbol = _sell_symbol(args[0])
+    coin = symbol.removesuffix("USDT")
     if symbol not in positions:
+        pending.pop(symbol, None)
         await _reply(update, f"Позиції {symbol} немає серед відкритих. Список: /sell")
         return
     avg_entry, quantity = positions[symbol]
@@ -184,15 +209,21 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if current is not None and avg_entry > 0:
             pnl_pct = (current / avg_entry - 1) * 100
             pnl_usdt = (current - avg_entry) * quantity
-            info = f"Зараз {_price(current)}, вхід {_price(avg_entry)}: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%) без комісій"
+            info = f"Зараз {format_price(current)}, вхід {format_price(avg_entry)}: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%) без комісій"
         else:
-            info = f"Вхід {_price(avg_entry)}, поточна ціна недоступна"
+            info = f"Вхід {format_price(avg_entry)}, поточна ціна недоступна"
+        pending[symbol] = utcnow() + SELL_CONFIRM_WINDOW
+        minutes = int(SELL_CONFIRM_WINDOW.total_seconds() // 60)
         await _reply(
             update,
             f"⚠️ ПРОДАТИ ВСЮ ПОЗИЦІЮ {symbol} ПО РИНКУ?\nКількість: {quantity}\n{info}\n"
-            f"Для підтвердження напиши: /sell {symbol.removesuffix('USDT')} так\n"
-            "Після продажу бот не купуватиме цю монету 24 години.",
+            f"Для підтвердження протягом {minutes} хв напиши: /sell {coin} так\n"
+            "Після продажу бот не купуватиме і не докуповуватиме цю монету 24 години.",
         )
+        return
+    expires = pending.pop(symbol, None)
+    if expires is None or utcnow() > expires:
+        await _reply(update, f"Спершу напиши /sell {coin} - я покажу позицію, і тоді підтверди.")
         return
     if ctx.manual_sell is None:
         await _reply(update, "Продаж через Telegram недоступний у цій версії бота.")
@@ -201,7 +232,13 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, f"Продаю {symbol} по ринку...")
     except Exception as exc:  # noqa: BLE001 - the owner confirmed: a failed courtesy reply must not stop the sale
         logger.warning("Could not send the /sell progress reply: %r", exc)
-    result = await ctx.manual_sell(symbol)
+    try:
+        result = await ctx.manual_sell(symbol)
+    except Exception as exc:  # noqa: BLE001 - the order may or may not have gone through
+        logger.exception("Manual sell of %s raised: %r", symbol, exc)
+        await _reply(update, f"⚠️ Під час продажу {symbol} сталася помилка ({exc!r}) - результат невідомий.\n"
+                             "Перевір /positions і Binance, перш ніж повторювати.")
+        return
     await _reply(update, _sell_reply(symbol, result))
 
 
@@ -211,15 +248,29 @@ def _sell_reply(symbol: str, result: ManualSellResult) -> str:
         return f"✅ {symbol} продано повністю. Підсумок угоди - в окремому повідомленні."
     if result.status == "sold_with_warning":
         return f"✅ {symbol} продано, але є попередження.{detail}"
+    coin = symbol.removesuffix("USDT")
     if result.status == "partial":
         return (f"⚠️ {symbol} продано ЧАСТКОВО - залишок {result.remaining} ще у позиції.{detail}\n"
-                f"Повтори /sell {symbol.removesuffix('USDT')} так, щоб продати решту.")
+                f"Щоб продати решту: /sell {coin}, потім /sell {coin} так.")
+    if result.status == "pending":
+        return (f"⏳ Ордер на продаж {symbol} надіслано, але біржа ще не підтвердила виконання. "
+                "Бот сам дізнається результат за хвилину-дві й надішле підсумок; перевір /positions, "
+                "перш ніж продавати ще раз.")
     if result.status == "no_position":
         return f"Позиції {symbol} вже немає - можливо, її щойно закрив сам бот."
     if result.status == "no_order_book":
         return f"❌ Не вдалося отримати ціни {symbol} з біржі - нічого не продано. Спробуй ще раз."
     left = f" Залишок у позиції: {result.remaining}." if result.remaining is not None else ""
     return f"❌ Продаж {symbol} не виконано.{left}{detail}\nПеревір /positions і Binance."
+
+
+@_restricted
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = _ctx(context)
+    if ctx.get_monthly_report_text is None:
+        await _reply(update, "Звіт недоступний у цій версії бота.")
+        return
+    await _reply(update, await ctx.get_monthly_report_text())
 
 
 @_restricted
@@ -326,7 +377,7 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reasons = "\n".join(regime.reasons[:5]) if regime.reasons else "-"
         parts.append(f"Зараз (15 хв - 4 год), BTC: {regime_label(regime.level.value)} (бал {regime.score:.0f})\n{reasons}")
     if macro is not None:
-        parts.append(format_macro_report(macro))
+        parts.append(format_macro_report(macro, entry_block=_ctx(context).settings.bear_entry_block))
     await _reply(update, "\n\n".join(parts))
 
 
@@ -352,7 +403,7 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"INITIAL_ORDER_USDT={s.initial_order_usdt}  MAX_POSITION_USDT={s.max_position_usdt}",
         (f"STRONG_SIGNAL_ORDER_USDT={s.strong_signal_order_usdt} (бал >= потрібний + {s.strong_signal_score_margin:g}, "
          "лише коли довгострокова фаза ринку = 🟢 ЗРОСТАННЯ, див. /market)")
-        if s.strong_signal_order_usdt > s.initial_order_usdt else "Збільшений вхід на сильному сигналі: вимкнено",
+        if s.strong_signal_off_reason is None else f"Збільшений вхід на сильному сигналі: вимкнено ({s.strong_signal_off_reason})",
         f"MAX_OPEN_POSITIONS={s.max_open_positions}  MAX_TOTAL_EXPOSURE_PERCENT={s.max_total_exposure_percent}%",
         f"TARGET_PROFIT_PERCENT={s.target_profit_percent}%  USE_TRAILING_AFTER_TP={s.use_trailing_after_tp}",
         f"MIN_BUY_SCORE={s.min_buy_score}  MIN_DCA_SCORE={s.min_dca_score}",

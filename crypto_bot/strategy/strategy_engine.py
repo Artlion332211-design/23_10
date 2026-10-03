@@ -28,9 +28,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from config.settings import RulesConfig, Settings
 from database.models import (
@@ -41,7 +43,12 @@ from database.models import (
     PositionStatus,
     SignalDecision,
 )
-from database.repository import OrderRepository, PositionRepository, SignalRepository
+from database.repository import (
+    OrderRepository,
+    PositionRepository,
+    SettingsRepository,
+    SignalRepository,
+)
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionResult
 from market.market_data import MarketDataStore
@@ -110,17 +117,37 @@ class BuyExecutedEvent:
     strong_signal: bool = False  # entered with STRONG_SIGNAL_ORDER_USDT
 
 
-_PARTIAL_FILL = "біржа продала лише частину (мало покупців у стакані)"
+ManualSellStatus = Literal[
+    "sold", "sold_with_warning", "partial", "pending", "failed", "no_position", "no_order_book",
+]
+# After the owner's /sell the bot neither re-buys nor DCAs that coin for a
+# while - he just chose to get out of it. Written in the same transaction
+# that applies the sale, so a fill the order poll resolves later counts too.
+MANUAL_SELL_COOLDOWN = timedelta(hours=24)
+MANUAL_SELL_COOLDOWN_KEY = "manual_sell_at:{symbol}"
+
+
+def in_manual_sell_cooldown(symbol: str) -> bool:
+    with session_scope() as session:
+        raw = SettingsRepository(session).get(MANUAL_SELL_COOLDOWN_KEY.format(symbol=symbol))
+    return raw is not None and utcnow() - datetime.fromisoformat(raw) < MANUAL_SELL_COOLDOWN
 
 
 @dataclass(frozen=True)
 class ManualSellResult:
-    """Outcome of the owner's /sell. status: sold | sold_with_warning |
-    partial | failed | no_position | no_order_book."""
+    """Outcome of the owner's /sell."""
 
-    status: str
-    detail: str | None = None
+    status: ManualSellStatus
+    detail: str | None = None  # plain-Ukrainian reasons/warnings, shown in the /sell reply
     remaining: Decimal | None = None  # quantity still held when not fully sold
+
+
+@dataclass
+class _ForceSellOutcome:
+    sold: bool  # the position ended up CLOSED, with nothing unconfirmed left behind
+    partial: bool = False  # Binance filled only part of the MARKET sell
+    pending: bool = False  # the sell's outcome is unknown yet (the order poll will resolve it)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -178,6 +205,10 @@ class DelayedFillEvent:
     usdt_amount: Decimal
     purpose: str
     position_id: int
+
+
+# Makes sure spot holds the given USDT amount for a buy; False = it couldn't.
+FundsProvider = Callable[[Decimal], Awaitable[bool]]
 
 
 class StrategyNotifier(Protocol):
@@ -240,8 +271,12 @@ class StrategyEngine:
         market_data: MarketDataStore,
         news_provider: NewsProvider,
         notifier: StrategyNotifier | None = None,
+        funds_provider: FundsProvider | None = None,
     ) -> None:
         self._settings = settings
+        # Brings USDT back from Simple Earn before a buy (exchange/earn.py);
+        # None = all the money is on spot already.
+        self._funds_provider = funds_provider
         self._rules = rules
         self._signal_engine = signal_engine
         self._risk_manager = risk_manager
@@ -410,15 +445,23 @@ class StrategyEngine:
         order_book: OrderBookSnapshot,
         open_position_symbols: list[str] | None = None,
         strong_size_allowed: bool = False,
+        entry_block_reason: str | None = None,
     ) -> TradeDecision:
         """`strong_size_allowed`: the caller's long-term market check (the
-        bigger entry is only ever used while the long-term phase is BULL)."""
+        bigger entry is only ever used while the long-term phase is BULL).
+        `entry_block_reason`: the caller forbids new entries right now (the
+        bear-market gate); the candidate is still scored and recorded, so
+        the signals table keeps showing what the bot sees."""
         decision = await self.evaluate_candidate(symbol, btc_regime=btc_regime, open_position_symbols=open_position_symbols)
         self._record_signal(decision)
 
         if decision.action != "BUY":
             await self._notifier.on_no_trade(decision)
             return decision
+        if entry_block_reason is not None:
+            blocked = replace(decision, action="BLOCKED", reasons=[entry_block_reason])
+            await self._notifier.on_no_trade(blocked)
+            return blocked
 
         liquidity_check = check_liquidity_fresh(order_book, self._settings)
         if not liquidity_check.passed:
@@ -429,7 +472,7 @@ class StrategyEngine:
         await self._notifier.on_buy_signal(decision)
 
         strong = strong_size_allowed and self.is_strong_signal(decision)
-        order_usdt = self._settings.strong_signal_order_usdt if strong else self._settings.initial_order_usdt
+        order_usdt = self._settings.effective_strong_order_usdt if strong else self._settings.initial_order_usdt
         risk_decision = self._risk_manager.can_open_new_position(
             requested_usdt=order_usdt,
             trading_balance_usdt=trading_balance_usdt,
@@ -446,6 +489,13 @@ class StrategyEngine:
             blocked = replace(decision, action="BLOCKED", reasons=risk_decision.reasons)
             await self._notifier.on_no_trade(blocked)
             return blocked
+        if not await self._ensure_spot_funds(order_usdt, symbol, "entry"):
+            return replace(decision, action="BLOCKED", reasons=["USDT could not be brought back from Earn"])
+        flags = self._risk_manager.status()
+        if flags.emergency_stop or flags.buy_paused:
+            # An Earn redemption can take seconds: /emergency_stop or /pause
+            # may have arrived since the risk check above.
+            return replace(decision, action="BLOCKED", reasons=["buying stopped while USDT came back from Earn"])
 
         result = await self._execution_engine.buy(
             symbol=symbol, usdt_amount=order_usdt, reference_price=order_book.mid_price,
@@ -477,13 +527,26 @@ class StrategyEngine:
         )
         return replace(decision, action="BUY")
 
+    async def _ensure_spot_funds(self, usdt_amount: Decimal, symbol: str, what: str) -> bool:
+        if self._funds_provider is None:
+            return True
+        try:
+            if await self._funds_provider(usdt_amount):
+                return True
+            problem = "not enough USDT on spot even after redeeming from Earn"
+        except Exception as exc:  # noqa: BLE001 - a failed transfer skips this buy, never crashes the loop
+            logger.exception("Earn redemption for the %s %s buy failed: %r", symbol, what, exc)
+            problem = f"redeeming from Earn failed: {exc!r}"
+        await self._notifier.on_error(f"{what} buy for {symbol} skipped ({usdt_amount} USDT): {problem}")
+        return False
+
     def is_strong_signal(self, decision: TradeDecision) -> bool:
         """The score beats what the current BTC regime requires by at least
         STRONG_SIGNAL_SCORE_MARGIN. Relative, not an absolute score: in weak
         markets the required score is already 80-85, so an absolute "80+"
         rule would put the bigger entries exactly into the riskiest regimes."""
         return (
-            self._settings.strong_signal_order_usdt > self._settings.initial_order_usdt
+            self._settings.strong_signal_off_reason is None
             and decision.breakdown.final_score >= decision.required_score + self._settings.strong_signal_score_margin
         )
 
@@ -669,6 +732,11 @@ class StrategyEngine:
         )
         if level is None:
             return
+        if in_manual_sell_cooldown(symbol):
+            # Only a /sell that Binance filled partially leaves a position
+            # behind - averaging down into it would undo the owner's sale.
+            logger.info("DCA level %s reached for %s but the owner sold it by hand recently - no DCA", level.level_index, symbol)
+            return
         if trading_balance_usdt is None:
             logger.info(
                 "DCA level %s reached for %s but the trading balance is unavailable this cycle - DCA waits for the next tick",
@@ -698,6 +766,13 @@ class StrategyEngine:
                 await self._notifier.on_no_trade(replace(decision, action="NO_TRADE", reasons=reasons))
             return
 
+        # Funds first: a redemption that keeps failing must not announce a
+        # "DCA signal" (and write a signal row) every minute.
+        if not await self._ensure_spot_funds(level.size_usdt, symbol, "DCA"):
+            return
+        flags = self._risk_manager.status()
+        if flags.emergency_stop or flags.dca_paused:
+            return  # stopped while USDT came back from Earn
         self._dca_decisions.pop(position_id, None)
         self._record_signal(replace(decision, action="DCA"))
         await self._notifier.on_dca_signal(replace(decision, action="DCA"))
@@ -883,6 +958,8 @@ class StrategyEngine:
                 position, sold_quantity=result.filled_quantity, proceeds_usdt=proceeds, now=utcnow(),
                 close_reason=reason, unsellable_below=unsellable,
             )
+            if reason == _EXIT_CLOSE_REASON[OrderPurpose.MANUAL_SELL]:
+                SettingsRepository(session).set(MANUAL_SELL_COOLDOWN_KEY.format(symbol=symbol), utcnow().isoformat())
             cumulative_pnl = position.realized_pnl_usdt
             cumulative_pnl_pct = position.realized_pnl_pct
 
@@ -1040,10 +1117,10 @@ class StrategyEngine:
                 await self._notifier.on_error(f"Emergency liquidation for {symbol} skipped: no order book available")
                 continue
             try:
-                liquidated, _detail = await self._force_sell_position(
+                liquidated = (await self._force_sell_position(
                     position_id, symbol, order_book=order_book, btc_regime=btc_regime,
                     purpose=OrderPurpose.EMERGENCY_SELL, label="Emergency liquidation",
-                )
+                )).sold
             except Exception as exc:  # noqa: BLE001 - one coin's failure must not stop the kill switch selling the rest
                 logger.exception("Emergency liquidation for %s failed: %r", symbol, exc)
                 await self._notifier.on_error(f"Emergency liquidation for {symbol} failed: {exc!r} - check Binance manually")
@@ -1068,7 +1145,7 @@ class StrategyEngine:
             if order_book is None or order_book.is_empty:
                 return ManualSellResult("no_order_book")
             try:
-                sold, detail = await self._force_sell_position(
+                outcome = await self._force_sell_position(
                     position_id, symbol, order_book=order_book, btc_regime=btc_regime,
                     purpose=OrderPurpose.MANUAL_SELL, label="Manual sell",
                 )
@@ -1079,21 +1156,24 @@ class StrategyEngine:
             with session_scope() as session:
                 left = PositionRepository(session).get(position_id)
                 remaining = left.total_quantity if left is not None and left.status == PositionStatus.OPEN else None
+            detail = "; ".join(outcome.notes) or None
             if remaining is None:
-                return ManualSellResult("sold" if sold else "sold_with_warning", detail)
-            if detail == _PARTIAL_FILL:
+                return ManualSellResult("sold" if outcome.sold else "sold_with_warning", detail)
+            if outcome.partial:
                 return ManualSellResult("partial", detail, remaining=remaining)
+            if outcome.pending:
+                return ManualSellResult("pending", detail, remaining=remaining)
             return ManualSellResult("failed", detail, remaining=remaining)
 
     async def _force_sell_position(
         self, position_id: int, symbol: str, *, order_book: OrderBookSnapshot, btc_regime: RegimeAssessment,
         purpose: OrderPurpose, label: str,
-    ) -> tuple[bool, str | None]:
+    ) -> _ForceSellOutcome:
         """Market-sells one whole position (emergency liquidation or the
-        owner's /sell). Returns (cleanly sold, reason in plain Ukrainian when
-        not). Only a position that ended up CLOSED counts as sold: a MARKET
-        sell that Binance cut short (EXPIRED after a partial fill on a thin
-        book) leaves the rest open and must not be reported as done."""
+        owner's /sell). Only a position that ended up CLOSED counts as sold:
+        a MARKET sell that Binance cut short (EXPIRED after a partial fill on
+        a thin book) leaves the rest open and must not be reported as done.
+        The notes say why in plain Ukrainian, for the /sell reply."""
         # Runs in the Telegram handler's task, concurrently with the
         # position monitor: held from the cancel through the sell so
         # manage_position can't read the same OPEN quantity and sell it
@@ -1108,15 +1188,17 @@ class StrategyEngine:
                 await self._notifier.on_error(
                     f"{label} for {symbol} skipped: a resting SELL could not be confirmed cancelled"
                 )
-                return False, ("на біржі висить ордер на продаж цієї монети, і його не вдалося скасувати - "
-                               "нічого не продано; скасуй його на Binance і повтори")
-            clean, detail = True, None
+                return _ForceSellOutcome(sold=False, notes=[
+                    "на біржі висить ордер на продаж цієї монети, і його не вдалося скасувати - нічого не продано; "
+                    "скасуй його на Binance і повтори"
+                ])
+            result = _ForceSellOutcome(sold=True)
             if unconfirmed:
                 # The sell below still goes ahead, but a live DCA BUY
                 # could refill the position after it: the kill switch
                 # must not report this symbol as cleanly liquidated.
-                clean = False
-                detail = "ордер докупки (DCA) не вдалося скасувати - скасуй його на Binance вручну"
+                result.sold = False
+                result.notes.append("ордер докупки (DCA) не вдалося скасувати - скасуй його на Binance вручну")
                 await self._notifier.on_error(
                     f"{label} for {symbol}: DCA order(s) "
                     f"{', '.join(o.client_order_id for o in unconfirmed)} could not be confirmed cancelled - "
@@ -1125,26 +1207,44 @@ class StrategyEngine:
             with session_scope() as session:
                 position = PositionRepository(session).get(position_id)
                 if position is None or position.status != PositionStatus.OPEN:
-                    return clean, detail  # a cancelled order's own fill already closed it
+                    return result  # a cancelled order's own fill already closed it
                 quantity = position.total_quantity
             if quantity <= 0:
-                return clean, detail
+                return result
             errors: list[str] = []
-            outcome = await self._submit_and_apply_sell(
+            sell = await self._submit_and_apply_sell(
                 position_id, symbol=symbol, quantity=quantity, reference_price=order_book.mid_price,
                 spread_percent=Decimal("0"),  # force MARKET: a forced sell must not wait in a resting LIMIT order
                 purpose=purpose, reason=_EXIT_CLOSE_REASON[purpose], error_context=f"{label} SELL", error_sink=errors,
             )
-        if outcome is None:
-            if errors:
-                return False, f"біржа відхилила продаж: {errors[0]}"
-            # Accepted but not confirmed filled yet (e.g. the response was lost):
-            # the order poll resolves it and closes the position then.
-            return False, "біржа ще не підтвердила продаж - результат буде за хвилину-дві, перевір /positions"
-        if not outcome[1]:
+        if sell is None:
+            result.sold = False
+            if self._has_resting_sell(position_id):
+                # Outcome not known yet (the response was lost or Binance
+                # answered 5xx - the order row stays NEW, even though the
+                # submit came back "not accepted"): the order poll resolves
+                # it and closes the position then.
+                result.pending = True
+                result.notes.append("біржа ще не підтвердила продаж - результат буде за хвилину-дві, перевір /positions")
+            elif errors:
+                result.notes.append(f"біржа відхилила продаж: {errors[0]}")
+            else:
+                # e.g. EXPIRED with nothing filled on an empty book: the order is dead.
+                result.notes.append("біржа не виконала ордер (немає покупців за ринковою ціною) - нічого не продано")
+            return result
+        if not sell[1]:
             await self._notifier.on_error(f"{label} for {symbol}: Binance filled only part of the MARKET sell")
-            return False, _PARTIAL_FILL
-        return clean, detail
+            result.sold, result.partial = False, True
+            result.notes.insert(0, "біржа продала лише частину (мало покупців у стакані)")
+        return result
+
+    @staticmethod
+    def _has_resting_sell(position_id: int) -> bool:
+        with session_scope() as session:
+            return any(
+                o.side == OrderSide.SELL and o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
+                for o in OrderRepository(session).for_position(position_id)
+            )
 
     # ------------------------------------------------------------------
     # Delayed resolution of LIMIT orders that were resting at submit time

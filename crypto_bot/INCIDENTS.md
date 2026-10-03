@@ -113,3 +113,31 @@ happened; keep network calls outside locks.
 daily-report test built "an hour ago" from the wall clock, which is
 yesterday in that hour. It would have blocked a night-time deploy (tests run
 on the server first). Lesson: tests must never depend on the time of day.
+
+## 2026-10-03
+
+**15. Review of the deployed /sell and 50 USDT entry (9b64255) - fixed before
+any of it bit.** Found by a post-deploy review, none happened in production:
+an edited Telegram message re-ran its command (editing an old "/sell AAVE"
+into "/sell AAVE так" sold at once; an edited old /emergency_stop would have
+fired again); "/sell AAVE так" sold without the prompt that shows the
+position; a sale whose response was lost was reported as "біржа відхилила"
+although it may have filled, and an EXPIRED sale with no fill as "not
+confirmed yet"; the 24 h no-re-buy cooldown was written by the Telegram
+path only, so a fill the order poll resolved later never set it, and DCA
+could still average into what a partial sale left; an exception after
+"Продаю..." left the owner without any answer; a long sale blocked every
+other command (including /emergency_stop) behind it; a STRONG_SIGNAL setting
+that didn't fit the position cap stopped the bot at startup. Lessons: an
+"outcome unknown" order must be checked against what the exchange holds
+before telling the owner anything; a rule tied to a fill belongs in the
+transaction that applies the fill; Telegram edits are new commands unless
+filtered; an optional extra must never be able to stop a live bot.
+
+**16. Claude's own slips while building the 2026-10-03 changes (caught by
+tests, nothing deployed).** Python edits sent through a bash heredoc turned
+`\n` inside f-strings into real line breaks (SyntaxError in the Telegram
+handlers); and a scratch script name collided with an older one, so the old
+mutation script ran first (harmless - it restores every file byte for
+byte). Lessons: write multi-line code edits with the editor tool or a script
+file, never a heredoc with backslashes; give scratch scripts unique names.
