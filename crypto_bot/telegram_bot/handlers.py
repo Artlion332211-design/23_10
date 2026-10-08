@@ -17,11 +17,11 @@ import functools
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config.settings import RulesConfig, Settings
@@ -30,8 +30,21 @@ from database.session import session_scope
 from market.macro_regime import MacroAssessment
 from market.market_regime import RegimeAssessment
 from news.news_engine import NewsEngine
+from orchestration.daily_report import month_closed_trades
 from risk.risk_manager import RiskManager
 from strategy.strategy_engine import ManualSellResult, TradeDecision
+from telegram_bot.keyboard import (
+    BUTTON_BALANCE,
+    BUTTON_HISTORY,
+    BUTTON_MARKET,
+    BUTTON_PAUSE,
+    BUTTON_POSITIONS,
+    BUTTON_REPORT,
+    BUTTON_RESUME,
+    BUTTON_STATUS,
+    BUTTON_STOP,
+    main_keyboard,
+)
 from telegram_bot.notifications import (
     SIGNAL_LABELS,
     DailyReportData,
@@ -307,10 +320,11 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     today = utcnow().date().isoformat()
     with session_scope() as session:
         stat = DailyStatRepository(session).get(today)
-    if stat is None:
+        data = DailyReportData.from_model(stat, month_closed_trades(session, today)) if stat is not None else None
+    if data is None:
         await _reply(update, f"Ще немає статистики за {today}.")
         return
-    await _reply(update, format_daily_report(DailyReportData.from_model(stat)))
+    await _reply(update, format_daily_report(data))
 
 
 @_restricted
@@ -438,3 +452,109 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Нові купівлі та DCA вимкнено. EMERGENCY_AUTO_SELL активний: "
             "усі відкриті позиції успішно продано за ринком.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Main-screen buttons (telegram_bot/keyboard.py)
+# ---------------------------------------------------------------------------
+
+# A tap on Pause / Resume / STOP only asks; the action needs "✅ Так" within
+# this window, once. A stray tap on the phone must never change trading, and
+# an old confirmation scrolled back to must not resume buying hours later.
+CONTROL_CONFIRM_WINDOW = timedelta(minutes=2)
+_CONTROL_USED_KEY = "control_confirmed_messages"
+
+
+@_restricted
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start: (re)shows the main-screen buttons."""
+    message = update.effective_message
+    assert message is not None
+    await message.reply_text(
+        "Кнопки внизу екрана: стан бота, позиції, баланс, ринок, звіт за місяць, історія угод. "
+        "Пауза, Продовжити і СТОП спершу питають підтвердження. Усі інші команди - у меню «/».",
+        reply_markup=main_keyboard(),
+    )
+
+
+def _control_prompt(action: str, ctx: BotContext) -> str:
+    if action == "pause":
+        return "⏸ Зупинити НОВІ купівлі? Відкриті позиції бот веде далі (продаж у плюс, докупки)."
+    if action == "resume":
+        return "▶️ Відновити купівлі й докупки? Якщо була аварійна зупинка, її теж буде знято."
+    text = "🛑 АВАРІЙНА ЗУПИНКА: вимкнути всі купівлі й докупки?"
+    if ctx.settings.emergency_auto_sell:
+        text += "\n⚠️ Увімкнено EMERGENCY_AUTO_SELL: бот одразу ПРОДАСТЬ УСІ позиції по ринку."
+    else:
+        text += " Відкриті позиції лишаються, бот їх і далі веде."
+    return text + "\n(Команда /emergency_stop спрацьовує одразу, без цього питання.)"
+
+
+_CONTROL_BUTTONS = {BUTTON_PAUSE: "pause", BUTTON_RESUME: "resume", BUTTON_STOP: "stop"}
+_CONFIRM_LABELS = {"pause": "✅ Так, пауза", "resume": "✅ Так, відновити", "stop": "✅ Так, зупинити"}
+
+
+@_restricted
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    assert message is not None
+    label = message.text or ""
+    action = _CONTROL_BUTTONS.get(label)
+    if action is not None:
+        issued = int(utcnow().timestamp())
+        await message.reply_text(
+            _control_prompt(action, _ctx(context)),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(_CONFIRM_LABELS[action], callback_data=f"ctl:{action}:{issued}"),
+                InlineKeyboardButton("❌ Скасувати", callback_data="ctl:cancel"),
+            ]]),
+        )
+        return
+    handler = _INFO_BUTTONS.get(label)
+    if handler is not None:
+        context.args = []
+        await handler(update, context)
+
+
+@_restricted
+async def on_control_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    assert query is not None
+    parts = (query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else "cancel"
+    message_id = query.message.message_id if query.message is not None else None
+    used: set[int] = context.bot_data.setdefault(_CONTROL_USED_KEY, set())
+    if message_id is not None and message_id in used:
+        await query.answer("Вже виконано")  # a second tap on the same prompt
+        return
+    await query.answer()
+    if action == "cancel" or action not in _CONTROL_ACTIONS or len(parts) < 3 or not parts[2].isdigit():
+        if message_id is not None:
+            used.add(message_id)
+        await query.edit_message_text("❌ Скасовано - нічого не змінено.")
+        return
+    issued = datetime.fromtimestamp(int(parts[2]), tz=UTC)
+    if utcnow() - issued > CONTROL_CONFIRM_WINDOW:
+        await query.edit_message_text("⌛ Час на підтвердження минув - нічого не змінено. Натисни кнопку ще раз.")
+        return
+    # The action first, the cosmetic button removal after: a failed edit
+    # (Telegram hiccup) must never swallow an emergency stop. Marked used
+    # only once the action ran, so a failed action can be retried.
+    await _CONTROL_ACTIONS[action](update, context)
+    if message_id is not None:
+        used.add(message_id)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:  # noqa: BLE001 - the action already ran; a second tap now answers "Вже виконано"
+        logger.warning("Could not remove the confirm buttons: %r", exc)
+
+
+_INFO_BUTTONS = {
+    BUTTON_STATUS: cmd_status,
+    BUTTON_POSITIONS: cmd_positions,
+    BUTTON_BALANCE: cmd_balance,
+    BUTTON_MARKET: cmd_market,
+    BUTTON_REPORT: cmd_report,
+    BUTTON_HISTORY: cmd_history,
+}
+_CONTROL_ACTIONS = {"pause": cmd_pause, "resume": cmd_resume, "stop": cmd_emergency_stop}

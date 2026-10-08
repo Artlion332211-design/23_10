@@ -285,9 +285,10 @@ def test_get_balance_text_live_mode_shows_total_usdt_value(settings, rules):
 
     text = asyncio.run(runtime.get_balance_text())
 
-    assert "БАЛАНС (LIVE)" in text
-    assert "SOL: вільно=2" in text
-    assert "Загалом приблизно: 700.00 USDT" in text
+    assert text.splitlines()[0] == "💰 БАЛАНС"
+    assert "💵 USDT на споті: 500.00" in text
+    assert "🪙 У монетах: 200.00 USDT" in text and "SOL 200.00" in text
+    assert "Разом: ~700.00 USDT" in text
 
 
 def test_build_status_snapshot_reports_unrealized_pnl(db_engine, settings, rules):
@@ -668,8 +669,8 @@ def test_balance_shows_the_earn_line(db_engine, settings, rules):
 
     text = asyncio.run(runtime.get_balance_text())
 
-    assert "USDT в Earn (Flexible, 2.65% річних): 900.00" in text
-    assert "Загалом приблизно: 1050.00 USDT" in text
+    assert "🏦 USDT в Earn (депозит, 2.65% річних): 900.00" in text
+    assert "Разом: ~1050.00 USDT" in text
 
 
 def test_an_earn_outage_alerts_once_without_a_false_recovered_message(db_engine, settings, rules):
@@ -750,3 +751,33 @@ def test_a_sweep_that_moved_money_is_reported_even_if_the_totals_cannot_be_read(
 
     notifier.on_error.assert_not_called()
     assert "850.00 USDT переміщено в Simple Earn" in notifier.status_ping.await_args.args[0]
+
+
+def test_balance_is_short_counts_dust_and_never_counts_the_earn_receipt_twice(db_engine, settings, rules):
+    """Owner 2026-10-08: /balance listed ~30 lines of dust plus LDUSDT (Binance's
+    Earn receipt) next to the Earn line; he wants where the money is, briefly."""
+    runtime, fake, _notifier = _earn_runtime(settings, rules)
+    real = fake.get_account_balances
+
+    async def balances():
+        out = await real()
+        out.update({
+            "AVAX": (Decimal("5"), Decimal("0")), "SC": (Decimal("500"), Decimal("0")),
+            "BNB": (Decimal("0.00000037"), Decimal("0")), "LDUSDT": (Decimal("800"), Decimal("0")),
+        })
+        return out
+
+    runtime._client.get_account_balances = balances
+    runtime.get_mark_prices = lambda: {"AVAXUSDT": Decimal("11"), "BNBUSDT": Decimal("600")}
+
+    text = asyncio.run(runtime.get_balance_text())
+
+    assert text == (
+        "💰 БАЛАНС\n"
+        "💵 USDT на споті: 150.00\n"
+        "🏦 USDT в Earn (депозит, 2.65% річних): 900.00\n"
+        "🪙 У монетах: 55.00 USDT\n"
+        "   AVAX 55.00\n"
+        "🧹 Дрібні залишки: 2 монет (менше 1 USDT або без ціни, у підсумок не входять)\n"
+        "Разом: ~1105.00 USDT"
+    )

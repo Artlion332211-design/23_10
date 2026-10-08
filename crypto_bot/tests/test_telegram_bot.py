@@ -96,3 +96,31 @@ def test_command_menu_is_set_for_the_owner_chat_only_in_menu_order():
     assert app.bot.set_my_commands.await_args.kwargs["scope"].chat_id == 42
     app.bot.delete_my_commands.assert_awaited_once_with()  # the public default-scope menu
     assert {c.command for c in menu_commands()} == set(_COMMANDS)
+
+
+def _text_update(text: str, *, edited: bool = False) -> Update:
+    message = Message(
+        message_id=2, date=datetime.now(UTC), chat=Chat(id=42, type="private"),
+        from_user=User(id=42, first_name="owner", is_bot=False), text=text,
+    )
+    message.set_bot(MagicMock(username="cryptobot"))
+    return Update(update_id=2, edited_message=message) if edited else Update(update_id=2, message=message)
+
+
+def test_button_presses_and_confirmations_reach_their_handlers():
+    from telegram import CallbackQuery
+
+    from telegram_bot.handlers import on_button, on_control_confirm
+
+    app = create_application(_FAKE_TOKEN)
+    attach_context(app, MagicMock())
+
+    pressed = _matching(app, _text_update("📊 Статус"))
+    assert [h.callback for h in pressed] == [on_button]
+    assert pressed[0].block is False
+    assert _matching(app, _text_update("📊 Статус", edited=True)) == []  # edits never act
+    assert _matching(app, _text_update("просто текст")) == []
+
+    query = CallbackQuery(id="1", from_user=User(id=42, first_name="owner", is_bot=False), chat_instance="c",
+                          data="ctl:pause:1")
+    assert [h.callback for h in _matching(app, Update(update_id=3, callback_query=query))] == [on_control_confirm]

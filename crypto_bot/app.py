@@ -53,6 +53,7 @@ from strategy.signal_engine import SignalEngine
 from strategy.strategy_engine import StrategyEngine
 from telegram_bot.bot import TelegramBotRunner, attach_context, create_application
 from telegram_bot.handlers import BotContext
+from telegram_bot.keyboard import main_keyboard
 from telegram_bot.notifications import TelegramNotifier
 from utils.logging import register_secret, setup_logging
 from utils.time import utcnow
@@ -244,7 +245,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
             open_count = len(PositionRepository(session).get_open_positions())
 
         await bot_runner.start()
-        await notifier.startup(settings.mode.value, effective_dry_run, open_count)
+        await notifier.startup(settings.mode.value, effective_dry_run, open_count, reply_markup=main_keyboard())
         if report.has_warnings:
             await notifier.on_error(
                 "Startup reconciliation found position mismatches - check logs and /positions before trusting the numbers."

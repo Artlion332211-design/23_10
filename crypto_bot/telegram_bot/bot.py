@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from telegram import Bot, BotCommand, BotCommandScopeChat
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from telegram_bot.handlers import (
     CTX_KEY,
@@ -30,13 +30,17 @@ from telegram_bot.handlers import (
     cmd_resume,
     cmd_sell,
     cmd_signals,
+    cmd_start,
     cmd_start_dca,
     cmd_status,
     cmd_stop_dca,
     cmd_today,
     edited_command_hint,
+    on_button,
+    on_control_confirm,
     on_handler_error,
 )
+from telegram_bot.keyboard import ALL_BUTTONS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,7 @@ _COMMANDS = {
     "news": cmd_news,
     "config": cmd_config,
     "emergency_stop": cmd_emergency_stop,
+    "start": cmd_start,
 }
 
 # The "/" menu in Telegram, set from code at startup so it never drifts from
@@ -80,6 +85,7 @@ COMMAND_DESCRIPTIONS = {
     "stop_dca": "вимкнути докупки",
     "start_dca": "увімкнути докупки",
     "emergency_stop": "АВАРІЙНА ЗУПИНКА",
+    "start": "показати кнопки на головному екрані",
 }
 
 
@@ -110,6 +116,12 @@ def attach_context(application: Application, ctx: BotContext) -> Application:
             CommandHandler(name, handler, filters=filters.UpdateType.MESSAGE, block=name not in _NON_BLOCKING)
         )
     application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, edited_command_hint))
+    # Main-screen buttons: a press is a new text message with the label.
+    # Non-blocking like /report (the report button downloads candles).
+    application.add_handler(
+        MessageHandler(filters.UpdateType.MESSAGE & filters.Text(ALL_BUTTONS), on_button, block=False)
+    )
+    application.add_handler(CallbackQueryHandler(on_control_confirm, pattern=r"^ctl:"))
     application.add_error_handler(on_handler_error)
     return application
 

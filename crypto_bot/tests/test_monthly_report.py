@@ -178,3 +178,26 @@ def test_a_trade_closed_late_on_the_last_day_counts_in_the_next_month(db_engine)
         )
 
     assert (data.closed_trades, data.realized_pnl) == (1, Decimal("3.00"))
+
+
+def test_daily_report_shows_the_month_of_closed_trades_not_just_the_day(db_engine):
+    """Owner 2026-10-08: the report for a day without closes said +0.00 although
+    two trades had closed in profit earlier that month."""
+    from orchestration.daily_report import month_closed_trades
+    from telegram_bot.notifications import DailyReportData
+
+    _stat("2026-10-07", start="5000", end="4990")
+    _closed_trade(datetime(2026, 10, 2, 4, 52, tzinfo=UTC), "2.58")
+    _closed_trade(datetime(2026, 10, 6, 13, 50, tzinfo=UTC), "1.86")
+    _closed_trade(datetime(2026, 9, 30, 12, 0, tzinfo=UTC), "5.00")  # last month
+    _closed_trade(datetime(2026, 10, 8, 1, 0, tzinfo=UTC), "7.00")  # after the reported day
+
+    with session_scope() as session:
+        stat = DailyStatRepository(session).get("2026-10-07")
+        data = DailyReportData.from_model(stat, month_closed_trades(session, "2026-10-07"))
+
+    from telegram_bot.notifications import format_daily_report
+
+    text = format_daily_report(data)
+    assert "Реалізований PnL за день: +0.00 USDT" in text
+    assert "За місяць (закриті угоди): +4.44 USDT, закрито 2 (у плюсі 2)" in text

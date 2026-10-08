@@ -10,7 +10,7 @@ fixture without any live exchange or Telegram dependency.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -74,6 +74,18 @@ def build_daily_stat(
         best_trade_pct=best_trade_pct,
         btc_regime=btc_regime,
     )
+
+
+def month_closed_trades(session: Session, date_str: str) -> tuple[Decimal, int, int]:
+    """(realized PnL, closed trades, of them in profit) from the 1st of
+    `date_str`'s month (00:00 UTC) to the end of that day. The daily figure
+    covers one day only - an owner who saw +0.00 on a day without closes
+    asked where the month's profit is."""
+    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
+    closed = PositionRepository(session).closed_between(day.replace(day=1), day + timedelta(days=1))
+    pnl = sum((p.realized_pnl_usdt or Decimal("0") for p in closed), Decimal("0"))
+    wins = sum(1 for p in closed if (p.realized_pnl_usdt or Decimal("0")) > 0)
+    return pnl, len(closed), wins
 
 
 def _previous_date_str(date_str: str) -> str:

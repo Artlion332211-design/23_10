@@ -20,7 +20,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from database.models import DailyStat
 from strategy.strategy_engine import (
@@ -515,10 +515,16 @@ class DailyReportData:
     best_trade_symbol: str | None
     best_trade_pct: float | None
     btc_regime: str
+    # Closed trades from the 1st of the month to this day (daily_report.month_closed_trades).
+    month_realized_pnl: Decimal | None = None
+    month_closed_trades: int = 0
+    month_wins: int = 0
 
     @classmethod
-    def from_model(cls, stat: DailyStat) -> DailyReportData:
+    def from_model(cls, stat: DailyStat, month: tuple[Decimal, int, int] | None = None) -> DailyReportData:
+        month_pnl, month_closed, month_wins = month if month is not None else (None, 0, 0)
         return cls(
+            month_realized_pnl=month_pnl, month_closed_trades=month_closed, month_wins=month_wins,
             date=stat.date, starting_balance=stat.starting_balance, current_balance=stat.ending_balance,
             realized_pnl=stat.realized_pnl, unrealized_pnl=stat.unrealized_pnl, trades_count=stat.trades_count,
             closed_trades_count=stat.closed_trades_count, win_rate=stat.win_rate, fees_paid=stat.fees_paid,
@@ -530,13 +536,19 @@ class DailyReportData:
 
 def format_daily_report(data: DailyReportData) -> str:
     best_trade = f"{data.best_trade_symbol} ({data.best_trade_pct:+.2f}%)" if data.best_trade_symbol else "-"
+    month_line = (
+        f"За місяць (закриті угоди): {data.month_realized_pnl:+.2f} USDT, закрито {data.month_closed_trades} "
+        f"(у плюсі {data.month_wins})\n"
+        if data.month_realized_pnl is not None else ""
+    )
     return (
         f"ЩОДЕННИЙ ЗВІТ ({data.date})\n"
         f"Баланс на початок дня: {data.starting_balance:.2f} USDT\n"
         f"Поточний баланс:       {data.current_balance:.2f} USDT\n"
-        f"Реалізований PnL:      {data.realized_pnl:+.2f} USDT\n"
+        f"Реалізований PnL за день: {data.realized_pnl:+.2f} USDT\n"
         f"Нереалізований PnL:    {data.unrealized_pnl:+.2f} USDT\n"
         f"Угод сьогодні: {data.trades_count}  Закрито: {data.closed_trades_count}\n"
+        f"{month_line}"
         f"Успішність: {data.win_rate:.1f}%\n"
         f"Сплачено комісій: {data.fees_paid:.2f} USDT\n"
         f"Відкритих позицій: {data.open_positions_count}\n"
@@ -637,7 +649,7 @@ def format_status(snap: StatusSnapshot) -> str:
 
 
 class TelegramSender(Protocol):
-    async def send_message(self, chat_id: int, text: str) -> object: ...
+    async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> object: ...
 
 
 PublicIpProvider = Callable[[], Awaitable[str | None]]
@@ -666,11 +678,14 @@ class TelegramNotifier:
         self._active_errors: dict[str, tuple[float, int]] = {}
         self._error_categories: dict[str, ErrorCategory] = {}
 
-    async def _send(self, text: str) -> bool:
+    async def _send(self, text: str, *, reply_markup: object | None = None) -> bool:
         """True if Telegram accepted the message. Never raises - a failed
         notification must never crash the trading loop."""
         try:
-            await self._sender.send_message(chat_id=self._chat_id, text=text)
+            if reply_markup is None:
+                await self._sender.send_message(chat_id=self._chat_id, text=text)
+            else:
+                await self._sender.send_message(chat_id=self._chat_id, text=text, reply_markup=reply_markup)
         except Exception as exc:  # noqa: BLE001 - a failed notification must never crash the trading loop
             logger.error("Failed to send Telegram message: %r", exc)
             return False
@@ -737,8 +752,9 @@ class TelegramNotifier:
             self._active_errors.pop(key, None)
         await self._send(format_recovered(labels))
 
-    async def startup(self, mode: str, dry_run: bool, open_positions: int) -> None:
-        await self._send(format_startup(mode, dry_run, open_positions))
+    async def startup(self, mode: str, dry_run: bool, open_positions: int, *, reply_markup: object | None = None) -> None:
+        """`reply_markup`: the main-screen buttons, re-attached after every restart."""
+        await self._send(format_startup(mode, dry_run, open_positions), reply_markup=reply_markup)
 
     async def shutdown(self, reason: str = "") -> None:
         await self._send(format_shutdown(reason))

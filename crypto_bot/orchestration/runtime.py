@@ -56,7 +56,7 @@ from market.market_regime import MarketRegimeEngine, RegimeAssessment, RegimeLev
 from market.orderbook import OrderBookSnapshot, parse_order_book
 from market.universe_scanner import UniverseScanner
 from news.news_engine import NewsEngine
-from orchestration.daily_report import build_daily_stat
+from orchestration.daily_report import build_daily_stat, month_closed_trades
 from orchestration.monthly_report import (
     MonthlyReportData,
     build_monthly_report,
@@ -722,7 +722,7 @@ class BotRuntime:
                 current_balance=current_balance, unrealized_pnl=unrealized_pnl,
                 open_positions_count=open_count, capital_exposure_pct=exposure_pct, btc_regime=btc_regime_value,
             )
-            report_data = DailyReportData.from_model(stat)
+            report_data = DailyReportData.from_model(stat, month_closed_trades(session, date_str))
         await self._notifier.daily_report(report_data)
 
     # ------------------------------------------------------------------
@@ -787,32 +787,41 @@ class BotRuntime:
             try:
                 earn_usdt = await self._earn.balance()
                 apr = (await self._earn.product()).apr
-                earn_line = f"USDT в Earn (Flexible, {apr * 100:.2f}% річних): {earn_usdt:.2f}"
+                earn_line = f"🏦 USDT в Earn (депозит, {apr * 100:.2f}% річних): {earn_usdt:.2f}"
             except Exception as exc:  # noqa: BLE001 - show the rest of the balance anyway
                 logger.warning("Earn balance for /balance failed: %r", exc)
-                earn_line = "USDT в Earn: недоступно (помилка біржі)"
+                earn_line = "🏦 USDT в Earn: недоступно (помилка біржі)"
         if not balances and earn_usdt <= 0:
-            return "БАЛАНС (LIVE)\n(немає ненульових балансів)"
+            return "💰 БАЛАНС\n(немає ненульових балансів)"
 
+        # Short on purpose (owner 2026-10-08): where the money is and in what -
+        # spot USDT, the Earn deposit, coins worth >= 1 USDT; dust is counted only.
         mark_prices = self.get_mark_prices()
-        lines = ["БАЛАНС (LIVE)"]
-        total_usdt = Decimal("0")
-        priced_everything = True
-        for asset, (free, locked) in sorted(balances.items()):
-            lines.append(f"{asset}: вільно={free} заблоковано={locked}")
-            if asset == "USDT":
-                total_usdt += free + locked
+        spot_free, spot_locked = balances.get("USDT", (Decimal("0"), Decimal("0")))
+        usdt = spot_free + spot_locked
+        coins: list[tuple[str, Decimal]] = []
+        dust = 0
+        for asset, (free, locked) in balances.items():
+            # LD* (e.g. LDUSDT) is how Binance lists the Earn deposit among
+            # spot balances - already in the Earn line, never count it twice.
+            if asset == "USDT" or (self._earn is not None and asset.startswith("LD")):
                 continue
             price = mark_prices.get(f"{asset}USDT")
-            if price is not None:
-                total_usdt += (free + locked) * price
+            value = (free + locked) * price if price is not None else None
+            if value is not None and value >= 1:
+                coins.append((asset, value))
             else:
-                priced_everything = False
+                dust += 1
+        coins_total = sum((value for _asset, value in coins), Decimal("0"))
+        lines = ["💰 БАЛАНС", f"💵 USDT на споті: {usdt:.2f}" + (f" (з них у відкритих ордерах {spot_locked:.2f})" if spot_locked > 0 else "")]
         if earn_line is not None:
             lines.append(earn_line)
-            total_usdt += earn_usdt
-        caveat = "" if priced_everything else " (без активів поза відстежуваними парами)"
-        lines.append(f"Загалом приблизно: {total_usdt:.2f} USDT{caveat}")
+        if coins:
+            lines.append(f"🪙 У монетах: {coins_total:.2f} USDT")
+            lines.append("   " + " · ".join(f"{asset} {value:.2f}" for asset, value in sorted(coins, key=lambda c: -c[1])))
+        if dust:
+            lines.append(f"🧹 Дрібні залишки: {dust} монет (менше 1 USDT або без ціни, у підсумок не входять)")
+        lines.append(f"Разом: ~{usdt + earn_usdt + coins_total:.2f} USDT")
         return "\n".join(lines)
 
     def build_status_snapshot(self) -> StatusSnapshot:

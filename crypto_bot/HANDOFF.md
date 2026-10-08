@@ -352,6 +352,15 @@ Ukrainian term exists for them).
 | `/config` | Current configuration (secrets redacted) |
 | `/emergency_stop` | **The real, instant kill switch.** Stops new BUYs and DCA immediately. Existing positions are left alone UNLESS `EMERGENCY_AUTO_SELL=true`, in which case every open position is market-sold immediately too. This is what the project owner should use for "stop it now" - see §11. |
 
+**Main-screen buttons** (`telegram_bot/keyboard.py`, owner request 2026-10-03):
+a persistent 3x3 keyboard under the input field - Статус / Позиції / Баланс,
+Ринок / Звіт (= /report) / Історія, Пауза / Продовжити / СТОП. It comes with
+the startup message after every restart and with `/start`. A press is a
+plain text message handled by `on_button` with the same handler as the
+command. Пауза, Продовжити and СТОП only ask: an inline "✅ Так / ❌
+Скасувати" that works within 2 minutes, once (`on_control_confirm`); the
+`/emergency_stop` command itself stays instant, no question asked.
+
 Plus a **proactive 3x/day status push** (`STATUS_PING_HOUR_1/2/3_UTC`,
 default ~08:00/14:00/22:00 Kyiv) so it's obvious the bot is alive without
 asking.
