@@ -141,3 +141,33 @@ handlers); and a scratch script name collided with an older one, so the old
 mutation script ran first (harmless - it restores every file byte for
 byte). Lessons: write multi-line code edits with the editor tool or a script
 file, never a heredoc with backslashes; give scratch scripts unique names.
+
+## 2026-10-08
+
+**17. "Realized PnL +0.00 although trades closed in profit" (not a bug).** The
+daily report for 2026-10-07 showed +0.00 realized; the owner expected the
+profit of the trades closed on 10-02 and 10-06. The figure was right - it
+covers that one day, and nothing closed that day - but nothing said so.
+Fixed in 190660d: the line reads "за день" and a new line shows the month's
+closed trades (PnL, count, wins), also in /today. Lesson: a number that is
+right but easy to misread is a defect of the message.
+
+**18. Main-screen buttons: STOP confirmation could be swallowed (caught by
+review before deploy).** The confirm handler marked the prompt as used and
+removed its buttons before running the action. If Telegram had failed that
+edit for a moment, the emergency stop would not have run and a second tap
+would have been ignored silently. The action now runs first, the button
+removal is best-effort, and a repeat tap answers "Вже виконано". Lesson:
+the safety action comes first, cosmetics after, and a click must never get
+silence.
+
+**19. Claude repeated the heredoc slip from #16 twice in one day (caught
+before anything ran).** Two edit scripts sent through a bash heredoc lost
+their `\n` again; both failed on their own checks, nothing was written.
+Lesson, now a hard habit: every code or test edit goes through a script
+file written with the editor tool, never a heredoc.
+
+**20. Live-data files were one `git add -A` away from the public repo.** A
+copy of the live DB (backups/), a scratch pickle and, on the server, the live
+DB's WAL/SHM files were not ignored. Never committed (files are always
+staged by name), now ignored (9b86663) with the owner's OK.
