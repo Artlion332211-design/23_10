@@ -187,8 +187,16 @@ fabric.properties
 ### crypto_bot project
 crypto_bot/data/*.db
 crypto_bot/data/*.db-journal
+# SQLite WAL companions of the live DB (recent trades not yet merged into the .db)
+crypto_bot/data/*.db-wal
+crypto_bot/data/*.db-shm
 crypto_bot/data/*.sqlite3
 crypto_bot/logs/*.log
+# rotated log backups (app.log.1, ...) - may contain account errors and IPs; public repo
+crypto_bot/logs/*.log.*
 crypto_bot/backtest/reports/
 !crypto_bot/data/.gitkeep
 !crypto_bot/logs/.gitkeep
+# local DB backups (live account data) and scratch pickles - public repo
+backups/
+crypto_bot/k.pkl
