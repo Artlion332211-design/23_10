@@ -171,3 +171,16 @@ file written with the editor tool, never a heredoc.
 copy of the live DB (backups/), a scratch pickle and, on the server, the live
 DB's WAL/SHM files were not ignored. Never committed (files are always
 staged by name), now ignored (9b86663) with the owner's OK.
+
+**21. Klines WebSocket flapped for 12 minutes (exchange/network side, no
+action needed).** 18:45-18:57 Kyiv: the klines stream dropped 14 times with
+`keepalive ping timeout` about 40 s after each reconnect, plus 7 `timed out
+during opening handshake`; 63 of the day's 64 errors.log lines. The
+user_data stream, Telegram and the event loop were unaffected, no
+`QueueOverflow` (so not a slow consumer as in #1), nothing unusual ran just
+before. The library reconnected every time, the stale-data veto held the
+DCA checks during the gaps, the 18:45 candle was still evaluated, and the
+19:08 rescan reconnect was clean. Lesson: klines-only ping/handshake
+timeouts that heal on their own are the exchange or the route to it - don't
+restart or patch; look again only if they last longer than a rescan cycle
+or come with missed candles.
