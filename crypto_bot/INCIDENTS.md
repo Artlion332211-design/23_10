@@ -184,3 +184,13 @@ DCA checks during the gaps, the 18:45 candle was still evaluated, and the
 timeouts that heal on their own are the exchange or the route to it - don't
 restart or patch; look again only if they last longer than a rescan cycle
 or come with missed candles.
+
+## 2026-10-09
+
+**22. Claude broke the "no heredoc" habit from #19 a third time (no harm).**
+While adding the Binance-tag filter, two new tests were appended to
+`tests/test_strategy_engine.py` through a bash heredoc. The code had no
+backslashes and was checked line by line; the only side effect was mixed
+line endings in the working copy, normalized before the commit. Lesson: the
+habit holds for appends too - a "small" append is still a code edit and
+goes through the editor tool.

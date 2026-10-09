@@ -170,6 +170,12 @@ class Settings(BaseSettings):
     min_listing_age_days: int = 60
     scanner_top_n: int = 25
     scanner_interval_minutes: int = 15
+    # No new buys and no DCA in coins Binance marks with one of these tags
+    # (market/asset_tags.py): "Monitoring" = Binance may delist the coin.
+    # Others: "Seed" (new, very volatile projects), "bStocks" (tokenized US
+    # stocks). Comma-separated, case ignored; empty turns the filter off.
+    # Open positions are still sold as usual. Owner decision 2026-10-09.
+    excluded_asset_tags: str = "Monitoring"
 
     # --- News ----------------------------------------------------------------
     news_enabled: bool = True
@@ -293,6 +299,11 @@ class Settings(BaseSettings):
     def effective_strong_order_usdt(self) -> Decimal:
         """The strong-signal entry size actually used (INITIAL_ORDER_USDT while it is off)."""
         return self.initial_order_usdt if self.strong_signal_off_reason else self.strong_signal_order_usdt
+
+    @property
+    def excluded_asset_tag_set(self) -> frozenset[str]:
+        """EXCLUDED_ASSET_TAGS as tag names; empty = the filter is off."""
+        return frozenset(tag.strip() for tag in self.excluded_asset_tags.split(",") if tag.strip())
 
     @property
     def dca_plan(self) -> list[tuple[Decimal, Decimal]]:

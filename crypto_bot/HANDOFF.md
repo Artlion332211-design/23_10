@@ -92,7 +92,8 @@ still in the scanned universe (`orchestration/runtime.py::_evaluate_entry`,
 triggered by `_on_kline_message`). Universe rescanning itself happens every
 `SCANNER_INTERVAL_MINUTES` (default 15) and filters Binance's full USDT pair
 list down by: quote asset USDT, not a stablecoin pair, not a leveraged token
-(UP/DOWN/BULL/BEAR suffix), not blacklisted, `MIN_QUOTE_VOLUME_24H_USDT`
+(UP/DOWN/BULL/BEAR suffix), not blacklisted, no Binance tag from
+`EXCLUDED_ASSET_TAGS` (default Monitoring, §17), `MIN_QUOTE_VOLUME_24H_USDT`
 (default $5M), `MIN_LISTING_AGE_DAYS` (default 60), `min_trades_24h`
 (10,000), spread/depth checks, capped to `SCANNER_TOP_N` (default 25) by
 volume.
@@ -185,6 +186,9 @@ faster than the slow composite would otherwise reach it).
   `max_correlated_positions` (2).
 - **Liquidity freshness**: order book spread/depth checked right before
   submission, not just at scan time.
+- **Binance tags** (`EXCLUDED_ASSET_TAGS`, default Monitoring = Binance may
+  delist the coin): a hard veto in `evaluate_candidate`, so it also stops
+  DCA into a held coin that gets the tag later (§17).
 - **RiskManager.can_open_new_position** (the actual gate, `risk/risk_manager.py`):
   `emergency_stop` not active, buys not paused, consecutive losing streak
   under `MAX_CONSECUTIVE_BAD_TRADES` (default 3, auto-pauses new buys, not
@@ -902,3 +906,33 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
   entry off (shown in /config) instead of stopping the bot at startup.
 - The backtest engine models the bear gate and the strong size (app.py
   backtest mode computes `macro_regime.phase_by_day` from BTC daily candles).
+
+## 17. Added 2026-10-09 (owner request: no coins Binance may delist)
+
+- **EXCLUDED_ASSET_TAGS** (default `Monitoring`; comma-separated, case
+  ignored, empty = off). Binance tags coins it may delist "Monitoring", new
+  very volatile projects "Seed", tokenized US stocks "bStocks". Of the 101
+  coins the universe scan put up for evaluation in the first 10 live days,
+  6 carried Monitoring, 20 Seed and 7 bStocks, while every backtest used 12
+  large coins. The owner chose Monitoring only; Seed/bStocks can be added
+  in `.env`.
+- `market/asset_tags.py` reads the tags from the public, undocumented
+  product list behind binance.com's markets page (`tags` per symbol; the
+  trading API has no such field), refreshed by the universe scan at most
+  hourly and retried at every scan after a failure. Fails open: the last
+  good list stays in use, and before the first successful fetch nothing is
+  excluded (= the bot as before this filter). An answer with fewer than 200
+  products is treated as a failure, so a cut-off reply can't empty the list.
+  /status reports a list missing for over 1 h or older than 24 h.
+- Where it acts: the universe scan leaves tagged coins out (their slots go
+  to other coins), and `evaluate_candidate` adds a hard veto, which also
+  blocks DCA into a held coin (the DCA re-analysis runs it). Exits (target,
+  trailing, hard ceiling, /sell) are untouched: a held tagged coin is still
+  sold as usual.
+- News is matched for held coins too, not only universe candidates
+  (`_rescan_universe` -> `set_known_bases`): a held coin outside the
+  universe - certain for a tagged one - would otherwise miss its own
+  delisting notice (critical-news alert and DCA block).
+- Not in the backtest: Binance publishes only today's tags, not when each
+  one was set. None of the research harness's coins carried the tag on
+  2026-10-09, so it would not have changed those results.

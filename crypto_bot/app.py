@@ -41,6 +41,7 @@ from exchange.binance_client import BinanceClient
 from exchange.earn import EarnManager
 from exchange.execution_engine import BinanceExecutionAdapter, ExecutionEngine, OrderExecutor
 from exchange.websocket_manager import WebSocketManager
+from market.asset_tags import AssetTags
 from market.market_data import MarketDataStore
 from market.universe_scanner import UniverseScanner
 from news.news_engine import NewsEngine
@@ -172,7 +173,11 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
     risk_manager = RiskManager(settings)
     news_engine = NewsEngine(settings)
     signal_engine = SignalEngine(settings, rules)
-    universe_scanner = UniverseScanner(client, settings, rules.universe)
+    asset_tags = (
+        AssetTags(settings.excluded_asset_tag_set, quote_asset=rules.universe.quote_asset)
+        if settings.excluded_asset_tag_set else None
+    )
+    universe_scanner = UniverseScanner(client, settings, rules.universe, asset_tags=asset_tags)
 
     # PAPER never touches real orders regardless of DRY_RUN - that flag only
     # means something for LIVE ("shadow" live against real market data).
@@ -205,7 +210,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
     strategy_engine = StrategyEngine(
         settings=settings, rules=rules, signal_engine=signal_engine, risk_manager=risk_manager,
         execution_engine=execution_engine, market_data=market_data, news_provider=news_engine, notifier=notifier,
-        funds_provider=earn.ensure_spot if earn is not None else None,
+        funds_provider=earn.ensure_spot if earn is not None else None, asset_tags=asset_tags,
     )
 
     async def _on_task_gave_up(name: str, exc: BaseException | None) -> None:
@@ -217,7 +222,7 @@ async def run_live_or_paper_mode(config: AppConfig, mode: TradingMode) -> None:
         settings=settings, rules=rules, client=client, ws_manager=ws_manager, market_data=market_data,
         universe_scanner=universe_scanner, risk_manager=risk_manager, news_engine=news_engine,
         execution_engine=execution_engine, strategy_engine=strategy_engine, notifier=notifier,
-        watchdog=watchdog, paper_broker=paper_broker, started_at=utcnow(), earn=earn,
+        watchdog=watchdog, paper_broker=paper_broker, started_at=utcnow(), earn=earn, asset_tags=asset_tags,
     )
 
     ctx = BotContext(

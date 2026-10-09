@@ -321,13 +321,13 @@ def _task(*, running=True, restarts=0, gave_up=False, heartbeat=5.0):
     return {"running": running, "restart_count": restarts, "gave_up": gave_up, "seconds_since_heartbeat": heartbeat}
 
 
-def _health_runtime(settings, rules, *, down_for=None, kline_age=1.0, tasks=None):
+def _health_runtime(settings, rules, *, down_for=None, kline_age=1.0, tasks=None, **overrides):
     ws_manager = MagicMock()
     ws_manager.seconds_disconnected.return_value = down_for
     ws_manager.last_message_age_seconds.return_value = kline_age
     watchdog = MagicMock()
     watchdog.snapshot.return_value = tasks or {}
-    return _make_runtime(settings, rules, ws_manager=ws_manager, watchdog=watchdog)
+    return _make_runtime(settings, rules, ws_manager=ws_manager, watchdog=watchdog, **overrides)
 
 
 def test_status_problems_report_a_real_feed_outage_and_a_task_given_up(settings, rules):
@@ -364,6 +364,44 @@ def test_status_problems_report_a_stale_feed_and_a_hung_position_monitor(setting
         "ціни не оновлювались 4 хв",
         "задача \"супровід позицій\" не відповідає 15 хв",
     ]
+
+
+def test_news_is_matched_for_held_coins_that_left_the_universe(db_engine, settings, rules):
+    """Only universe candidates got their news matched. A held coin the scan
+    leaves out - certain for one Binance tagged for a possible delisting -
+    would miss exactly the delisting notice."""
+    with session_scope() as session:
+        PositionRepository(session).create(
+            symbol="MOVEUSDT", opened_at=utcnow(), avg_entry_price=Decimal("1"),
+            total_quantity=Decimal("10"), total_cost_usdt=Decimal("10"), target_price=Decimal("1.1"),
+        )
+    scanner = MagicMock()
+    scanner.scan = AsyncMock(return_value=[MagicMock(symbol="SOLUSDT")])
+    market_data = MagicMock()
+    market_data.backfill = AsyncMock()
+    ws_manager = MagicMock()
+    ws_manager.stop_stream = AsyncMock()
+    news_engine = MagicMock()
+    runtime = _make_runtime(
+        settings, rules, universe_scanner=scanner, market_data=market_data, ws_manager=ws_manager,
+        news_engine=news_engine,
+    )
+
+    asyncio.run(runtime._rescan_universe())
+
+    news_engine.set_known_bases.assert_called_once_with({"SOL", "MOVE"})
+
+
+def test_status_problems_say_when_the_binance_tag_list_cannot_be_trusted(settings, rules):
+    """EXCLUDED_ASSET_TAGS fails open: if Binance's tag list can't be loaded
+    the bot keeps trading without the filter - /status must say so."""
+    asset_tags = MagicMock()
+    asset_tags.problem.return_value = "позначки монет з Binance не завантажуються - заборона купівель (Monitoring) поки не діє"
+    runtime = _health_runtime(settings, rules, asset_tags=asset_tags)
+    assert runtime._status_problems() == [asset_tags.problem.return_value]
+
+    asset_tags.problem.return_value = None
+    assert runtime._status_problems() == []
 
 
 def test_status_snapshot_says_starting_until_initialize_finishes(db_engine, settings, rules):

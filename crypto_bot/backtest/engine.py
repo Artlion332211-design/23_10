@@ -487,6 +487,8 @@ class BacktestEngine:
         blacklist = check_blacklist(symbol, self.rules.universe)
         if not blacklist.passed:
             extra_vetoes.append(blacklist.reason or "blacklisted")
+        # Live's EXCLUDED_ASSET_TAGS veto has no counterpart here: Binance
+        # publishes only today's tags, not when each one was set.
 
         if open_position_symbols:
             candidate_closes = symbol_merged[symbol].loc[:ts, "close"]

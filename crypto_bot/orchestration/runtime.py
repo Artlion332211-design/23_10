@@ -44,6 +44,7 @@ from exchange.binance_client import BinanceClient
 from exchange.earn import EarnManager
 from exchange.execution_engine import ExecutionEngine
 from exchange.websocket_manager import WebSocketManager
+from market.asset_tags import AssetTags
 from market.macro_regime import (
     HISTORY_DAYS,
     MacroAssessment,
@@ -148,6 +149,7 @@ class BotRuntime:
         paper_broker: PaperBroker | None,
         started_at: datetime,
         earn: EarnManager | None = None,
+        asset_tags: AssetTags | None = None,
     ) -> None:
         self._settings = settings
         self._rules = rules
@@ -167,6 +169,9 @@ class BotRuntime:
         self._earn = earn
         self._earn_failures = 0
         self._earn_balance_alerted = False  # one alert per Earn outage
+        # EXCLUDED_ASSET_TAGS list (refreshed by the universe scan); only read
+        # here for the /status line when it can't be loaded.
+        self._asset_tags = asset_tags
 
         self._regime_engine = MarketRegimeEngine(rules.crash_detector)
         self._btc_regime: RegimeAssessment | None = None
@@ -230,11 +235,14 @@ class BotRuntime:
 
     async def _rescan_universe(self) -> None:
         candidates = await self._universe_scanner.scan()
-        self._news_engine.set_known_bases({c.symbol[:-4] for c in candidates if c.symbol.endswith("USDT")})
 
         new_candidates = {c.symbol for c in candidates}
         with session_scope() as session:
             open_symbols = {p.symbol for p in PositionRepository(session).get_open_positions()}
+        # Held coins too: one left out of the universe - e.g. Binance tagged
+        # it for a possible delisting (EXCLUDED_ASSET_TAGS) - still needs its
+        # news matched, or a delisting notice for it would go unnoticed.
+        self._news_engine.set_known_bases({s[:-4] for s in new_candidates | open_symbols if s.endswith("USDT")})
         required = new_candidates | open_symbols | {"BTCUSDT"}
 
         for symbol in required - self._tracked_symbols:
@@ -889,6 +897,9 @@ class BotRuntime:
                     # The one loop with a fixed short cadence: a stale heartbeat
                     # there means it's hung and open positions aren't managed.
                     problems.append(f"задача \"{label}\" не відповідає {_minutes(heartbeat_age)} хв")
+        tags_problem = self._asset_tags.problem() if self._asset_tags is not None else None
+        if tags_problem is not None:
+            problems.append(tags_problem)
         return problems
 
     def get_current_regime(self) -> RegimeAssessment | None:

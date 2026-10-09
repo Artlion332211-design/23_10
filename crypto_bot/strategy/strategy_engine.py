@@ -51,6 +51,7 @@ from database.repository import (
 )
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionResult
+from market.asset_tags import AssetTags
 from market.market_data import MarketDataStore
 from market.market_regime import RegimeAssessment, RegimeLevel
 from market.orderbook import OrderBookSnapshot
@@ -272,11 +273,14 @@ class StrategyEngine:
         news_provider: NewsProvider,
         notifier: StrategyNotifier | None = None,
         funds_provider: FundsProvider | None = None,
+        asset_tags: AssetTags | None = None,
     ) -> None:
         self._settings = settings
         # Brings USDT back from Simple Earn before a buy (exchange/earn.py);
         # None = all the money is on spot already.
         self._funds_provider = funds_provider
+        # EXCLUDED_ASSET_TAGS (market/asset_tags.py); None = the filter is off.
+        self._asset_tags = asset_tags
         self._rules = rules
         self._signal_engine = signal_engine
         self._risk_manager = risk_manager
@@ -373,6 +377,12 @@ class StrategyEngine:
         blacklist_check = check_blacklist(symbol, self._rules.universe)
         if not blacklist_check.passed:
             extra_vetoes.append(blacklist_check.reason or "blacklisted")
+
+        # Here and not only in the universe scan: the DCA re-analysis runs
+        # this too, so a held coin that gets the tag later is not averaged into.
+        tag_reason = self._asset_tags.exclusion_reason(symbol) if self._asset_tags is not None else None
+        if tag_reason is not None:
+            extra_vetoes.append(tag_reason)
 
         if open_position_symbols:
             candidate_df = self._market_data.dataframe(symbol, Timeframe.H1)

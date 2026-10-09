@@ -26,6 +26,7 @@ from database.repository import (
 from database.session import session_scope
 from exchange.execution_engine import ExecutionEngine, ExecutionFill, ExecutionResult
 from exchange.symbol_filters import SymbolFilters
+from market.asset_tags import AssetTags
 from market.market_regime import RegimeAssessment, RegimeLevel
 from market.orderbook import OrderBookSnapshot
 from risk.risk_manager import RiskManager
@@ -1390,3 +1391,60 @@ def test_dca_pause_during_an_earn_redemption_stops_the_dca(strategy_setup, bulli
     tick()
 
     assert executor.sides.count("BUY") == 1  # only the entry
+
+
+def _binance_tags(*symbols):
+    """A loaded EXCLUDED_ASSET_TAGS list in which `symbols` carry the Monitoring tag."""
+    items = [{"s": symbol, "q": "USDT", "tags": ["Monitoring"]} for symbol in symbols]
+    items += [{"s": f"COIN{i}USDT", "q": "USDT", "tags": []} for i in range(250)]
+
+    async def fetch():
+        return {"data": items}
+
+    tags = AssetTags(frozenset({"Monitoring"}), quote_asset="USDT", fetch=fetch)
+    asyncio.run(tags.refresh_if_due())
+    return tags
+
+
+def test_a_coin_binance_may_delist_is_scored_but_not_bought(strategy_setup):
+    strategy, executor, notifier, book = strategy_setup
+    strategy._asset_tags = _binance_tags("SOLUSDT")
+
+    decision = asyncio.run(strategy.try_open_position(
+        "SOLUSDT", btc_regime=NEUTRAL, trading_balance_usdt=BALANCE, order_book=book
+    ))
+
+    assert decision.action == "BLOCKED"
+    assert any("Monitoring" in reason for reason in decision.reasons)
+    assert executor.submit_calls == 0
+    with session_scope() as session:
+        assert PositionRepository(session).get_open_position_for_symbol("SOLUSDT") is None
+        assert SignalRepository(session).recent(limit=1, symbol="SOLUSDT")[0].decision == SignalDecision.BLOCKED
+
+
+def test_no_dca_into_a_held_coin_once_binance_tags_it_but_it_still_sells(strategy_setup):
+    """Bought before Binance tagged it: no more averaging down, while the
+    take-profit exit works as before."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    strategy._asset_tags = _binance_tags("SOLUSDT")
+    submits_before = executor.submit_calls
+
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=Decimal("97"), order_book=book, trading_balance_usdt=BALANCE,
+    ))  # -3%: DCA level 1 reached
+
+    assert executor.submit_calls == submits_before
+    no_trade_reasons = [reason for e in notifier.events if e[0] == "no_trade" for reason in e[1]]
+    assert any("Monitoring" in reason for reason in no_trade_reasons)
+    with session_scope() as session:
+        position = PositionRepository(session).get(position_id)
+        assert position.dca_count == 0
+        target = position.target_price
+
+    executor.price = target + Decimal("0.5")
+    asyncio.run(strategy.manage_position(
+        position_id, btc_regime=NEUTRAL, current_price=executor.price, order_book=book, trading_balance_usdt=BALANCE,
+    ))
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "TAKE_PROFIT"

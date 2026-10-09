@@ -12,6 +12,14 @@ def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **overrides)
 
 
+def test_excluded_asset_tags_default_to_monitoring_and_read_as_a_comma_list():
+    assert _settings().excluded_asset_tag_set == frozenset({"Monitoring"})
+    assert _settings(excluded_asset_tags=" Monitoring, Seed ,,bStocks ").excluded_asset_tag_set == frozenset(
+        {"Monitoring", "Seed", "bStocks"}
+    )
+    assert _settings(excluded_asset_tags="").excluded_asset_tag_set == frozenset()
+
+
 def test_strong_signal_defaults_are_50_usdt_with_a_5_point_margin():
     s = _settings()
     assert s.strong_signal_order_usdt == Decimal("50")

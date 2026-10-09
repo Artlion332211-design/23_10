@@ -2,9 +2,10 @@
 indicator analysis over thousands of coins).
 
 Stage 1 (this module): cheap, batched checks - liquidity, spread proxy via
-24h stats, listing age, blacklist/stablecoin/leveraged-token exclusion -
-narrowed with two REST calls (`exchangeInfo`, all-symbol `ticker/24hr`) plus
-a bounded number of listing-age lookups. Produces a ranked shortlist.
+24h stats, listing age, blacklist/stablecoin/leveraged-token/Binance-tag
+exclusion - narrowed with two REST calls (`exchangeInfo`, all-symbol
+`ticker/24hr`) plus a bounded number of listing-age lookups. Produces a
+ranked shortlist.
 
 Stage 2 (full multi-timeframe indicators + SignalEngine scoring) runs only
 on that shortlist, driven by the caller (StrategyEngine), not here.
@@ -19,8 +20,11 @@ from decimal import Decimal
 
 from config.settings import Settings, UniverseConfig
 from exchange.binance_client import BinanceClient
+from market.asset_tags import AssetTags
 
 logger = logging.getLogger(__name__)
+
+_TAGGED = "excluded Binance tag"
 
 
 @dataclass(frozen=True)
@@ -51,10 +55,18 @@ def _opportunity_score(quote_volume: float, change_pct: float) -> float:
 
 
 class UniverseScanner:
-    def __init__(self, client: BinanceClient, settings: Settings, universe_config: UniverseConfig) -> None:
+    def __init__(
+        self,
+        client: BinanceClient,
+        settings: Settings,
+        universe_config: UniverseConfig,
+        asset_tags: AssetTags | None = None,
+    ) -> None:
         self._client = client
         self._settings = settings
         self._universe = universe_config
+        # EXCLUDED_ASSET_TAGS (market/asset_tags.py); None = the filter is off.
+        self._asset_tags = asset_tags
 
     def _is_leveraged_token(self, base_asset: str, known_bases: set[str]) -> bool:
         """Binance leveraged tokens are an existing asset plus a suffix
@@ -78,6 +90,8 @@ class UniverseScanner:
             return "leveraged token"
         if symbol in self._universe.blacklist_symbols:
             return "blacklisted"
+        if self._asset_tags is not None and self._asset_tags.excluded_tags(symbol):
+            return _TAGGED
         return None
 
     async def _passes_listing_age(self, symbol: str) -> bool:
@@ -88,14 +102,20 @@ class UniverseScanner:
         return len(df) >= min_days
 
     async def scan(self) -> list[ScanCandidate]:
+        if self._asset_tags is not None:
+            await self._asset_tags.refresh_if_due()
         exchange_info = await self._client.get_exchange_info()
         tickers = await self._client.get_ticker_24h()
         ticker_by_symbol = {t["symbol"]: t for t in tickers}
 
         known_bases = {filters.base_asset for filters in exchange_info.values()}
         stage1: list[ScanCandidate] = []
+        tagged = 0
         for symbol, filters in exchange_info.items():
-            if self._exclusion_reason(symbol, filters.base_asset, filters.quote_asset, filters.status, known_bases):
+            reason = self._exclusion_reason(symbol, filters.base_asset, filters.quote_asset, filters.status, known_bases)
+            if reason is not None:
+                if reason == _TAGGED:
+                    tagged += 1
                 continue
             ticker = ticker_by_symbol.get(symbol)
             if ticker is None:
@@ -138,7 +158,8 @@ class UniverseScanner:
                 break
 
         logger.info(
-            "Universe scan: %s symbols passed stage-1 filters, %s confirmed after listing-age check",
-            len(stage1), len(confirmed),
+            "Universe scan: %s symbols passed stage-1 filters (%s skipped for a Binance tag), "
+            "%s confirmed after listing-age check",
+            len(stage1), tagged, len(confirmed),
         )
         return confirmed
