@@ -91,7 +91,9 @@ Entry evaluation runs on every **15-minute candle close** for every symbol
 still in the scanned universe (`orchestration/runtime.py::_evaluate_entry`,
 triggered by `_on_kline_message`). Universe rescanning itself happens every
 `SCANNER_INTERVAL_MINUTES` (default 15) and filters Binance's full USDT pair
-list down by: quote asset USDT, not a stablecoin pair, not a leveraged token
+list down by: quote asset USDT, not a stablecoin/fiat/gold-token pair
+(`stablecoin_assets`), a 24h price range of at least
+`min_price_range_24h_percent` (0.5%, §18), not a leveraged token
 (UP/DOWN/BULL/BEAR suffix), not blacklisted, no Binance tag from
 `EXCLUDED_ASSET_TAGS` (default Monitoring, §17), `MIN_QUOTE_VOLUME_24H_USDT`
 (default $5M), `MIN_LISTING_AGE_DAYS` (default 60), `min_trades_24h`
@@ -936,3 +938,29 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
 - Not in the backtest: Binance publishes only today's tags, not when each
   one was set. None of the research harness's coins carried the tag on
   2026-10-09, so it would not have changed those results.
+
+## 18. Added 2026-10-10 (owner OK: no stablecoins or gold in the universe)
+
+- Symptom (INCIDENTS #24): the live bot evaluated UUSDT 96 times in a week
+  (best score 57, 70 needed), plus XAUT and PAXG. A buy would never reach
+  the +10% target and would hold a slot and its capital for good.
+- Cause: `stablecoin_assets` missed newer stablecoins (U, RLUSD, XUSD, USDE,
+  BFUSD, EURI, USDS, PYUSD) and had no gold tokens, and
+  `_opportunity_score` gives a flat 24h change the full +3.0 pullback bonus,
+  so such pairs rank near the top of the 25 candidates.
+- Fix: those assets and PAXG/XAUT are on the list (it means "pegged
+  price": stablecoins, fiat, tokenized gold), and the scanner leaves out any
+  pair whose 24h high/low range is under `min_price_range_24h_percent`
+  (0.5%) so the next stablecoin is caught before anyone lists it. Over
+  2025-08..2026-09 that range was under 0.5% for USD stablecoins ~99% of
+  the time, for BTC and TRX on ~0.3% of their quietest days, for the
+  tokenized S&P 500 (SPYB) a quarter of the time, never for other coins. A
+  ticker without a usable range is kept. The scan log line counts these
+  ("N for a pegged price").
+- Research context (owner's 2026-10-10 "raise income, cut losses" study,
+  scratchpad `fast/`): in a replay of the live scanner over 469 USDT pairs
+  these coins were evaluated but never bought with today's rules, so
+  backtested returns are unchanged (2025-26 +6.9%, 2023-24 +14.3% before
+  and after); the fixed-list backtest engine has no scanner, so its results
+  can't change. The study's other findings and rejected ideas are in its
+  summary to the owner; nothing else was changed.

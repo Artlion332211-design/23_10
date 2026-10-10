@@ -98,6 +98,10 @@ correlation:
 
 universe:
   quote_asset: "USDT"
+  # Assets whose price is pegged - stablecoins, fiat, tokenized gold. A +10%
+  # target on them is unreachable, and a flat 24h change earns them the
+  # scanner's full pullback bonus, so a missing one ranks near the top of the
+  # candidates (incident #24: UUSDT was evaluated 96 times in a week).
   stablecoin_assets:
     - USDC
     - FDUSD
@@ -110,6 +114,23 @@ universe:
     - TRY
     - AEUR
     - USD1
+    - U
+    - RLUSD
+    - XUSD
+    - USDE
+    - BFUSD
+    - EURI
+    - USDS
+    - PYUSD
+    - PAXG    # tokenized gold
+    - XAUT    # tokenized gold
+  # Catches the next stablecoin before it is listed above: a pair whose 24h
+  # high/low range is below this is left out. 2025-08..2026-09, among pairs
+  # with enough volume: USD stablecoins ~99% of the time, BTC and TRX ~0.3%
+  # (their quietest days), the tokenized S&P 500 (SPYB) a quarter of the
+  # time, every other coin never. Gold moves more (median ~1.7%/24h), hence
+  # its explicit entries above.
+  min_price_range_24h_percent: 0.5
   leveraged_token_suffixes: ["UP", "DOWN", "BULL", "BEAR"]
   blacklist_symbols: []
   min_trades_24h: 10000

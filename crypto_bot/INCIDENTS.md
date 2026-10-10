@@ -194,3 +194,30 @@ backslashes and was checked line by line; the only side effect was mixed
 line endings in the working copy, normalized before the commit. Lesson: the
 habit holds for appends too - a "small" append is still a code edit and
 goes through the editor tool.
+
+## 2026-10-10
+
+**23. Claude reported a "best variant" before the decisive test (research,
+nothing deployed).** During the owner's "how to raise income and cut losses"
+study, "sell everything when the bear phase starts + 15% target" was
+reported as better in every one of the first 5-6 one-year periods. The
+continuous 2019-2026 run then reversed it: 7 bear starts in 7 years, only 2
+long bears, so selling at each start locked in losses before 5 quick
+recoveries (+32% vs +61% for today's rules). Two of the one-year windows
+began right at a market top, which flattered the bear exit. Corrected in
+the same session. Lesson: name a winner only after the continuous
+multi-year run and the same rules with shifted start dates - one start date
+alone swings results by about 10 percentage points.
+
+**24. The coin scanner lets stablecoins and gold tokens into the 25
+candidates.** `config.yaml`'s stablecoin list misses U, RLUSD, XUSD, USDE,
+BFUSD, EURI, USDS and PYUSD, and has no rule for tokenized gold (PAXG,
+XAUT). The opportunity score gives a flat 24h change the full +3.0 bonus,
+so these rank near the top. The live bot evaluated UUSDT 96 times between
+2026-09-29 and 2026-10-06 (best score 57, 70 needed); a buy would never
+reach +10% and would hold a slot for good. Found by the same study. Fixed
+the same day with the owner's OK (HANDOFF §18): the missing assets and
+PAXG/XAUT are on the list, and a pair whose 24h range is under 0.5% is left
+out, so the next new stablecoin is caught without a list update. Lesson: a
+hand-kept list of "never trade" assets goes stale as the exchange lists new
+ones - back it with a rule that recognizes the kind of asset by behaviour.

@@ -50,3 +50,44 @@ def test_scan_refreshes_binance_tags_and_leaves_tagged_coins_out(settings, rules
 def test_scan_without_a_tag_list_keeps_every_coin(settings, rules):
     scanner = UniverseScanner(MagicMock(), settings, rules.universe)
     assert scanner._exclusion_reason("MOVEUSDT", "MOVE", "USDT", "TRADING", {"MOVE"}) is None
+
+
+def _scan(settings, rules, tickers):
+    tuned = settings.model_copy(update={"min_listing_age_days": 0, "min_quote_volume_24h_usdt": Decimal("1")})
+    client = MagicMock()
+    client.get_exchange_info = AsyncMock(return_value={
+        t["symbol"]: SimpleNamespace(base_asset=t["symbol"][:-4], quote_asset="USDT", status="TRADING")
+        for t in tickers
+    })
+    client.get_ticker_24h = AsyncMock(return_value=tickers)
+    return {c.symbol for c in asyncio.run(UniverseScanner(client, tuned, rules.universe).scan())}
+
+
+def test_stablecoins_and_gold_tokens_never_enter_the_universe(settings, rules):
+    """Incident #24: U, RLUSD and the gold tokens were missing from the
+    stablecoin list, and a flat 24h change earns the full pullback bonus, so
+    they ranked among the 25 candidates (live: UUSDT evaluated 96 times in a
+    week). These tickers carry no 24h range, so only the list can stop them."""
+    pegged = ["UUSDT", "RLUSDUSDT", "XUSDUSDT", "USDEUSDT", "BFUSDUSDT", "EURIUSDT", "USDSUSDT", "PAXGUSDT",
+              "XAUTUSDT"]
+    tickers = [
+        {"symbol": s, "quoteVolume": "90000000", "priceChangePercent": "0", "lastPrice": "1", "count": 50000}
+        for s in [*pegged, "SOLUSDT"]
+    ]
+
+    assert _scan(settings, rules, tickers) == {"SOLUSDT"}
+
+
+def test_a_pair_whose_price_barely_moved_in_24h_is_left_out(settings, rules):
+    """The next stablecoin, before anyone adds it to the list: a 24h high/low
+    range under min_price_range_24h_percent (0.5%). A ticker without a range
+    is kept rather than guessed about."""
+    base = {"quoteVolume": "90000000", "priceChangePercent": "-1", "lastPrice": "1", "count": 50000}
+    tickers = [
+        {**base, "symbol": "NEWUSDUSDT", "highPrice": "1.0010", "lowPrice": "0.9990"},  # 0.2%
+        {**base, "symbol": "SOLUSDT", "highPrice": "105", "lowPrice": "100"},  # 5%
+        {**base, "symbol": "ETHUSDT"},  # no range in the answer
+        {**base, "symbol": "ZEROUSDT", "highPrice": "1", "lowPrice": "0"},  # unusable range
+    ]
+
+    assert _scan(settings, rules, tickers) == {"SOLUSDT", "ETHUSDT", "ZEROUSDT"}

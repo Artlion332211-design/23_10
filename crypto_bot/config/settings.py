@@ -434,6 +434,9 @@ class CorrelationConfig(BaseModel):
 class UniverseConfig(BaseModel):
     quote_asset: str = "USDT"
     stablecoin_assets: list[str] = Field(default_factory=list)
+    # A pair whose 24h high/low range is below this is pegged to something
+    # (a stablecoin not yet in stablecoin_assets) - see config.yaml.
+    min_price_range_24h_percent: float = 0.5
     leveraged_token_suffixes: list[str] = Field(default_factory=lambda: ["UP", "DOWN", "BULL", "BEAR"])
     blacklist_symbols: list[str] = Field(default_factory=list)
     min_trades_24h: int = 10000

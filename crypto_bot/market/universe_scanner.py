@@ -3,9 +3,9 @@ indicator analysis over thousands of coins).
 
 Stage 1 (this module): cheap, batched checks - liquidity, spread proxy via
 24h stats, listing age, blacklist/stablecoin/leveraged-token/Binance-tag
-exclusion - narrowed with two REST calls (`exchangeInfo`, all-symbol
-`ticker/24hr`) plus a bounded number of listing-age lookups. Produces a
-ranked shortlist.
+exclusion, pegged prices (a 24h range too small for a real coin) - narrowed
+with two REST calls (`exchangeInfo`, all-symbol `ticker/24hr`) plus a
+bounded number of listing-age lookups. Produces a ranked shortlist.
 
 Stage 2 (full multi-timeframe indicators + SignalEngine scoring) runs only
 on that shortlist, driven by the caller (StrategyEngine), not here.
@@ -17,6 +17,7 @@ import logging
 import math
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from config.settings import Settings, UniverseConfig
 from exchange.binance_client import BinanceClient
@@ -94,6 +95,19 @@ class UniverseScanner:
             return _TAGGED
         return None
 
+    def _barely_moved(self, ticker: dict[str, Any]) -> bool:
+        """24h high/low range under `min_price_range_24h_percent`: the price
+        is pegged to a currency or gold (a stablecoin missing from
+        `stablecoin_assets`), so the strategy's +10% target is unreachable.
+        A ticker without a usable range is kept - no guessing."""
+        try:
+            high, low = Decimal(ticker["highPrice"]), Decimal(ticker["lowPrice"])
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+        if low <= 0:
+            return False
+        return (high / low - 1) * 100 < Decimal(str(self._universe.min_price_range_24h_percent))
+
     async def _passes_listing_age(self, symbol: str) -> bool:
         min_days = self._settings.min_listing_age_days
         if min_days <= 0:
@@ -111,6 +125,7 @@ class UniverseScanner:
         known_bases = {filters.base_asset for filters in exchange_info.values()}
         stage1: list[ScanCandidate] = []
         tagged = 0
+        flat = 0
         for symbol, filters in exchange_info.items():
             reason = self._exclusion_reason(symbol, filters.base_asset, filters.quote_asset, filters.status, known_bases)
             if reason is not None:
@@ -132,6 +147,9 @@ class UniverseScanner:
             if trades < self._universe.min_trades_24h:
                 continue
             if last_price <= 0:
+                continue
+            if self._barely_moved(ticker):
+                flat += 1
                 continue
 
             score = _opportunity_score(float(quote_volume), float(change_pct))
@@ -158,8 +176,8 @@ class UniverseScanner:
                 break
 
         logger.info(
-            "Universe scan: %s symbols passed stage-1 filters (%s skipped for a Binance tag), "
-            "%s confirmed after listing-age check",
-            len(stage1), tagged, len(confirmed),
+            "Universe scan: %s symbols passed stage-1 filters (%s skipped for a Binance tag, "
+            "%s for a pegged price), %s confirmed after listing-age check",
+            len(stage1), tagged, flat, len(confirmed),
         )
         return confirmed
