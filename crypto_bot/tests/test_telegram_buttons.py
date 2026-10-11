@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 from telegram import InlineKeyboardMarkup
 
+from database.models import PositionStatus
+from database.repository import PositionRepository
+from database.session import session_scope
+from strategy.strategy_engine import ManualSellResult
 from telegram_bot.handlers import (
     _CONTROL_BUTTONS,
     _INFO_BUTTONS,
@@ -14,9 +20,10 @@ from telegram_bot.handlers import (
     cmd_start,
     on_button,
     on_control_confirm,
+    on_sell_button,
 )
 from telegram_bot.keyboard import ALL_BUTTONS, MAIN_KEYBOARD_ROWS, main_keyboard
-from tests.test_telegram_handlers import _make_context, _make_ctx, _make_update
+from tests.test_telegram_handlers import _make_context, _make_ctx, _make_update, _open
 from utils.time import utcnow
 
 
@@ -201,3 +208,188 @@ def test_a_failed_button_removal_never_swallows_the_emergency_stop(db_engine, se
     asyncio.run(on_control_confirm(update, context))  # tapped again
     assert query.answer.await_args.args == ("Вже виконано",)
     assert update.effective_message.reply_text.await_count == 1  # the stop ran once
+
+
+# ---------------------------------------------------------------------------
+# 💸 sell buttons under /positions (owner request 2026-10-11)
+# ---------------------------------------------------------------------------
+
+_GONE = "Ця кнопка вже не діє - відкрий 💼 Позиції ще раз"
+
+
+def _sell_setup(db_engine, settings, rules):
+    """SOL bought at 100, now 105 (+4.84 USDT after fees). Mutate `prices` to move it."""
+    position_id = _open("SOLUSDT", "100")
+    ctx = _make_ctx(db_engine, settings, rules)
+    prices = {"SOLUSDT": Decimal("105")}
+    ctx.get_mark_prices = lambda: dict(prices)
+    ctx.manual_sell = AsyncMock(return_value=ManualSellResult("sold"))
+    return ctx, position_id, {CTX_KEY: ctx}, prices
+
+
+def _tap_update(ctx, data, *, bot_data, user_id=42):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    query = MagicMock(data=data)
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    update.callback_query = query
+    update.effective_message = MagicMock(reply_text=AsyncMock())
+    context = _make_context(ctx)
+    context.bot_data = bot_data
+    return update, context
+
+
+def _tap(ctx, data, *, bot_data, user_id=42):
+    """One tap on a sell button; returns (query, the chat's reply_text mock)."""
+    update, context = _tap_update(ctx, data, bot_data=bot_data, user_id=user_id)
+    asyncio.run(on_sell_button(update, context))
+    return update.callback_query, update.effective_message.reply_text
+
+
+def _ask(ctx, position_id, bot_data):
+    """Taps 💸 under /positions; returns (prompt text, ✅ data, ❌ data)."""
+    _query, reply = _tap(ctx, f"sell:ask:{position_id}", bot_data=bot_data)
+    yes, no = reply.await_args.kwargs["reply_markup"].inline_keyboard[0]
+    return reply.await_args.args[0], yes.callback_data, no.callback_data
+
+
+def test_the_positions_button_shows_a_sell_button_for_a_position_in_profit(db_engine, settings, rules):
+    ctx, position_id, _bot_data, _prices = _sell_setup(db_engine, settings, rules)
+
+    markup = _press(ctx, "💼 Позиції").await_args.kwargs["reply_markup"]
+
+    assert markup.inline_keyboard[0][0].callback_data == f"sell:ask:{position_id}"
+
+
+def test_a_sell_button_only_asks_with_fresh_numbers(db_engine, settings, rules):
+    """A stray tap must never sell by itself."""
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+
+    text, yes, no = _ask(ctx, position_id, bot_data)
+
+    assert text.startswith("💸 ПРОДАТИ ВСЮ ПОЗИЦІЮ SOL ПО РИНКУ?")
+    assert "≈ +4.84 USDT (+4.84%) після комісій" in text
+    assert "Кнопка «Так» діє 2 хв" in text
+    assert yes.startswith(f"sell:yes:{position_id}:") and no.startswith(f"sell:no:{position_id}:")
+    ctx.manual_sell.assert_not_called()
+
+
+def test_a_confirmed_sale_sells_once(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+
+    query, reply = _tap(ctx, yes, bot_data=bot_data)
+
+    ctx.manual_sell.assert_awaited_once_with("SOLUSDT")
+    query.edit_message_text.assert_awaited_once_with("Продаю SOLUSDT по ринку...")  # the buttons are gone
+    assert reply.await_args.args[0].startswith("✅ SOLUSDT продано повністю")
+
+    again, _reply = _tap(ctx, yes, bot_data=bot_data)
+    assert again.answer.await_args.args == (_GONE,)
+    ctx.manual_sell.assert_awaited_once()
+
+
+def test_two_quick_taps_on_yes_start_one_sale(db_engine, settings, rules):
+    """The sale runs as its own task (it waits on Binance), so two taps are
+    handled at the same time; the second must not start a second sale."""
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+
+    async def slow_sale(symbol):
+        await asyncio.sleep(0.01)
+        return ManualSellResult("sold")
+
+    ctx.manual_sell = AsyncMock(side_effect=slow_sale)
+    first = _tap_update(ctx, yes, bot_data=bot_data)
+    second = _tap_update(ctx, yes, bot_data=bot_data)
+
+    async def both():
+        await asyncio.gather(on_sell_button(*first), on_sell_button(*second))
+
+    asyncio.run(both())
+    ctx.manual_sell.assert_awaited_once_with("SOLUSDT")
+
+
+def test_an_old_sell_confirmation_sells_nothing(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+    key = yes.split(":", 2)[2]
+    bot_data["sell_offers"][key] = replace(bot_data["sell_offers"][key], expires=utcnow() - timedelta(seconds=1))
+
+    query, _reply = _tap(ctx, yes, bot_data=bot_data)
+
+    assert "Час на підтвердження минув" in query.edit_message_text.await_args.args[0]
+    ctx.manual_sell.assert_not_called()
+
+
+def test_the_button_never_sells_a_position_no_longer_in_profit(db_engine, settings, rules):
+    """The button promises "close it in profit": a position that slipped to
+    a loss after fees between the prompt and the tap is left alone."""
+    ctx, position_id, bot_data, prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+    prices["SOLUSDT"] = Decimal("100.1")  # still above the entry on price - a loss after fees
+
+    query, _reply = _tap(ctx, yes, bot_data=bot_data)
+
+    text = query.edit_message_text.await_args.args[0]
+    assert "SOL уже не в плюсі (-0.05 USDT після комісій) - нічого не продано" in text
+    assert "/sell SOL" in text
+    _query, reply = _tap(ctx, f"sell:ask:{position_id}", bot_data=bot_data)  # nor does a new tap offer it
+    assert "уже не в плюсі" in reply.await_args.args[0]
+    assert "reply_markup" not in reply.await_args.kwargs
+    ctx.manual_sell.assert_not_called()
+
+
+def test_the_button_never_sells_a_position_that_changed_or_closed(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+    with session_scope() as session:  # a DCA filled after the prompt
+        PositionRepository(session).get(position_id).total_quantity += Decimal("0.5")
+    query, _reply = _tap(ctx, yes, bot_data=bot_data)
+    assert "Позиція SOL змінилась" in query.edit_message_text.await_args.args[0]
+
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+    with session_scope() as session:  # the bot's own take-profit closed it
+        PositionRepository(session).get(position_id).status = PositionStatus.CLOSED
+    query, _reply = _tap(ctx, yes, bot_data=bot_data)
+    assert "Цієї позиції вже немає" in query.edit_message_text.await_args.args[0]
+
+    ctx.manual_sell.assert_not_called()
+
+
+def test_cancel_sells_nothing_and_its_yes_button_then_does_nothing(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, no = _ask(ctx, position_id, bot_data)
+
+    query, _reply = _tap(ctx, no, bot_data=bot_data)
+    assert query.edit_message_text.await_args.args[0] == "❌ Скасовано - нічого не продано."
+
+    again, _reply = _tap(ctx, yes, bot_data=bot_data)
+    assert again.answer.await_args.args == (_GONE,)
+    ctx.manual_sell.assert_not_called()
+
+
+def test_after_a_restart_an_old_sell_confirmation_does_nothing(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+
+    query, _reply = _tap(ctx, yes, bot_data={CTX_KEY: ctx})  # a restart forgets every offer
+
+    assert query.answer.await_args.args == (_GONE,)
+    ctx.manual_sell.assert_not_called()
+
+
+def test_a_stranger_tapping_sell_buttons_gets_nothing(db_engine, settings, rules):
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    _text, yes, _no = _ask(ctx, position_id, bot_data)
+
+    query, reply = _tap(ctx, yes, bot_data=bot_data, user_id=7)
+    query.answer.assert_not_called()
+    _query, reply = _tap(ctx, f"sell:ask:{position_id}", bot_data=bot_data, user_id=7)
+    reply.assert_not_called()
+    ctx.manual_sell.assert_not_called()
+
+    _tap(ctx, yes, bot_data=bot_data)  # the owner's own tap still works
+    ctx.manual_sell.assert_awaited_once_with("SOLUSDT")

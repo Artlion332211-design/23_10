@@ -292,10 +292,14 @@ def test_get_balance_text_live_mode_shows_total_usdt_value(settings, rules):
 
 
 def test_build_status_snapshot_reports_unrealized_pnl(db_engine, settings, rules):
+    """After fees, like /positions (review 2026-10-11): the gross +6.00 left
+    out the 0.10 buy commission and the sale's own fee and slippage."""
+    settings = settings.model_copy(update={"taker_fee_rate": Decimal("0.001"), "expected_slippage_percent": Decimal("0.05")})
     with session_scope() as session:
         PositionRepository(session).create(
             symbol="SOLUSDT", opened_at=utcnow(), avg_entry_price=Decimal("100"),
             total_quantity=Decimal("1"), total_cost_usdt=Decimal("100"), target_price=Decimal("110"),
+            fees_paid_usdt=Decimal("0.1"),
         )
     market_data = MagicMock()
     market_data.snapshot.side_effect = lambda symbol, tf: _mock_snapshot_with_close(106.0)
@@ -312,9 +316,31 @@ def test_build_status_snapshot_reports_unrealized_pnl(db_engine, settings, rules
     snapshot = runtime.build_status_snapshot()
 
     assert snapshot.open_positions_count == 1
-    assert snapshot.total_unrealized_pnl_usdt == Decimal("6")
+    assert snapshot.total_unrealized_pnl_usdt == Decimal("5.741053")  # 106 * 0.999 * 0.9995 - 100.1
     assert snapshot.max_open_positions == settings.max_open_positions
     assert snapshot.problems == ()
+
+
+def test_sale_prices_are_the_fresh_best_bids_and_skip_a_book_that_fails(db_engine, settings, rules):
+    """The owner's sale decisions used the stream's last trade, which goes
+    minutes stale while the stream is down (review 2026-10-11)."""
+    books = {
+        "SOLUSDT": {"bids": [["99.5", "10"]], "asks": [["100.5", "10"]]},
+        "AAVEUSDT": {"bids": [], "asks": []},  # empty book: no price rather than 0
+    }
+
+    async def get_order_book(symbol, limit):
+        if symbol == "ETHUSDT":
+            raise TimeoutError("binance")
+        return books[symbol]
+
+    client = MagicMock()
+    client.get_order_book = get_order_book
+    runtime = _make_runtime(settings, rules, client=client)
+
+    prices = asyncio.run(runtime.get_sale_prices(["SOLUSDT", "ETHUSDT", "AAVEUSDT"]))
+
+    assert prices == {"SOLUSDT": Decimal("99.5")}
 
 
 def _task(*, running=True, restarts=0, gave_up=False, heartbeat=5.0):

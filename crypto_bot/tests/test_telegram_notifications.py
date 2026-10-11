@@ -285,6 +285,21 @@ def test_distinct_order_failures_on_different_symbols_are_not_merged():
 
     assert len(sender.sent) == 2
 
+
+def test_unfilled_sale_alerts_in_ukrainian_stay_per_coin():
+    """Two coins' "Продаж ... не відбувся" within the hour must both arrive
+    (the per-symbol rule matched only the English word "order")."""
+    sender = _RecordingSender()
+    notifier = TelegramNotifier(sender, chat_id=123)
+
+    async def scenario():
+        for symbol in ("SOLUSDT", "ETHUSDT"):
+            await notifier.on_error(f"Продаж {symbol} не відбувся: біржа закрила ордер без виконання (REJECTED).")
+
+    asyncio.run(scenario())
+
+    assert len(sender.sent) == 2
+
 def test_api_key_alert_includes_the_current_public_ip():
     """The home ISP hands out a dynamic IP and the key is IP-whitelisted -
     the alert should say exactly which address to add on Binance."""

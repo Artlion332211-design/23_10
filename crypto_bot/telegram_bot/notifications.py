@@ -454,10 +454,12 @@ def error_key(message: str, category: ErrorCategory | None) -> str:
     """What counts as "the same error" for de-duplication: the category for
     known failure classes; otherwise the text with symbol names and numbers
     blanked out - except order failures, which stay per symbol so a second
-    coin's failed order is never hidden behind the first."""
+    coin's failed order is never hidden behind the first (also when the
+    alert is in Ukrainian: "ордер")."""
     if category is not None:
         return category.key
-    text = message if "order" in message.lower() else _SYMBOL.sub("*", message)
+    lowered = message.lower()
+    text = message if "order" in lowered or "ордер" in lowered else _SYMBOL.sub("*", message)
     return re.sub(r"\d+", "#", text)[:160]
 
 

@@ -9,7 +9,7 @@ engine, optional paper broker) and exposes:
   `run_news_refresh_loop`, `run_daily_report_loop`, `run_status_ping_loop`);
 * the read-only callables `telegram_bot.handlers.BotContext` needs
   (`get_balance_text`, `get_current_regime`, `get_latest_signals`,
-  `get_health_snapshot`, `get_mark_prices`, `get_status_snapshot`).
+  `get_health_snapshot`, `get_mark_prices`, `get_sale_prices`, `get_status_snapshot`).
 
 Kept out of `app.py` so the composition root stays readable as "build the
 pieces, wire them into a BotRuntime, hand it to the scheduler" instead of a
@@ -73,6 +73,7 @@ from strategy.strategy_engine import (
     TradeDecision,
     in_manual_sell_cooldown,
 )
+from strategy.take_profit import net_result_if_sold
 from telegram_bot.notifications import (
     DailyReportData,
     StatusSnapshot,
@@ -777,6 +778,21 @@ class BotRuntime:
                 prices[symbol] = Decimal(str(snap.close))
         return prices
 
+    async def get_sale_prices(self, symbols: list[str]) -> dict[str, Decimal]:
+        """Best bid per symbol from a fresh order book: what a market sale
+        would get right now - for the owner's /positions, /sell and sell
+        buttons. The stream price above is the last trade, and minutes old
+        while the stream is down (incident #21). A symbol whose book can't
+        be read is left out."""
+        books = await asyncio.gather(*(self._get_order_book(s) for s in symbols), return_exceptions=True)
+        prices: dict[str, Decimal] = {}
+        for symbol, book in zip(symbols, books, strict=True):
+            if isinstance(book, BaseException):
+                logger.warning("Order book for %s unavailable for the owner's sale price: %r", symbol, book)
+            elif not book.is_empty:
+                prices[symbol] = book.best_bid
+        return prices
+
     async def get_balance_text(self) -> str:
         if self._paper_broker is not None:
             mark_prices = self.get_mark_prices()
@@ -842,7 +858,13 @@ class BotRuntime:
             for p in open_positions:
                 price = mark_prices.get(p.symbol)
                 if price is not None:
-                    total_unrealized += (price - p.avg_entry_price) * p.total_quantity
+                    # After fees, like /positions: the gross figure called a
+                    # position at +0.1% "у плюсі" although selling it books a loss.
+                    total_unrealized += net_result_if_sold(
+                        p.avg_entry_price, p.total_quantity, p.fees_paid_usdt, price,
+                        taker_fee_rate=self._settings.taker_fee_rate,
+                        expected_slippage_percent=self._settings.expected_slippage_percent,
+                    )[0]
                     priced_any = True
             open_count = len(open_positions)
 

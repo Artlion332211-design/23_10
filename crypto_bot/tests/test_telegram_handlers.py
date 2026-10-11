@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from database.models import PositionStatus
 from database.repository import PositionRepository
 from database.session import session_scope
 from market.market_regime import RegimeAssessment, RegimeLevel
@@ -48,7 +52,12 @@ def _default_status_snapshot() -> StatusSnapshot:
     )
 
 
+# The "if sold now" figures depend on these; pinned so a local .env can't move them.
+_FEES = {"taker_fee_rate": Decimal("0.001"), "expected_slippage_percent": Decimal("0.05")}
+
+
 def _make_ctx(db_engine, settings, rules, *, allowed_user_id: int = 42) -> BotContext:
+    settings = settings.model_copy(update=_FEES)
     risk_manager = RiskManager(settings)
 
     async def _trigger_emergency_stop() -> list[str] | None:
@@ -175,9 +184,10 @@ def test_positions_reports_open_positions(db_engine, settings, rules):
 
     asyncio.run(cmd_positions(update, context))
     text = update.message.reply_text.call_args[0][0]
-    assert "SOLUSDT" in text
+    assert "⚪ SOL: поточна ціна недоступна" in text  # get_mark_prices() is empty by default
     assert "142.53" in text
-    assert "поточна ціна недоступна" in text  # get_mark_prices() is empty by default
+    assert "Відкритих ордерів на біржі немає" in text
+    assert update.message.reply_text.call_args.kwargs["reply_markup"] is None  # no price, no sell button
 
 
 def test_positions_shows_current_pnl_state_when_price_is_known(db_engine, settings, rules):
@@ -193,8 +203,93 @@ def test_positions_shows_current_pnl_state_when_price_is_known(db_engine, settin
 
     asyncio.run(cmd_positions(update, context))
     text = update.message.reply_text.call_args[0][0]
-    assert "PnL=-6.00%" in text
-    assert "у мінусі" in text
+    assert "🔴 SOL у мінусі: -6.14 USDT (-6.14%)" in text  # 94 * 0.999 * 0.9995 - 100
+    assert "ціна 94.0000, вхід 100.0000, ціль 110.0000 (до цілі +17.0%)" in text
+    assert "Разом вкладено 100.00 USDT, якщо продати все зараз: -6.14 USDT" in text
+
+
+def _positions_reply(ctx):
+    update = _make_update(user_id=42)
+    asyncio.run(cmd_positions(update, _make_context(ctx)))
+    call = update.message.reply_text.call_args
+    return call.args[0], call.kwargs.get("reply_markup")
+
+
+def _open(symbol, entry, *, quantity="1", fees="0"):
+    with session_scope() as session:
+        return PositionRepository(session).create(
+            symbol=symbol, opened_at=utcnow(), avg_entry_price=Decimal(entry), total_quantity=Decimal(quantity),
+            total_cost_usdt=Decimal(entry) * Decimal(quantity), target_price=Decimal(entry) * Decimal("1.1"),
+            fees_paid_usdt=Decimal(fees),
+        ).id
+
+
+def test_positions_offer_a_sell_button_only_for_positions_in_profit_after_fees(db_engine, settings, rules):
+    """Owner request 2026-10-11: close the positions that are already in
+    profit. 'In profit' is after fees (review 2026-10-11): ETH at +0.1% on
+    price used to read 'у плюсі', yet selling it books a loss."""
+    sol = _open("SOLUSDT", "100")
+    _open("ETHUSDT", "100", fees="0.1")
+    _open("AVAXUSDT", "100")
+    _open("DOTUSDT", "100")
+    ctx = _make_ctx(db_engine, settings, rules)
+    ctx.get_mark_prices = lambda: {"SOLUSDT": Decimal("105"), "ETHUSDT": Decimal("100.1"), "AVAXUSDT": Decimal("94")}
+
+    text, markup = _positions_reply(ctx)
+
+    assert "🟢 SOL у плюсі: +4.84 USDT (+4.84%)" in text
+    assert "🔴 ETH у мінусі: -0.15 USDT (-0.15%)" in text  # 100.1 on price, a loss after fees
+    assert "⚪ DOT: поточна ціна недоступна" in text
+    assert "Разом вкладено" not in text  # not every price is known
+    assert [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard] == [
+        [("💸 Продати SOL (+4.84 USDT)", f"sell:ask:{sol}")],
+    ]
+
+
+def test_positions_use_the_fresh_sale_price_not_the_stream_price(db_engine, settings, rules):
+    """The stream price is the last trade and goes stale while the stream is
+    down; a sale gets the best bid (review 2026-10-11)."""
+    _open("SOLUSDT", "100")
+    ctx = _make_ctx(db_engine, settings, rules)
+    ctx.get_mark_prices = lambda: {"SOLUSDT": Decimal("120")}  # stale: would read +19%
+    ctx.get_sale_prices = AsyncMock(return_value={"SOLUSDT": Decimal("95")})
+
+    text, markup = _positions_reply(ctx)
+
+    ctx.get_sale_prices.assert_awaited_once_with(["SOLUSDT"])
+    assert "SOL у мінусі" in text and "ціна 95.0000" in text
+    assert markup is None
+
+
+def test_positions_list_the_orders_open_on_binance(db_engine, settings, rules):
+    """Owner request 2026-10-11: see the open orders. /positions read only
+    positions, so a sale awaiting the exchange's answer, or a resting buy
+    with no position yet, was invisible (review 2026-10-11)."""
+    from database.models import OrderPurpose, OrderSide, OrderType
+    from database.repository import OrderRepository
+
+    ctx = _make_ctx(db_engine, settings, rules)
+    with session_scope() as session:
+        OrderRepository(session).create(
+            position_id=None, symbol="ETHUSDT", client_order_id="bot-entry-1", side=OrderSide.BUY,
+            type=OrderType.LIMIT, purpose=OrderPurpose.ENTRY, requested_price=Decimal("2500"),
+            requested_qty=Decimal("0.0080"), requested_usdt=Decimal("20"),
+        )
+    text, _markup = _positions_reply(ctx)
+    assert text.startswith("Відкритих позицій немає.")
+    assert "⏳ ВІДКРИТІ ОРДЕРИ НА БІРЖІ (1)" in text
+    assert "ETH: купівля 0.008 за 2500.0000, 0 хв тому" in text
+
+    sol = _open("SOLUSDT", "100")
+    with session_scope() as session:
+        OrderRepository(session).create(
+            position_id=sol, symbol="SOLUSDT", client_order_id="bot-manual-1", side=OrderSide.SELL,
+            type=OrderType.MARKET, purpose=OrderPurpose.MANUAL_SELL, requested_price=None,
+            requested_qty=Decimal("1"), requested_usdt=Decimal("100"),
+        )
+    text, _markup = _positions_reply(ctx)
+    assert "⏳ ВІДКРИТІ ОРДЕРИ НА БІРЖІ (2)" in text
+    assert "SOL: твій продаж 1 по ринку, біржа ще не підтвердила" in text
 
 
 def test_market_before_and_after_regime_computed(db_engine, settings, rules):
@@ -280,7 +375,8 @@ def test_sell_without_confirmation_only_shows_the_position_and_sells_nothing(db_
     assert "AAVE" in listing[0] and "/sell AAVE" in listing[0]
     assert "ПРОДАТИ ВСЮ ПОЗИЦІЮ AAVEUSDT ПО РИНКУ?" in prompt[0]
     assert "протягом 2 хв напиши: /sell AAVE так" in prompt[0]
-    assert "+0.62 USDT" in prompt[0]  # (170 - 164.84) * 0.120879
+    # 170 * 0.120879 * 0.999 * 0.9995 - 164.84 * 0.120879: after fees (review 2026-10-11)
+    assert "≈ +0.59 USDT (+2.98%) після комісій" in prompt[0]
     ctx.manual_sell.assert_not_called()
 
 
@@ -307,7 +403,8 @@ def test_sell_confirmation_without_a_fresh_prompt_sells_nothing(db_engine, setti
     assert "Спершу напиши /sell AAVE" in cold[-1]
 
     bot_data = _prompted(ctx)
-    bot_data["sell_pending"]["AAVEUSDT"] = utcnow() - timedelta(seconds=1)  # the window has passed
+    offer = bot_data["sell_pending"]["AAVEUSDT"]
+    bot_data["sell_pending"]["AAVEUSDT"] = replace(offer, expires=utcnow() - timedelta(seconds=1))  # the window has passed
     assert "Спершу напиши /sell AAVE" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]
 
     bot_data = _prompted(ctx)
@@ -316,6 +413,64 @@ def test_sell_confirmation_without_a_fresh_prompt_sells_nothing(db_engine, setti
     ctx.manual_sell.assert_awaited_once_with("AAVEUSDT")
     assert timedelta(minutes=1) <= SELL_CONFIRM_WINDOW <= timedelta(minutes=5)
 
+
+def test_sell_confirmation_sells_only_the_position_and_size_it_showed(db_engine, settings, rules):
+    """The confirmation used to be remembered by coin only: a DCA within the
+    2 minutes, or a new position in the same coin, was sold unseen (review
+    2026-10-11)."""
+    ctx = _ctx_with_position(db_engine, settings, rules)
+
+    bot_data = _prompted(ctx)
+    with session_scope() as session:  # a DCA fills after the prompt
+        position = PositionRepository(session).get_open_position_for_symbol("AAVEUSDT")
+        position.total_quantity += Decimal("0.1")
+    assert "Позиція AAVE змінилась" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]
+
+    bot_data = _prompted(ctx)
+    with session_scope() as session:  # it closes and the bot buys AAVE again
+        old = PositionRepository(session).get_open_position_for_symbol("AAVEUSDT")
+        quantity = old.total_quantity
+        old.status = PositionStatus.CLOSED
+        PositionRepository(session).create(
+            symbol="AAVEUSDT", opened_at=utcnow(), avg_entry_price=Decimal("164.84"), total_quantity=quantity,
+            total_cost_usdt=Decimal("19.93"), target_price=Decimal("181.60"),
+        )
+    assert "Позиція AAVE змінилась" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]
+
+    ctx.manual_sell.assert_not_called()
+
+
+def test_sell_confirmation_is_armed_only_once_the_prompt_was_delivered(db_engine, settings, rules):
+    """The confirmation was armed before the prompt was sent: if Telegram
+    failed to deliver it, '/sell AAVE так' still sold what the owner never
+    saw (review 2026-10-11)."""
+    from telegram_bot.handlers import cmd_sell
+
+    ctx = _ctx_with_position(db_engine, settings, rules)
+    bot_data = {CTX_KEY: ctx}
+    update = _make_update(user_id=42)
+    update.message.reply_text = AsyncMock(side_effect=TimeoutError("telegram"))
+    context = _make_context(ctx)
+    context.bot_data = bot_data
+    context.args = ["AAVE"]
+    with pytest.raises(TimeoutError):
+        asyncio.run(cmd_sell(update, context))
+
+    assert "Спершу напиши /sell AAVE" in _sell(ctx, "AAVE", "так", bot_data=bot_data)[-1]
+    ctx.manual_sell.assert_not_called()
+
+
+def test_sale_replies_for_an_unknown_result_and_for_a_position_another_exit_closed():
+    from telegram_bot.handlers import _sell_reply
+
+    unknown = _sell_reply("AAVEUSDT", ManualSellResult("unknown", "помилка: OperationalError('database is locked')"))
+    assert unknown.startswith("⚠️") and "результат невідомий" in unknown
+    assert "не виконано" not in unknown  # the sale may well have filled (review 2026-10-11)
+
+    closed = _sell_reply("AAVEUSDT", ManualSellResult("closed_by_bot"))
+    assert "закрилась ще до цього продажу" in closed
+    assert "не купуватиме AAVE 24 години" in closed
+    assert "✅" not in closed
 
 def test_sell_of_a_coin_without_an_open_position_does_nothing(db_engine, settings, rules):
     ctx = _ctx_with_position(db_engine, settings, rules)

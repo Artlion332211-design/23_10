@@ -341,10 +341,10 @@ Ukrainian term exists for them).
 
 | Command | What it does |
 |---|---|
-| `/status` | Mode, uptime, BTC regime, open positions count, total unrealized PnL, pause/emergency flags, health |
+| `/status` | Mode, uptime, BTC regime, open positions count, total unrealized PnL after fees, pause/emergency flags, health |
 | `/balance` | Live balance (exchange or paper account) incl. USDT in Simple Earn + approximate total portfolio value |
-| `/positions` | Each open position: entry, current price, live PnL%, DCA count, target |
-| `/sell` | `/sell` lists, `/sell AAVE` shows the position and asks, `/sell AAVE так` within 2 min market-sells it (§15, §16) |
+| `/positions` | Each open position: what selling it now would book after fees (USDT and %), price/entry/target, invested, DCA count; the orders open on Binance; a 💸 sell button for each position in profit (§19) |
+| `/sell` | `/sell` lists, `/sell AAVE` shows the position and its after-fee result and asks, `/sell AAVE так` within 2 min market-sells that same position at that size (§15, §16, §19) |
 | `/report` | Month to date: bot vs BTC vs "35% BTC + 65% Earn" (§16) |
 | `/signals` | Most recently scored candidates |
 | `/pnl` | All-time realized PnL and win rate |
@@ -365,7 +365,9 @@ the startup message after every restart and with `/start`. A press is a
 plain text message handled by `on_button` with the same handler as the
 command. Пауза, Продовжити and СТОП only ask: an inline "✅ Так / ❌
 Скасувати" that works within 2 minutes, once (`on_control_confirm`); the
-`/emergency_stop` command itself stays instant, no question asked.
+`/emergency_stop` command itself stays instant, no question asked. The
+Позиції reply carries an inline "💸 Продати X" button per position in
+profit, which asks the same way before it sells (`on_sell_button`, §19).
 
 Plus a **proactive 3x/day status push** (`STATUS_PING_HOUR_1/2/3_UTC`,
 default ~08:00/14:00/22:00 Kyiv) so it's obvious the bot is alive without
@@ -964,3 +966,42 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
   and after); the fixed-list backtest engine has no scanner, so its results
   can't change. The study's other findings and rejected ideas are in its
   summary to the owner; nothing else was changed.
+
+## 19. Added 2026-10-11 (owner request: see the open orders, close the positions in profit)
+
+- **💼 Позиції / `/positions`**: for each position, what selling it now
+  would book, in USDT and % - at the best bid of a fresh order book
+  (`BotRuntime.get_sale_prices`), after the sale's fee and slippage and the
+  buy commissions already paid (`take_profit.net_result_if_sold`, the basis
+  `PositionRepository.apply_sell_fill` books on close) - with price, entry,
+  target and the distance to it, the amount invested, DCA count and date; a
+  total when every price is known; then the orders the bot has open on
+  Binance (NEW / partly filled rows: a resting LIMIT, a sale awaiting the
+  exchange's answer). The bot keeps its sale target to itself and sells by
+  market, so Binance's own "open orders" list is normally empty - the reply
+  says so. `/status`'s open-positions total is after fees as well (stream
+  prices, it also feeds the 3x/day ping).
+- **💸 Продати X** (inline button, one per position in profit after fees):
+  `sell:ask:<position id>` shows fresh numbers with "✅ Так / ❌ Скасувати";
+  "Так" works within 2 minutes, once (`sell_offers` in bot_data, taken
+  before any await so two concurrent taps can't start two sales, forgotten
+  on a restart). It sells only that position at the size shown, and only
+  while it is still in profit after fees at a fresh price; otherwise nothing
+  is sold and the reply points to `/sell`. Same sale path as `/sell`
+  (`_sell_now` -> `manual_sell`), so the 24 h no-re-buy cooldown applies. A
+  losing position is still sold only with `/sell`.
+- `/sell` shows the same after-fee result at a fresh price, binds the
+  confirmation to the position id and size shown, and arms it only once the
+  prompt was delivered.
+- Review fixes in the sale path (INCIDENTS #25): an exception mid-sale is
+  reported as "результат невідомий" (status `unknown`), not "не виконано"; a
+  position another exit closed while `/sell` waited for the lock is
+  reported as such (`closed_by_bot`) and still gets the cooldown; a pending
+  MANUAL_SELL/EMERGENCY_SELL that resolves unfilled sends "Продаж X не
+  відбувся"; Ukrainian order alerts stay per coin in the alert
+  de-duplication; `/positions` and the sell buttons run as their own tasks
+  (they wait on Binance), so `/emergency_stop` is never held up.
+- Known, not changed: if the database write fails right after a fill, that
+  order row stays NEW and untracked until the next restart (startup
+  reconciliation resolves it) and the position's exits/DCA wait until then.
+  It needs a failing DB write; such an order now shows in 💼 Позиції.

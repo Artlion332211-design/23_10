@@ -1271,6 +1271,71 @@ def test_manual_sell_that_sold_nothing_says_why(strategy_setup, answer, expected
         assert PositionRepository(session).get(position_id).status == PositionStatus.OPEN
 
 
+def test_manual_sell_that_raises_after_the_order_went_out_reports_an_unknown_result(strategy_setup, monkeypatch):
+    """An exception after Binance filled the sale (here the DB write of its
+    result) was reported as "❌ не виконано" (review 2026-10-11)."""
+    strategy, executor, notifier, book = strategy_setup
+    _open_position(strategy, book)
+
+    def database_locked(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(strategy._execution_engine, "_persist_result", database_locked)
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert _sells(executor) == 1  # the order did go out
+    assert result.status == "unknown"
+    assert "database is locked" in (result.detail or "")
+
+
+def test_manual_sell_of_a_position_another_exit_just_closed_says_so_and_keeps_the_cooldown(strategy_setup):
+    """A resting take-profit had filled by the time /sell cancelled it: the
+    reply said "✅ продано" and the promised 24 h without re-buying the coin
+    was never written (review 2026-10-11)."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    _order(position_id, OrderPurpose.TAKE_PROFIT, "bot-tp-filled")
+    with session_scope() as session:
+        quantity = PositionRepository(session).get(position_id).total_quantity
+    tp_filled = _fill(price=Decimal("110"), qty=quantity, status=OrderStatus.FILLED)
+
+    class TakeProfitAlreadyFilled(FakeExecutor):
+        async def cancel(self, symbol, *, client_order_id):
+            return tp_filled
+
+    filled = TakeProfitAlreadyFilled()
+    strategy._execution_engine._executor = filled
+
+    result = asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL))
+
+    assert result.status == "closed_by_bot"
+    assert _sells(filled) == 0  # nothing was left to sell
+    assert in_manual_sell_cooldown("SOLUSDT")
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).close_reason == "TAKE_PROFIT"
+
+
+def test_a_pending_manual_sell_that_ends_unfilled_tells_the_owner(strategy_setup):
+    """The "⏳" reply promises the result; when the order poll later found
+    the sale REJECTED, only a log line was written (review 2026-10-11)."""
+    strategy, executor, notifier, book = strategy_setup
+    position_id = _open_position(strategy, book)
+    strategy._execution_engine._executor = _LostResponseSellExecutor()
+    assert asyncio.run(strategy.manual_sell("SOLUSDT", order_book=book, btc_regime=NEUTRAL)).status == "pending"
+    with session_scope() as session:
+        order = next(o for o in OrderRepository(session).for_position(position_id) if o.purpose == OrderPurpose.MANUAL_SELL)
+
+    rejected = ExecutionResult(accepted=True, status=OrderStatus.REJECTED, error_message="Order does not exist")
+    asyncio.run(strategy.apply_resolved_order(order, rejected, btc_regime=NEUTRAL))
+
+    alert = _errors(notifier)[-1]
+    assert alert.startswith("Продаж SOLUSDT не відбувся") and "REJECTED" in alert
+    assert "позиція лишається відкритою" in alert
+    with session_scope() as session:
+        assert PositionRepository(session).get(position_id).status == PositionStatus.OPEN
+
+
 def test_no_dca_into_what_is_left_after_the_owner_sold_by_hand(strategy_setup, bullish_snapshots):
     """A /sell that Binance filled only partly leaves a position behind;
     averaging down into it would undo the owner's decision."""

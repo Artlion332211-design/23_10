@@ -120,6 +120,8 @@ class BuyExecutedEvent:
 
 ManualSellStatus = Literal[
     "sold", "sold_with_warning", "partial", "pending", "failed", "no_position", "no_order_book",
+    "closed_by_bot",  # another exit closed it while this sale waited for the lock
+    "unknown",  # an exception mid-sale: the order may or may not have filled
 ]
 # After the owner's /sell the bot neither re-buys nor DCAs that coin for a
 # while - he just chose to get out of it. Written in the same transaction
@@ -148,6 +150,7 @@ class _ForceSellOutcome:
     sold: bool  # the position ended up CLOSED, with nothing unconfirmed left behind
     partial: bool = False  # Binance filled only part of the MARKET sell
     pending: bool = False  # the sell's outcome is unknown yet (the order poll will resolve it)
+    closed_elsewhere: bool = False  # already closed by another exit before this sell was sent
     notes: list[str] = field(default_factory=list)
 
 
@@ -1162,11 +1165,20 @@ class StrategyEngine:
             except Exception as exc:  # noqa: BLE001 - report, never crash the Telegram handler
                 logger.exception("Manual sell for %s failed: %r", symbol, exc)
                 await self._notifier.on_error(f"Manual sell for {symbol} failed: {exc!r} - check Binance manually")
-                return ManualSellResult("failed", f"помилка: {exc!r}")
+                # Not "failed": the exception can come after Binance filled the
+                # sale (e.g. from the DB write of its result).
+                return ManualSellResult("unknown", f"помилка: {exc!r}")
             with session_scope() as session:
                 left = PositionRepository(session).get(position_id)
                 remaining = left.total_quantity if left is not None and left.status == PositionStatus.OPEN else None
             detail = "; ".join(outcome.notes) or None
+            if outcome.closed_elsewhere:
+                # Another exit closed it, not this sale - whose promise of no
+                # re-buy for 24 h must hold all the same: the owner chose to
+                # get out of the coin.
+                with session_scope() as session:
+                    SettingsRepository(session).set(MANUAL_SELL_COOLDOWN_KEY.format(symbol=symbol), utcnow().isoformat())
+                return ManualSellResult("closed_by_bot", detail)
             if remaining is None:
                 return ManualSellResult("sold" if outcome.sold else "sold_with_warning", detail)
             if outcome.partial:
@@ -1217,7 +1229,10 @@ class StrategyEngine:
             with session_scope() as session:
                 position = PositionRepository(session).get(position_id)
                 if position is None or position.status != PositionStatus.OPEN:
-                    return result  # a cancelled order's own fill already closed it
+                    # Closed meanwhile: by a cancelled order's own fill, or by
+                    # an exit the monitor made just before this got the lock.
+                    result.closed_elsewhere = True
+                    return result
                 quantity = position.total_quantity
             if quantity <= 0:
                 return result
@@ -1377,6 +1392,13 @@ class StrategyEngine:
     async def _resolve_exit_order(self, order: Order, result: ExecutionResult) -> None:
         if result.filled_quantity <= 0 or order.position_id is None:
             logger.info("Exit LIMIT order for %s resolved with no fill - position remains open, unchanged", order.symbol)
+            if order.purpose in (OrderPurpose.MANUAL_SELL, OrderPurpose.EMERGENCY_SELL):
+                # The "⏳ pending" /sell reply promised the result; silence
+                # left the owner waiting for a summary that never came.
+                await self._notifier.on_error(
+                    f"Продаж {order.symbol} не відбувся: біржа закрила ордер без виконання ({result.status.value}). "
+                    "Нічого не продано - позиція лишається відкритою, бот веде її далі. Перевір 💼 Позиції."
+                )
             return
         reason = _EXIT_CLOSE_REASON[order.purpose]
         outcome = await self._apply_sell_result(order.position_id, result=result, reason=reason)

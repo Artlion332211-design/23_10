@@ -77,7 +77,32 @@ def test_sell_runs_without_blocking_other_commands():
     blocking = {name: h.block for h in app.handlers[0] if isinstance(h, CommandHandler) for name in h.commands}
 
     assert blocking["sell"] is False
+    assert blocking["positions"] is False  # reads fresh order books from Binance
     assert blocking["emergency_stop"] is True
+
+
+def test_sell_buttons_reach_their_handler_without_blocking_other_updates():
+    from telegram import CallbackQuery
+
+    from telegram_bot.handlers import on_control_confirm, on_sell_button
+
+    app = create_application(_FAKE_TOKEN)
+    attach_context(app, MagicMock())
+    owner = User(id=42, first_name="owner", is_bot=False)
+
+    for data in ("sell:ask:5", "sell:yes:5:1760000000", "sell:no:5:1760000000"):
+        query = CallbackQuery(id="1", from_user=owner, chat_instance="c", data=data)
+        matched = _matching(app, Update(update_id=4, callback_query=query))
+        assert [(h.callback, h.block) for h in matched] == [(on_sell_button, False)]
+    control = CallbackQuery(id="2", from_user=owner, chat_instance="c", data="ctl:stop:1")
+    assert [h.callback for h in _matching(app, Update(update_id=5, callback_query=control))] == [on_control_confirm]
+
+
+def test_the_menu_describes_the_two_step_sell():
+    """The menu said '/sell AAVE так' as if one message sold - the bot
+    refuses that without the '/sell AAVE' prompt first (review 2026-10-11)."""
+    assert "так" not in COMMAND_DESCRIPTIONS["sell"]
+    assert "підтвердити" in COMMAND_DESCRIPTIONS["sell"]
 
 
 def test_command_menu_is_set_for_the_owner_chat_only_in_menu_order():

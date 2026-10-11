@@ -221,3 +221,28 @@ PAXG/XAUT are on the list, and a pair whose 24h range is under 0.5% is left
 out, so the next new stablecoin is caught without a list update. Lesson: a
 hand-kept list of "never trade" assets goes stale as the exchange lists new
 ones - back it with a rule that recognizes the kind of asset by behaviour.
+
+## 2026-10-11
+
+**25. Review of /positions and /sell - fixed before any of it bit.** The
+owner asked to see the open orders and to close the positions already in
+profit. A review of that path (/positions, the 💼 button, /status, /sell,
+manual_sell) found, none of it seen in production: "у плюсі" was judged on
+price alone, so a position up 0.1-0.3% read as profit although selling it
+books a loss once the buy fee, the sale fee and the spread are paid; the
+figures came from the stream's last trade, minutes stale while the stream
+is down (#21); nothing showed the orders open on Binance, so a sale
+awaiting the exchange's answer looked like nothing had happened; a "/sell X
+так" confirmation was remembered by coin only (a DCA within the 2 minutes,
+or a new position in the same coin, would have been sold unseen) and was
+armed before the prompt was delivered; an exception after the sale filled
+read "не виконано"; a pending sale the exchange later rejected was never
+reported although the reply promised a result; a position another exit
+closed during the /sell was reported as sold by /sell, without the
+promised 24 h no-re-buy; the "/" menu described the old one-step /sell.
+Fixed together with the new sell buttons (HANDOFF §19); the one deeper gap
+left (a failing DB write right after a fill leaves the order untracked
+until a restart) is noted there. Lessons: for the owner, "in profit" means
+money after every fee; a confirmation binds to exactly what was shown -
+that position, that size; a promise in a reply ("I'll tell you the result")
+needs a code path for every outcome, failures included.

@@ -39,6 +39,7 @@ from telegram_bot.handlers import (
     on_button,
     on_control_confirm,
     on_handler_error,
+    on_sell_button,
 )
 from telegram_bot.keyboard import ALL_BUTTONS
 
@@ -69,8 +70,8 @@ _COMMANDS = {
 # the registered handlers (it used to be set by hand in BotFather).
 COMMAND_DESCRIPTIONS = {
     "status": "стан бота",
-    "positions": "відкриті позиції",
-    "sell": "продати позицію по ринку (/sell AAVE так)",
+    "positions": "позиції, відкриті ордери, продаж тих, що в плюсі",
+    "sell": "продати позицію по ринку (/sell AAVE, потім підтвердити)",
     "market": "ринок і фаза (ведмежий / зростання)",
     "balance": "баланс",
     "pnl": "прибуток / збиток",
@@ -102,10 +103,10 @@ def create_application(bot_token: str) -> Application:
     return Application.builder().token(bot_token).build()
 
 
-# A sale (or the report's candle download) waits on Binance for seconds; it
-# must not hold up the commands behind it (above all /emergency_stop), so it
-# runs as its own task.
-_NON_BLOCKING = {"sell", "report"}
+# A sale (or the report's candle download, or /positions' fresh order books)
+# waits on Binance for seconds; it must not hold up the commands behind it
+# (above all /emergency_stop), so it runs as its own task.
+_NON_BLOCKING = {"sell", "report", "positions"}
 
 
 def attach_context(application: Application, ctx: BotContext) -> Application:
@@ -122,6 +123,8 @@ def attach_context(application: Application, ctx: BotContext) -> Application:
         MessageHandler(filters.UpdateType.MESSAGE & filters.Text(ALL_BUTTONS), on_button, block=False)
     )
     application.add_handler(CallbackQueryHandler(on_control_confirm, pattern=r"^ctl:"))
+    # 💸 under /positions; non-blocking like /sell (the sale waits on Binance).
+    application.add_handler(CallbackQueryHandler(on_sell_button, pattern=r"^sell:", block=False))
     application.add_error_handler(on_handler_error)
     return application
 

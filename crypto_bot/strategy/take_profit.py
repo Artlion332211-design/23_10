@@ -74,6 +74,27 @@ def net_profit_percent(
     return (net_proceeds / avg_entry_price - Decimal(1)) * Decimal(100)
 
 
+def net_result_if_sold(
+    avg_entry_price: Decimal,
+    quantity: Decimal,
+    fees_paid_usdt: Decimal,
+    sell_price: Decimal,
+    *,
+    taker_fee_rate: Decimal,
+    expected_slippage_percent: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """(USDT, %) that selling the whole position at `sell_price` would book:
+    the sell-side fee and slippage as in `net_profit_percent`, plus the
+    buy-side commissions already paid (`fees_paid_usdt` - a position's
+    avg_entry_price is the plain fill price), on the basis
+    `PositionRepository.apply_sell_fill` uses when the position closes. What
+    the owner sees as "in profit": a price just above the entry is a loss."""
+    cost = avg_entry_price * quantity + fees_paid_usdt
+    slippage_fraction = expected_slippage_percent / Decimal(100)
+    net = sell_price * quantity * (Decimal(1) - taker_fee_rate) * (Decimal(1) - slippage_fraction) - cost
+    return net, (net / cost * Decimal(100) if cost > 0 else Decimal("0"))
+
+
 def trailing_stop_price(peak_price: Decimal, distance_percent: Decimal) -> Decimal:
     return peak_price * (Decimal(1) - distance_percent / Decimal(100))
 

@@ -25,7 +25,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config.settings import RulesConfig, Settings
-from database.repository import DailyStatRepository, NewsRepository, PositionRepository
+from database.models import OrderPurpose, Position, PositionStatus
+from database.repository import (
+    DailyStatRepository,
+    NewsRepository,
+    OrderRepository,
+    PositionRepository,
+)
 from database.session import session_scope
 from market.macro_regime import MacroAssessment
 from market.market_regime import RegimeAssessment
@@ -33,6 +39,7 @@ from news.news_engine import NewsEngine
 from orchestration.daily_report import month_closed_trades
 from risk.risk_manager import RiskManager
 from strategy.strategy_engine import ManualSellResult, TradeDecision
+from strategy.take_profit import net_result_if_sold
 from telegram_bot.keyboard import (
     BUTTON_BALANCE,
     BUTTON_HISTORY,
@@ -90,6 +97,10 @@ class BotContext:
     manual_sell: Callable[[str], Awaitable[ManualSellResult]] | None = None
     # /report: the month so far vs BTC and "35% BTC + 65% Earn".
     get_monthly_report_text: Callable[[], Awaitable[str]] | None = None
+    # Best bid per symbol from fresh order books (runtime.get_sale_prices) for
+    # /positions, /sell and the sell buttons; None = no order books in this
+    # build, get_mark_prices stands in.
+    get_sale_prices: Callable[[list[str]], Awaitable[dict[str, Decimal]]] | None = None
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
@@ -151,31 +162,152 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _reply(update, text)
 
 
+@dataclass(frozen=True)
+class _Held:
+    """An open position's figures, copied out of its DB session."""
+
+    position_id: int
+    symbol: str
+    avg_entry: Decimal
+    quantity: Decimal
+    fees_paid: Decimal
+    target: Decimal
+    dca_count: int
+    opened_at: datetime
+
+    @classmethod
+    def of(cls, p: Position) -> _Held:
+        return cls(p.id, p.symbol, p.avg_entry_price, p.total_quantity, p.fees_paid_usdt, p.target_price,
+                   p.dca_count, p.opened_at)
+
+    @property
+    def coin(self) -> str:
+        return self.symbol.removesuffix("USDT")
+
+    @property
+    def cost(self) -> Decimal:
+        """What the position cost, buy commissions included."""
+        return self.avg_entry * self.quantity + self.fees_paid
+
+    def if_sold_at(self, price: Decimal, settings: Settings) -> tuple[Decimal, Decimal]:
+        return net_result_if_sold(
+            self.avg_entry, self.quantity, self.fees_paid, price,
+            taker_fee_rate=settings.taker_fee_rate, expected_slippage_percent=settings.expected_slippage_percent,
+        )
+
+
+def _open_holdings() -> list[_Held]:
+    with session_scope() as session:
+        return [_Held.of(p) for p in PositionRepository(session).get_open_positions()]
+
+
+def _open_holding(position_id: int) -> _Held | None:
+    with session_scope() as session:
+        p = PositionRepository(session).get(position_id)
+        return _Held.of(p) if p is not None and p.status == PositionStatus.OPEN else None
+
+
+async def _sale_prices(ctx: BotContext, symbols: list[str]) -> dict[str, Decimal]:
+    """What a market sale would get now (fresh order books); the stream
+    prices only in a build without order-book access (tests)."""
+    if not symbols:
+        return {}
+    if ctx.get_sale_prices is None:
+        marks = ctx.get_mark_prices()
+        return {s: marks[s] for s in symbols if s in marks}
+    return await ctx.get_sale_prices(symbols)
+
+
+_ORDER_LABELS = {
+    OrderPurpose.ENTRY: "купівля",
+    OrderPurpose.DCA_1: "докупка",
+    OrderPurpose.DCA_2: "докупка",
+    OrderPurpose.DCA_3: "докупка",
+    OrderPurpose.TAKE_PROFIT: "продаж у ціль",
+    OrderPurpose.TRAILING_STOP: "продаж (трейлінг)",
+    OrderPurpose.EMERGENCY_SELL: "аварійний продаж",
+    OrderPurpose.HARD_CEILING: "продаж (стеля прибутку)",
+    OrderPurpose.MANUAL_SELL: "твій продаж",
+}
+
+
+def _open_orders_lines() -> list[str]:
+    """Orders the bot has open on Binance (NEW or partly filled): a resting
+    LIMIT, or a sale the exchange hasn't confirmed yet. The bot keeps its
+    sale target to itself, so Binance's own "open orders" list is normally
+    empty."""
+    now = utcnow()
+    with session_scope() as session:
+        orders = [(o.symbol, o.purpose, o.requested_qty, o.requested_price, o.created_at)
+                  for o in OrderRepository(session).open_orders()]
+    if not orders:
+        return ["Відкритих ордерів на біржі немає: бот продає по ринку, коли ціна доходить до цілі."]
+    lines = [f"⏳ ВІДКРИТІ ОРДЕРИ НА БІРЖІ ({len(orders)})"]
+    for symbol, purpose, quantity, price, created_at in orders:
+        at = f"за {format_price(price)}" if price is not None else "по ринку, біржа ще не підтвердила"
+        minutes = int((now - created_at).total_seconds() // 60)
+        lines.append(f"{symbol.removesuffix('USDT')}: {_ORDER_LABELS.get(purpose, purpose.value)} "
+                     f"{quantity.normalize():f} {at}, {minutes} хв тому")
+    return lines
+
+
+def _profit_state(net: Decimal) -> tuple[str, str]:
+    return ("🟢", "у плюсі") if net > 0 else (("🔴", "у мінусі") if net < 0 else ("⚪", "у нулі"))
+
+
+# 💸 buttons under /positions: "sell:ask:<position id>" asks with fresh
+# numbers; the prompt's "sell:yes:<offer>" sells, "sell:no:<offer>" cancels,
+# where <offer> = "<position id>:<unix time issued>".
+_SELL_ASK = "sell:ask:"
+_SELL_OFFERS_KEY = "sell_offers"
+
+
 @_restricted
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every open position with what selling it now would book (after fees,
+    at the price a market sale gets), the orders open on Binance, and a 💸
+    button for each position in profit (on_sell_button)."""
     ctx = _ctx(context)
-    max_dca = ctx.settings.max_dca_count
-    mark_prices = ctx.get_mark_prices()
-    with session_scope() as session:
-        positions = PositionRepository(session).get_open_positions()
-        if not positions:
-            await _reply(update, "Відкритих позицій немає.")
-            return
-        lines = [f"ВІДКРИТІ ПОЗИЦІЇ ({len(positions)}/{ctx.settings.max_open_positions})"]
-        for p in positions:
-            current = mark_prices.get(p.symbol)
-            if current is not None and p.avg_entry_price > 0:
-                pnl_pct = (current / p.avg_entry_price - 1) * 100
-                state = "у плюсі" if pnl_pct > 0 else ("у мінусі" if pnl_pct < 0 else "у нулі")
-                price_info = f"поточна={format_price(current)} PnL={pnl_pct:+.2f}% ({state})"
-            else:
-                price_info = "поточна ціна недоступна"
-            lines.append(
-                f"{p.symbol}: вхід={format_price(p.avg_entry_price)} к-сть={p.total_quantity:.6f} "
-                f"{price_info} ціль={format_price(p.target_price)} DCA={p.dca_count}/{max_dca} "
-                f"відкрито={p.opened_at.date()}"
-            )
-    await _reply(update, "\n".join(lines))
+    message = update.effective_message
+    assert message is not None
+    holdings = _open_holdings()
+    orders = _open_orders_lines()
+    if not holdings:
+        has_orders = orders[0].startswith("⏳")
+        await message.reply_text("\n\n".join(["Відкритих позицій немає.", *(["\n".join(orders)] if has_orders else [])]))
+        return
+    prices = await _sale_prices(ctx, [h.symbol for h in holdings])
+    lines = [f"ВІДКРИТІ ПОЗИЦІЇ ({len(holdings)}/{ctx.settings.max_open_positions})",
+             "Результат - якщо продати зараз по ринку, після комісій."]
+    in_profit: list[tuple[_Held, Decimal]] = []
+    total_net = Decimal("0")
+    for h in holdings:
+        price = prices.get(h.symbol)
+        if price is None:
+            lines += ["", f"⚪ {h.coin}: поточна ціна недоступна",
+                      f"вхід {format_price(h.avg_entry)}, ціль {format_price(h.target)}"]
+        else:
+            net, pct = h.if_sold_at(price, ctx.settings)
+            total_net += net
+            if net > 0:
+                in_profit.append((h, net))
+            to_target = "ціль досягнута" if price >= h.target else f"до цілі +{(h.target / price - 1) * 100:.1f}%"
+            icon, state = _profit_state(net)
+            lines += ["", f"{icon} {h.coin} {state}: {net:+.2f} USDT ({pct:+.2f}%)",
+                      f"ціна {format_price(price)}, вхід {format_price(h.avg_entry)}, ціль {format_price(h.target)} ({to_target})"]
+        lines.append(f"вкладено {h.cost:.2f} USDT, докупок {h.dca_count}/{ctx.settings.max_dca_count}, з {h.opened_at.date()}")
+    if all(h.symbol in prices for h in holdings):
+        invested = sum((h.cost for h in holdings), Decimal("0"))
+        lines += ["", f"Разом вкладено {invested:.2f} USDT, якщо продати все зараз: {total_net:+.2f} USDT"]
+    lines += ["", *orders]
+    markup = None
+    if in_profit:
+        lines += ["", "💸 Кнопка нижче продає позицію в плюсі: спершу покаже свіжі цифри й спитає «Так»."]
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💸 Продати {h.coin} ({net:+.2f} USDT)", callback_data=f"{_SELL_ASK}{h.position_id}")]
+            for h, net in in_profit
+        ])
+    await message.reply_text("\n".join(lines), reply_markup=markup)
 
 
 _SELL_CONFIRM_WORDS = {"так", "yes", "confirm", "підтверджую"}
@@ -184,6 +316,16 @@ _SELL_CONFIRM_WORDS = {"так", "yes", "confirm", "підтверджую"}
 # resent) must not sell what the owner hasn't just looked at.
 SELL_CONFIRM_WINDOW = timedelta(minutes=2)
 _SELL_PENDING_KEY = "sell_pending"
+
+
+@dataclass(frozen=True)
+class _SellOffer:
+    """A sale the owner was just shown: it may sell only that position, at
+    that size - not a new position in the same coin, nor one a DCA grew."""
+
+    position_id: int
+    quantity: Decimal
+    expires: datetime
 
 
 def _sell_symbol(raw: str) -> str:
@@ -199,52 +341,62 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sell a position by itself."""
     ctx = _ctx(context)
     args = list(context.args or [])
-    mark_prices = ctx.get_mark_prices()
-    pending: dict[str, datetime] = context.bot_data.setdefault(_SELL_PENDING_KEY, {})
-    with session_scope() as session:
-        positions = {p.symbol: (p.avg_entry_price, p.total_quantity) for p in PositionRepository(session).get_open_positions()}
+    pending: dict[str, _SellOffer] = context.bot_data.setdefault(_SELL_PENDING_KEY, {})
+    holdings = {h.symbol: h for h in _open_holdings()}
     if not args:
-        if not positions:
+        if not holdings:
             await _reply(update, "Відкритих позицій немає - продавати нічого.")
             return
-        names = ", ".join(sorted(s.removesuffix("USDT") for s in positions))
-        await _reply(update, f"Продаж по ринку. Відкриті позиції: {names}\nНапиши, наприклад: /sell {sorted(positions)[0].removesuffix('USDT')}")
+        names = ", ".join(sorted(s.removesuffix("USDT") for s in holdings))
+        await _reply(update, f"Продаж по ринку. Відкриті позиції: {names}\nНапиши, наприклад: /sell {sorted(holdings)[0].removesuffix('USDT')}")
         return
     symbol = _sell_symbol(args[0])
     coin = symbol.removesuffix("USDT")
-    if symbol not in positions:
+    held = holdings.get(symbol)
+    if held is None:
         pending.pop(symbol, None)
         await _reply(update, f"Позиції {symbol} немає серед відкритих. Список: /sell")
         return
-    avg_entry, quantity = positions[symbol]
-    current = mark_prices.get(symbol)
     if len(args) < 2 or args[1].strip().lower() not in _SELL_CONFIRM_WORDS:
-        if current is not None and avg_entry > 0:
-            pnl_pct = (current / avg_entry - 1) * 100
-            pnl_usdt = (current - avg_entry) * quantity
-            info = f"Зараз {format_price(current)}, вхід {format_price(avg_entry)}: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%) без комісій"
+        price = (await _sale_prices(ctx, [symbol])).get(symbol)
+        if price is not None:
+            net, pct = held.if_sold_at(price, ctx.settings)
+            info = f"Зараз {format_price(price)}, вхід {format_price(held.avg_entry)}: ≈ {net:+.2f} USDT ({pct:+.2f}%) після комісій"
         else:
-            info = f"Вхід {format_price(avg_entry)}, поточна ціна недоступна"
-        pending[symbol] = utcnow() + SELL_CONFIRM_WINDOW
+            info = f"Вхід {format_price(held.avg_entry)}, поточна ціна недоступна"
         minutes = int(SELL_CONFIRM_WINDOW.total_seconds() // 60)
         await _reply(
             update,
-            f"⚠️ ПРОДАТИ ВСЮ ПОЗИЦІЮ {symbol} ПО РИНКУ?\nКількість: {quantity}\n{info}\n"
+            f"⚠️ ПРОДАТИ ВСЮ ПОЗИЦІЮ {symbol} ПО РИНКУ?\nКількість: {held.quantity}\n{info}\n"
             f"Для підтвердження протягом {minutes} хв напиши: /sell {coin} так\n"
             "Після продажу бот не купуватиме і не докуповуватиме цю монету 24 години.",
         )
+        # Armed only once the prompt is out: if Telegram failed to deliver it,
+        # a "/sell X так" typed from memory must not sell what was never shown.
+        pending[symbol] = _SellOffer(held.position_id, held.quantity, utcnow() + SELL_CONFIRM_WINDOW)
         return
-    expires = pending.pop(symbol, None)
-    if expires is None or utcnow() > expires:
+    offer = pending.pop(symbol, None)
+    if offer is None or utcnow() > offer.expires:
         await _reply(update, f"Спершу напиши /sell {coin} - я покажу позицію, і тоді підтверди.")
         return
+    if (offer.position_id, offer.quantity) != (held.position_id, held.quantity):
+        await _reply(update, f"Позиція {coin} змінилась після того, як я її показав (докупка, частковий продаж "
+                             f"або вже нова позиція) - нічого не продано.\nНапиши /sell {coin} ще раз.")
+        return
+    await _sell_now(update, ctx, symbol, lambda text: _reply(update, text))
+
+
+async def _sell_now(
+    update: Update, ctx: BotContext, symbol: str, show_progress: Callable[[str], Awaitable[Any]]
+) -> None:
+    """The sale itself, for /sell and the 💸 button alike."""
     if ctx.manual_sell is None:
         await _reply(update, "Продаж через Telegram недоступний у цій версії бота.")
         return
     try:
-        await _reply(update, f"Продаю {symbol} по ринку...")
-    except Exception as exc:  # noqa: BLE001 - the owner confirmed: a failed courtesy reply must not stop the sale
-        logger.warning("Could not send the /sell progress reply: %r", exc)
+        await show_progress(f"Продаю {symbol} по ринку...")
+    except Exception as exc:  # noqa: BLE001 - the owner confirmed: a failed courtesy message must not stop the sale
+        logger.warning("Could not show the sell progress: %r", exc)
     try:
         result = await ctx.manual_sell(symbol)
     except Exception as exc:  # noqa: BLE001 - the order may or may not have gone through
@@ -253,6 +405,89 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                              "Перевір /positions і Binance, перш ніж повторювати.")
         return
     await _reply(update, _sell_reply(symbol, result))
+
+
+@_restricted
+async def on_sell_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """💸 under /positions: asks first, with fresh numbers (✅ Так / ❌), and
+    "✅ Так" within SELL_CONFIRM_WINDOW, once, makes the same market sale as
+    /sell - only of the position and size shown, and only while it is still
+    in profit after fees (a losing position is sold with /sell)."""
+    query = update.callback_query
+    assert query is not None
+    parts = (query.data or "").split(":")
+    if len(parts) == 3 and parts[1] == "ask" and parts[2].isdigit():
+        await query.answer()
+        await _offer_sale(update, context, int(parts[2]))
+        return
+    offers: dict[str, _SellOffer] = context.bot_data.setdefault(_SELL_OFFERS_KEY, {})
+    # Taken before any await: a second tap (or "✅" after "❌") can never
+    # start a second sale, even with both taps handled concurrently.
+    offer = offers.pop(":".join(parts[2:]), None)
+    if offer is None:
+        await query.answer("Ця кнопка вже не діє - відкрий 💼 Позиції ще раз")
+        return
+    await query.answer()
+    if parts[1] != "yes":
+        await query.edit_message_text("❌ Скасовано - нічого не продано.")
+        return
+    if utcnow() > offer.expires:
+        await query.edit_message_text("⌛ Час на підтвердження минув - нічого не продано. Відкрий 💼 Позиції ще раз.")
+        return
+    ctx = _ctx(context)
+    held = _open_holding(offer.position_id)
+    if held is None:
+        await query.edit_message_text("Цієї позиції вже немає - її щойно закрив сам бот. Нічого не продано.")
+        return
+    if held.quantity != offer.quantity:
+        await query.edit_message_text(f"Позиція {held.coin} змінилась (докупка або частковий продаж) - нічого не продано. "
+                                      "Відкрий 💼 Позиції ще раз.")
+        return
+    price = (await _sale_prices(ctx, [held.symbol])).get(held.symbol)
+    net = held.if_sold_at(price, ctx.settings)[0] if price is not None else None
+    if net is None or net <= 0:
+        now = f"{net:+.2f} USDT після комісій" if net is not None else "ціна недоступна"
+        await query.edit_message_text(f"{held.coin} уже не в плюсі ({now}) - нічого не продано.\n"
+                                      f"Продати все одно: /sell {held.coin}")
+        return
+    await _sell_now(update, ctx, held.symbol, query.edit_message_text)
+
+
+async def _offer_sale(update: Update, context: ContextTypes.DEFAULT_TYPE, position_id: int) -> None:
+    ctx = _ctx(context)
+    message = update.effective_message
+    assert message is not None
+    held = _open_holding(position_id)
+    if held is None:
+        await message.reply_text("Цієї позиції вже немає - її щойно закрив сам бот. Онови список: 💼 Позиції.")
+        return
+    price = (await _sale_prices(ctx, [held.symbol])).get(held.symbol)
+    if price is None:
+        await message.reply_text(f"Не вдалося отримати ціну {held.coin} з біржі - нічого не продано. Спробуй за хвилину.")
+        return
+    net, pct = held.if_sold_at(price, ctx.settings)
+    if net <= 0:
+        await message.reply_text(f"{held.coin} уже не в плюсі: {net:+.2f} USDT ({pct:+.2f}%) після комісій - "
+                                 f"кнопка продає лише позиції в плюсі.\nПродати все одно: /sell {held.coin}")
+        return
+    now = utcnow()
+    offers: dict[str, _SellOffer] = context.bot_data.setdefault(_SELL_OFFERS_KEY, {})
+    for key in [k for k, o in offers.items() if o.expires < now]:
+        del offers[key]
+    key = f"{held.position_id}:{int(now.timestamp())}"
+    minutes = int(SELL_CONFIRM_WINDOW.total_seconds() // 60)
+    await message.reply_text(
+        f"💸 ПРОДАТИ ВСЮ ПОЗИЦІЮ {held.coin} ПО РИНКУ?\n"
+        f"Кількість: {held.quantity.normalize():f}\n"
+        f"Зараз {format_price(price)}, вхід {format_price(held.avg_entry)}: ≈ {net:+.2f} USDT ({pct:+.2f}%) після комісій\n"
+        f"Сам бот продасть біля цілі {format_price(held.target)}.\n"
+        f"Кнопка «Так» діє {minutes} хв. Після продажу бот не купуватиме і не докуповуватиме {held.coin} 24 години.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ Так, продати {held.coin}", callback_data=f"sell:yes:{key}"),
+            InlineKeyboardButton("❌ Скасувати", callback_data=f"sell:no:{key}"),
+        ]]),
+    )
+    offers[key] = _SellOffer(held.position_id, held.quantity, now + SELL_CONFIRM_WINDOW)  # armed once it is shown
 
 
 def _sell_reply(symbol: str, result: ManualSellResult) -> str:
@@ -271,6 +506,12 @@ def _sell_reply(symbol: str, result: ManualSellResult) -> str:
                 "перш ніж продавати ще раз.")
     if result.status == "no_position":
         return f"Позиції {symbol} вже немає - можливо, її щойно закрив сам бот."
+    if result.status == "closed_by_bot":
+        return (f"Позиція {symbol} закрилась ще до цього продажу (її продав сам бот або попередній ордер) - "
+                f"підсумок угоди в окремому повідомленні. Бот не купуватиме {coin} 24 години.")
+    if result.status == "unknown":
+        return (f"⚠️ Під час продажу {symbol} сталася помилка - результат невідомий.{detail}\n"
+                "Перевір /positions через хвилину і Binance, перш ніж повторювати.")
     if result.status == "no_order_book":
         return f"❌ Не вдалося отримати ціни {symbol} з біржі - нічого не продано. Спробуй ще раз."
     left = f" Залишок у позиції: {result.remaining}." if result.remaining is not None else ""
@@ -472,7 +713,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert message is not None
     await message.reply_text(
         "Кнопки внизу екрана: стан бота, позиції, баланс, ринок, звіт за місяць, історія угод. "
-        "Пауза, Продовжити і СТОП спершу питають підтвердження. Усі інші команди - у меню «/».",
+        "Під списком позицій - кнопка «💸 Продати» для кожної, що в плюсі. "
+        "Продаж, Пауза, Продовжити і СТОП спершу питають підтвердження. Усі інші команди - у меню «/».",
         reply_markup=main_keyboard(),
     )
 

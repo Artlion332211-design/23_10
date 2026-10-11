@@ -8,6 +8,7 @@ from strategy.take_profit import (
     Fill,
     compute_target_price,
     net_profit_percent,
+    net_result_if_sold,
     should_arm_early_protection,
     should_exit_trailing,
     should_start_trailing,
@@ -49,6 +50,19 @@ def test_selling_at_target_price_realizes_exactly_target_net_profit():
     target = compute_target_price(avg_entry, target_profit_percent=Decimal("10"), taker_fee_rate=fee, expected_slippage_percent=slippage)
     realized = net_profit_percent(avg_entry, target, taker_fee_rate=fee, expected_slippage_percent=slippage)
     assert abs(realized - Decimal("10")) < Decimal("0.0001")
+
+
+def test_a_price_just_above_the_entry_is_still_a_loss_once_every_fee_is_counted():
+    """The review's case (2026-10-11): bought at 100 for 99.9 + 0.10 buy fee
+    (0.999 coins held), now 100.1 - '+0.10%' on price, a loss to sell."""
+    fees = {"taker_fee_rate": Decimal("0.001"), "expected_slippage_percent": Decimal("0.05")}
+
+    net, pct = net_result_if_sold(Decimal("100"), Decimal("0.999"), Decimal("0.1"), Decimal("100.1"), **fees)
+    assert net < 0 and pct < 0
+
+    net, pct = net_result_if_sold(Decimal("100"), Decimal("1"), Decimal("0.1"), Decimal("106"), **fees)
+    assert net == Decimal("106") * Decimal("0.999") * Decimal("0.9995") - Decimal("100.1")
+    assert pct == net / Decimal("100.1") * 100
 
 
 def test_compute_target_price_rejects_non_positive_entry():
