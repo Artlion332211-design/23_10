@@ -381,6 +381,19 @@ def test_after_a_restart_an_old_sell_confirmation_does_nothing(db_engine, settin
     ctx.manual_sell.assert_not_called()
 
 
+def test_a_sell_button_under_a_list_older_than_48_hours_explains_itself(db_engine, settings, rules):
+    """Telegram stops handing the bot a message older than 48 h with the tap
+    (effective_message is None): the tap ended in silence."""
+    ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
+    update, context = _tap_update(ctx, f"sell:ask:{position_id}", bot_data=bot_data)
+    update.effective_message = None
+
+    asyncio.run(on_sell_button(update, context))
+
+    update.callback_query.answer.assert_awaited_once_with("Цей список застарів - відкрий 💼 Позиції ще раз", show_alert=True)
+    ctx.manual_sell.assert_not_called()
+
+
 def test_a_stranger_tapping_sell_buttons_gets_nothing(db_engine, settings, rules):
     ctx, position_id, bot_data, _prices = _sell_setup(db_engine, settings, rules)
     _text, yes, _no = _ask(ctx, position_id, bot_data)

@@ -417,6 +417,11 @@ async def on_sell_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     assert query is not None
     parts = (query.data or "").split(":")
     if len(parts) == 3 and parts[1] == "ask" and parts[2].isdigit():
+        if update.effective_message is None:
+            # A list older than 48 h: Telegram no longer lets the bot answer
+            # under it - say so instead of a tap that does nothing.
+            await query.answer("Цей список застарів - відкрий 💼 Позиції ще раз", show_alert=True)
+            return
         await query.answer()
         await _offer_sale(update, context, int(parts[2]))
         return

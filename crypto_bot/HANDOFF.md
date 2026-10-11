@@ -989,7 +989,9 @@ owner's explicit go-ahead plus a backtest comparison before it goes live:
   while it is still in profit after fees at a fresh price; otherwise nothing
   is sold and the reply points to `/sell`. Same sale path as `/sell`
   (`_sell_now` -> `manual_sell`), so the 24 h no-re-buy cooldown applies. A
-  losing position is still sold only with `/sell`.
+  losing position is still sold only with `/sell`. Under a list older than
+  48 h Telegram no longer passes the message with the tap; the button then
+  answers with a pop-up to open 💼 Позиції again.
 - `/sell` shows the same after-fee result at a fresh price, binds the
   confirmation to the position id and size shown, and arms it only once the
   prompt was delivered.

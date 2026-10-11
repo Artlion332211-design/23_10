@@ -242,7 +242,11 @@ closed during the /sell was reported as sold by /sell, without the
 promised 24 h no-re-buy; the "/" menu described the old one-step /sell.
 Fixed together with the new sell buttons (HANDOFF §19); the one deeper gap
 left (a failing DB write right after a fill leaves the order untracked
-until a restart) is noted there. Lessons: for the owner, "in profit" means
-money after every fee; a confirmation binds to exactly what was shown -
-that position, that size; a promise in a reply ("I'll tell you the result")
-needs a code path for every outcome, failures included.
+until a restart) is noted there. Right after the deploy Claude found one
+more gap in the new button: under a list older than 48 h a tap did
+nothing, because Telegram no longer passes such a message (fixed in the
+follow-up commit, before the owner used it). Lessons: for the owner, "in
+profit" means money after every fee; a confirmation binds to exactly what
+was shown - that position, that size; a promise in a reply ("I'll tell you
+the result") needs a code path for every outcome, failures included; and an
+inline button can outlive its message's 48 h - test the tap on an old one.
